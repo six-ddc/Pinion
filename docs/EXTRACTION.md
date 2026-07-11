@@ -274,9 +274,30 @@ CM 依 yml 重解析。绝不 idf.py set-target。
 分区表 partitions/v1/32m.csv 本身不动：resources(4M)/model(960K) 分区闲置，
 flash_args 不再包含其烧写项（对应 CMake 声明删除后自动消失），风险最低且可回退。
 
-## 9. 里程碑提交
+## 9. 待终审清单（本轮"有把握才删"原则下保留的模糊边界，供终审 agent 逐项裁决）
+
+| 项 | 现状 | 倾向 |
+|---|---|---|
+| `.github/`（build.yml/release.yml + issue 模板） | build.yml/release.yml 引用已删除的 `scripts/release.py` 与 board 矩阵，推到 GitHub 会跑失败的 CI | 删或重写为单一 `idf.py build` 工作流 |
+| `README.md` / `README_zn.md` | xiaozhi 上游 README，内容与本仓库已严重不符 | 重写为 Claw6 简介（CLAUDE.md 已重写可作素材） |
+| `main/display/screen/pi_screen/pi_mock_paced.c` + `pi_scr_mock.h` | mock 走带（`PI_AGENT_TASK_USE_MOCK 0` 编译期关闭），仍参与编译 | pi_screen 属验收成品，倾向保留（调试价值）；删则同步改 pi_agent_task.c/CMakeLists |
+| SD 卡能力（SdCardManager + Init 挂载） | 用户能力清单未点名（"顺带"精神保留），无 UI 消费者 | 保留（硬件在、代码 header-only、成本≈0） |
+| `78/xiaozhi-fonts` 整包依赖 | 只用 font_puhui_20_4/30_4 两个字体（未选中的不编译） | 保留（改自带字体源文件收益小、风险高） |
+| managed_components 传递依赖（button/knob/freetype/esp_lv_decoder/esp_lv_fs/esp_mmap_assets/esp_new_jpeg/libpng/zlib） | esp_lvgl_adapter 自身 manifest 拉入，不可在本仓库删 | 保留（除非 fork adapter，不值） |
+| sdkconfig 孤儿项（esp-sr/opus/LANGUAGE/BOARD_TYPE 等已删组件的 CONFIG_*） | 本地 sdkconfig 未跟踪，重新生成时自动消失 | 不动 |
+| Wi-Fi 配网 portal（StartConfigPortal/force_ap）与 AddWifiCredential | 已迁入 lib 并编译通过，但从未真机验证（原 call site 在旧固件里就是注释掉的） | WP4 真机验证时裁决 |
+| `partitions/v1/32m.csv` 中闲置分区（resources 4M / model 960K / ota_1 12M 双槽） | 不再烧写但仍占表；改单槽表可省约 17M 空间 | 留给真机验证后裁决（分区表变更需整机重烧，风险另计） |
+| `.clang-format` / `LICENSE` / `docs/` | 正常仓库件 | 保留 |
+
+已在本轮"有把握"追加删除（终审无需再看）：`sd_images/`（已删 digital_people 屏的 SD 卡表情
+资产源 + 转换工具，5MB）、`partitions/` 除 v1/32m.csv 外全部变体（sdkconfig 只引用 32m.csv）；
+项目 `CLAUDE.md` 已重写为 Claw6 现状（旧版描述 Application/Board/McpServer/release.py 均已失实）。
+
+## 10. 里程碑提交
 
 1. docs/EXTRACTION.md（本文档）。
 2. components/metalio_hal 建立：硬件代码搬迁+耦合翻转，main 侧改用 lib（此时业务层可能仍在编译）。
 3. 删除全部业务层与残余 screen + 资产清理，main.cc 重写，CMake/依赖收敛；build + size + grep 验证。
 （2/3 若耦合导致无法各自独立编译通过，允许合并为一个 commit，以每 commit 可构建为先。）
+4. sdkconfig.defaults 承重集 + 文档 as-built 同步。
+5. 终态清扫：sd_images/分区表变体删除、CLAUDE.md 重写、待终审清单（本节）。
