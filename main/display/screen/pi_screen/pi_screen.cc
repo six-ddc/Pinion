@@ -10,11 +10,17 @@
 
 #include "esp_log.h"
 
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
 #include "IOExpander.hpp"
+#include "metalio_hal/audio_pipeline.h"
 #include "pi_fonts.h"
 #include "pi_ui_bridge.h"
 #include "screen_util.h"
 #include "settings.h"
+#include "volc_asr.h"
+#include "volc_tts.h"
 
 // ---------------------------------------------------------------------------
 // PiScreen -- pi_agent's four-state conversation UI (720x720).
@@ -63,12 +69,8 @@ constexpr int32_t kDockH  = 112;
 constexpr int32_t kMidH   = kH - kSbarH - kHintH;   // 552
 constexpr int32_t kFeedH  = kH - kSbarH - kDockH;   // 552
 
-constexpr const char* kPresetAsr =
-    "\xe5\xb8\xae\xe6\x88\x91\xe6\x9f\xa5\xe4\xb8\x80\xe4\xb8\x8b 37 "
-    "\xe4\xb9\x98 89\xef\xbc\x8c\xe5\x86\x8d\xe6\x8a\x8a\xe7\xbb\x93\xe6\x9e\x9c"
-    "\xe5\xad\x98\xe5\x88\xb0\xe5\xa4\x87\xe5\xbf\x98\xe3\x80\x82";
-// "帮我查一下 37 乘 89，再把结果存到备忘。" (UTF-8 literal bytes, avoids any
-// source-encoding surprises in the build toolchain).
+// S1 数据源已从预置假转写（kPresetAsr 走带）换成真 ASR（volc_asr 流式
+// delta）——见下方 "real ASR session engine" 一节；四状态视觉与交互结构不变。
 
 constexpr int32_t kSwipeCancelThreshold = 80;  // up-swipe px to cancel PTT
 constexpr int32_t kNvsNamespaceMaxTools = 4;   // cached tool cards per turn (ZEN peek)
@@ -98,10 +100,8 @@ lv_timer_t* s_clock_timer = nullptr;
 lv_obj_t* s_wave_row = nullptr;
 lv_obj_t* s_asr_lbl = nullptr;
 lv_obj_t* s_rec_lbl = nullptr;
-lv_timer_t* s_asr_timer = nullptr;
+lv_timer_t* s_asr_timer = nullptr;  // 70ms：轮询真 ASR 共享态并渲染（AsrTick）
 lv_timer_t* s_rec_timer = nullptr;
-int s_asr_reveal_chars = 0;
-int s_asr_total_chars = 0;
 int s_rec_secs = 0;
 std::vector<lv_obj_t*> s_wave_bars;
 
@@ -117,6 +117,8 @@ lv_obj_t* s_chat_ctx_lbl = nullptr;
 lv_obj_t* s_mode_icon_flow = nullptr;  // 3-bar hamburger, shown in FLOW
 lv_obj_t* s_mode_icon_zen = nullptr;   // ring, shown in ZEN
 lv_obj_t* s_mode_lbl = nullptr;
+lv_obj_t* s_tts_dot = nullptr;  // 状态栏 TTS 开关状态点（琥珀=开/线框灰=关）
+bool s_tts_on = true;           // NVS "pi_screen"/"tts_on"；Create 时灌入 agent 桥
 lv_obj_t* s_dock_stat_lbl = nullptr;
 lv_obj_t* s_dock_action_box = nullptr;  // holds either STOP or TALK contents
 lv_obj_t* s_stop_btn = nullptr;
@@ -346,6 +348,7 @@ void UpdateDockStat();
 void StartListen(ViewState return_state);
 void FinishListenSend();
 void RetryLastPrompt();
+void ShowErrorBanner(const char* message);
 
 // ---------------------------------------------------------------------------
 // shared status-bar pieces
@@ -600,39 +603,12 @@ void UpdateRecTimer(lv_timer_t*) {
     lv_label_set_text(s_rec_lbl, buf);
 }
 
-// Trailing codepoints of the revealed ASR text rendered amber, matching the
+// Trailing codepoints of the live ASR text rendered amber, matching the
 // design's ".cur" = "just-revealed fragment" treatment. 6 is a plain
-// character count, not a "word" (this preset string has no whitespace to
-// key off of, and doing real CJK word-segmentation for a demo reveal buffer
-// would be pure overkill).
+// character count, not a "word" (real CJK word-segmentation for a transient
+// highlight would be pure overkill). Rendering itself happens in AsrTick
+// (defined with the rest of the real-ASR engine, before StartListen).
 constexpr int kAsrHighlightCodepoints = 6;
-
-void RevealAsr(lv_timer_t*) {
-    if (s_asr_lbl == nullptr) return;
-    if (s_asr_reveal_chars < s_asr_total_chars) {
-        s_asr_reveal_chars++;
-    }
-    const char* full = kPresetAsr;
-    int highlight_start_cp = s_asr_reveal_chars - kAsrHighlightCodepoints;
-    if (highlight_start_cp < 0) highlight_start_cp = 0;
-    int plain_bytes = Utf8PrefixBytes(full, highlight_start_cp);
-    int shown_bytes = Utf8PrefixBytes(full, s_asr_reveal_chars);
-
-    std::string markup(full, plain_bytes);
-    markup += "#FFAE1F ";
-    markup.append(full + plain_bytes, shown_bytes - plain_bytes);
-    markup += "#";
-    lv_label_set_text(s_asr_lbl, markup.c_str());
-
-    // The physical PWR_KEY has no "release" signal (see StartListen's
-    // s_ptt_via_key note), so a key-initiated listen auto-sends once the
-    // whole preset string has been revealed instead of waiting on a touch
-    // release that will never come.
-    if (s_ptt_via_key && s_asr_reveal_chars >= s_asr_total_chars) {
-        s_ptt_via_key = false;
-        FinishListenSend();
-    }
-}
 
 void BuildListenView(lv_obj_t* parent) {
     s_listen_view = lv_obj_create(parent);
@@ -772,6 +748,23 @@ void SetZen(bool zen) {
     ApplyModeVisual();
 }
 
+// TTS 播报开关（状态栏）：mono "TTS" 字样 + 状态点（琥珀=开/线框灰=关，
+// 🔊/🔇 语义——字体子集没有喇叭 glyph，沿用本文件"点代 glyph"惯例）。
+// 默认开；关闭立即打断当前播报（pi_agent_tts_set_enabled 内部异步 stop）。
+void ApplyTtsVisual() {
+    if (s_tts_dot == nullptr) return;
+    lv_obj_set_style_bg_color(s_tts_dot, lv_color_hex(s_tts_on ? kAmber : kLine2),
+                              LV_PART_MAIN);
+}
+
+void SetTtsOn(bool on) {
+    s_tts_on = on;
+    Settings settings("pi_screen", true);
+    settings.SetBool("tts_on", on);
+    pi_agent_tts_set_enabled(on);
+    ApplyTtsVisual();
+}
+
 lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_obj_t* sbar = MakeSbarBase(parent);
     BuildIdBox(sbar);
@@ -827,6 +820,29 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_obj_add_event_cb(
         mode_btn, [](lv_event_t*) { SetZen(!s_zen); }, LV_EVENT_CLICKED, nullptr);
 
+    // TTS 开关（见 SetTtsOn 的注释）
+    lv_obj_t* tts_btn = lv_obj_create(sbar);
+    screen_strip_obj_chrome(tts_btn);
+    lv_obj_remove_flag(tts_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(tts_btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(tts_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(tts_btn, 4, LV_PART_MAIN);
+    lv_obj_add_flag(tts_btn, LV_OBJ_FLAG_CLICKABLE);
+    screen_swipe_back_ignore(tts_btn, true);
+    lv_obj_set_flex_flow(tts_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tts_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(tts_btn, 6, LV_PART_MAIN);
+    s_tts_dot = MakeCircle(tts_btn, 8, kAmber);
+    lv_obj_remove_flag(s_tts_dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t* tts_lbl = lv_label_create(tts_btn);
+    lv_label_set_text(tts_lbl, "TTS");
+    SetLabelFont(tts_lbl, &font_pi_mono_14, kFaint);
+    lv_obj_set_style_text_letter_space(tts_lbl, 1, LV_PART_MAIN);
+    lv_obj_remove_flag(tts_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        tts_btn, [](lv_event_t*) { SetTtsOn(!s_tts_on); }, LV_EVENT_CLICKED, nullptr);
+
     BuildWifi(sbar);
     return sbar;
 }
@@ -856,6 +872,45 @@ void AppendUserRow(const std::string& text) {
     lv_obj_set_flex_grow(t, 1);
     lv_label_set_text(t, text.c_str());
     SetLabelFont(t, &font_puhui_20_4, kDim);
+}
+
+// Thin red-line error banner in the chat feed (design: 红色细线横幅) --
+// shared by the agent bridge's UI_ERROR events and the S1 real-ASR failure
+// path. The amber "重试" pill resends the last prompt; when no prompt exists
+// yet (ASR failed before anything was sent) the pill is omitted since there
+// is nothing to retry.
+void ShowErrorBanner(const char* message) {
+    lv_obj_t* row = lv_obj_create(s_feed);
+    screen_strip_obj_chrome(row);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(kErr), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(row, 16, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(row, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
+
+    lv_obj_t* msg = lv_label_create(row);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(msg, 1);
+    lv_label_set_text(msg, message != nullptr ? message : "unknown error");
+    SetLabelFont(msg, &font_puhui_20_4, kErr);
+
+    if (!s_last_user_prompt.empty()) {
+        lv_obj_t* retry = lv_label_create(row);
+        lv_label_set_text(retry, "\xe9\x87\x8d\xe8\xaf\x95");  // "重试"
+        SetLabelFont(retry, &font_puhui_20_4, kAmber);
+        lv_obj_add_flag(retry, LV_OBJ_FLAG_CLICKABLE);
+        screen_swipe_back_ignore(retry, true);
+        lv_obj_add_event_cb(
+            retry, [](lv_event_t*) { RetryLastPrompt(); }, LV_EVENT_CLICKED, nullptr);
+    }
 }
 
 // "thinking" prefix: a small ring standing in for "◌" (not in the mono
@@ -1539,41 +1594,11 @@ void DrainQueueTick(lv_timer_t*) {
                 break;
             }
             case UI_ERROR: {
-                // Thin red-line banner (design: 红色细线横幅), not a modal --
-                // reading can continue around it. Message + a visible amber
-                // "重试" pill that resends the same prompt; real transports
-                // hit this path on genuine network/API failures now that
-                // mock is gone, so it has to actually retry, not just look
-                // clickable.
-                lv_obj_t* row = lv_obj_create(s_feed);
-                screen_strip_obj_chrome(row);
-                lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                lv_obj_set_width(row, LV_PCT(100));
-                lv_obj_set_height(row, LV_SIZE_CONTENT);
-                lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
-                lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
-                lv_obj_set_style_border_color(row, lv_color_hex(kErr), LV_PART_MAIN);
-                lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
-                lv_obj_set_style_pad_hor(row, 16, LV_PART_MAIN);
-                lv_obj_set_style_pad_ver(row, 12, LV_PART_MAIN);
-                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-                lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                                      LV_FLEX_ALIGN_CENTER);
-                lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
-
-                lv_obj_t* msg = lv_label_create(row);
-                lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-                lv_obj_set_flex_grow(msg, 1);
-                lv_label_set_text(msg, evt.s1 != nullptr ? evt.s1 : "unknown error");
-                SetLabelFont(msg, &font_puhui_20_4, kErr);
-
-                lv_obj_t* retry = lv_label_create(row);
-                lv_label_set_text(retry, "\xe9\x87\x8d\xe8\xaf\x95");  // "重试"
-                SetLabelFont(retry, &font_puhui_20_4, kAmber);
-                lv_obj_add_flag(retry, LV_OBJ_FLAG_CLICKABLE);
-                screen_swipe_back_ignore(retry, true);
-                lv_obj_add_event_cb(
-                    retry, [](lv_event_t*) { RetryLastPrompt(); }, LV_EVENT_CLICKED, nullptr);
+                // Not a modal -- reading can continue around it. Real
+                // transports hit this path on genuine network/API failures,
+                // so the banner's retry has to actually work (it resends the
+                // prompt already recorded in s_last_user_prompt).
+                ShowErrorBanner(evt.s1 != nullptr ? evt.s1 : "unknown error");
 
                 if (s_tool_running_timer != nullptr) {
                     lv_timer_delete(s_tool_running_timer);
@@ -1636,34 +1661,247 @@ int Utf8CodepointCount(const char* s) {
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// S1 real-ASR session engine (volc_asr + mhal::audio_pipeline capture).
+//
+// Thread model: volc_asr's callbacks fire on its WebSocket task and only
+// write the mutex-guarded shared strings/flags below; the LVGL side polls
+// them from AsrTick (the old fake-reveal timer slot, 70ms). All blocking
+// volc calls (TLS connect in start, final wait in stop, socket close in
+// abort) run on a dedicated voice-control task fed by a command queue, so
+// the LVGL thread never blocks and start/finish/cancel stay serialized even
+// if the user releases before the connection handshake finished.
+// ---------------------------------------------------------------------------
+SemaphoreHandle_t s_asr_mutex = nullptr;
+std::string s_asr_live_text;   // guarded by s_asr_mutex（服务端全量文本）
+std::string s_asr_error_text;  // guarded by s_asr_mutex
+volatile bool s_asr_final_ready = false;
+volatile bool s_asr_failed = false;
+bool s_asr_waiting_final = false;  // LVGL 线程：已松开，等服务端 final
+bool s_key_heard_speech = false;   // key 进入的聆听：VAD 自动收音的触发臂
+std::string s_asr_rendered;        // 上次渲染的文本（LVGL 线程，去重用）
+
+void AsrLock() { xSemaphoreTake(s_asr_mutex, portMAX_DELAY); }
+void AsrUnlock() { xSemaphoreGive(s_asr_mutex); }
+
+void OnAsrDelta(const char* text, void*) {
+    AsrLock();
+    s_asr_live_text = text;
+    AsrUnlock();
+}
+
+void OnAsrFinal(const char* text, void*) {
+    AsrLock();
+    s_asr_live_text = text;
+    AsrUnlock();
+    s_asr_final_ready = true;
+}
+
+void OnAsrError(int code, const char* msg, void*) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "ASR %d: %s", code, msg != nullptr ? msg : "");
+    AsrLock();
+    s_asr_error_text = buf;
+    AsrUnlock();
+    s_asr_failed = true;
+}
+
+void PostAsrFailure(const char* msg) {
+    AsrLock();
+    if (s_asr_error_text.empty()) s_asr_error_text = msg;
+    AsrUnlock();
+    s_asr_failed = true;
+}
+
+enum class VoiceCmd { Start, Finish, Cancel };
+QueueHandle_t s_voice_q = nullptr;
+
+void VoiceTask(void*) {
+    bool active = false;
+    for (;;) {
+        VoiceCmd cmd;
+        if (xQueueReceive(s_voice_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
+        switch (cmd) {
+            case VoiceCmd::Start: {
+                if (active) break;
+                volc_tts_stop();  // barge-in：用户开口即打断在播 TTS
+                volc_asr_callbacks_t cbs = {};
+                cbs.on_delta = OnAsrDelta;
+                cbs.on_final = OnAsrFinal;
+                cbs.on_error = OnAsrError;
+                esp_err_t err = volc_asr_start(&cbs);
+                if (err == ESP_OK) {
+                    mhal::audio_pipeline::CaptureConfig cfg;  // 20ms 帧 + 能量 VAD
+                    mhal::audio_pipeline::CaptureCallbacks ccb;
+                    ccb.on_frame = [](const int16_t* pcm, size_t n) {
+                        volc_asr_feed(pcm, n);
+                    };
+                    if (!mhal::audio_pipeline::StartCapture(cfg, ccb)) {
+                        volc_asr_abort();
+                        err = ESP_FAIL;
+                    }
+                }
+                if (err != ESP_OK) {
+                    PostAsrFailure("ASR connect failed (network / keys?)");
+                } else {
+                    active = true;
+                }
+                break;
+            }
+            case VoiceCmd::Finish: {
+                if (!active) break;
+                active = false;
+                mhal::audio_pipeline::StopCapture();
+                esp_err_t err = volc_asr_stop(12000);  // final 经 OnAsrFinal 落地
+                if (err != ESP_OK && !s_asr_final_ready && !s_asr_failed) {
+                    PostAsrFailure("ASR timed out waiting for final");
+                }
+                break;
+            }
+            case VoiceCmd::Cancel:
+                if (active) {
+                    active = false;
+                    mhal::audio_pipeline::StopCapture();
+                    volc_asr_abort();
+                }
+                break;
+        }
+    }
+}
+
+// 惰性建 voice 基建；采集/发送路径要跑 gzip + TLS 写，栈给足。
+void EnsureVoiceInfra() {
+    if (s_voice_q != nullptr) return;
+    s_asr_mutex = xSemaphoreCreateMutex();
+    s_voice_q = xQueueCreate(8, sizeof(VoiceCmd));
+    xTaskCreate(VoiceTask, "pi_voice", 6144, nullptr, 5, nullptr);
+}
+
+void VoiceSend(VoiceCmd cmd) {
+    EnsureVoiceInfra();
+    xQueueSend(s_voice_q, &cmd, 0);
+}
+
+void StopListenTimers() {
+    if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
+    if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
+}
+
+void HandleAsrFinal() {
+    std::string text;
+    AsrLock();
+    text = s_asr_live_text;
+    AsrUnlock();
+    s_asr_final_ready = false;
+    s_asr_waiting_final = false;
+    StopListenTimers();
+    if (text.empty()) {  // 没说话/没听清：安静回到来处，不发空 prompt
+        Go(s_return_state);
+        return;
+    }
+    Go(ViewState::Chat);
+    AppendUserRow(text);
+    ResetTurnState();
+    ScrollFeedToBottom();
+    s_last_user_prompt = text;
+    pi_agent_task_send_prompt(text.c_str());
+}
+
+void HandleAsrFailure() {
+    std::string msg;
+    AsrLock();
+    msg = s_asr_error_text;
+    AsrUnlock();
+    s_asr_failed = false;
+    s_asr_waiting_final = false;
+    StopListenTimers();
+    VoiceSend(VoiceCmd::Cancel);  // 兜底清理采集/半开会话（无会话时是 no-op）
+    Go(ViewState::Chat);          // 错误横幅住在 chat feed 里
+    ShowErrorBanner(msg.empty() ? "ASR error" : msg.c_str());
+    ShowTalkBtn();
+    ScrollFeedToBottom();
+}
+
+void AsrTick(lv_timer_t*) {
+    if (s_asr_lbl == nullptr) return;
+    if (s_asr_failed) {
+        HandleAsrFailure();
+        return;
+    }
+    if (s_asr_final_ready) {
+        HandleAsrFinal();
+        return;
+    }
+
+    std::string text;
+    AsrLock();
+    text = s_asr_live_text;
+    AsrUnlock();
+    if (text != s_asr_rendered) {
+        s_asr_rendered = text;
+        // 尾部 6 个码点琥珀高亮：沿用假走带的 ".cur" 视觉，数据源换成真 delta
+        int total_cp = Utf8CodepointCount(text.c_str());
+        int hi_start = total_cp - kAsrHighlightCodepoints;
+        if (hi_start < 0) hi_start = 0;
+        int plain_bytes = Utf8PrefixBytes(text.c_str(), hi_start);
+        std::string markup(text, 0, plain_bytes);
+        markup += "#FFAE1F ";
+        markup.append(text, plain_bytes, std::string::npos);
+        markup += "#";
+        lv_label_set_text(s_asr_lbl, markup.c_str());
+    }
+
+    // PWR_KEY 进入的聆听没有"松开"信号（原实现是假走带播完自动发送）：改为
+    // VAD 听到过人声、又回到静音（600ms 挂起）后自动收音发送；二次按键仍是
+    // 取消（OnKeyClickAsync 的 Listen 分支不变）。
+    if (s_ptt_via_key && !s_asr_waiting_final) {
+        if (mhal::audio_pipeline::IsVoiceDetected()) {
+            s_key_heard_speech = true;
+        } else if (s_key_heard_speech) {
+            s_ptt_via_key = false;
+            FinishListenSend();
+        }
+    }
+}
+
 void StartListen(ViewState return_state) {
     s_return_state = return_state;
     s_ptt_via_key = false;
-    s_asr_reveal_chars = 0;
-    s_asr_total_chars = Utf8CodepointCount(kPresetAsr);
+    s_key_heard_speech = false;
+    s_asr_waiting_final = false;
+    s_asr_final_ready = false;
+    s_asr_failed = false;
+    s_asr_rendered.clear();
+    EnsureVoiceInfra();
+    AsrLock();
+    s_asr_live_text.clear();
+    s_asr_error_text.clear();
+    AsrUnlock();
+    VoiceSend(VoiceCmd::Start);  // 建连+开采集都在 voice 任务，UI 不阻塞
     if (s_asr_lbl != nullptr) lv_label_set_text(s_asr_lbl, "");
     s_rec_secs = 0;
     if (s_rec_lbl != nullptr) lv_label_set_text(s_rec_lbl, "REC 0:00");
     Go(ViewState::Listen);
-    if (s_asr_timer == nullptr) s_asr_timer = lv_timer_create(RevealAsr, 70, nullptr);
+    if (s_asr_timer == nullptr) s_asr_timer = lv_timer_create(AsrTick, 70, nullptr);
     if (s_rec_timer == nullptr) s_rec_timer = lv_timer_create(UpdateRecTimer, 1000, nullptr);
 }
 
 void CancelListen() {
-    if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
-    if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
+    StopListenTimers();
+    s_asr_waiting_final = false;
+    s_ptt_via_key = false;
+    VoiceSend(VoiceCmd::Cancel);
     Go(s_return_state);
 }
 
 void FinishListenSend() {
-    if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
+    if (s_asr_waiting_final) return;  // 重复松开/自动发送竞态：只收一次
+    s_asr_waiting_final = true;
+    s_ptt_via_key = false;
+    // 停采集与等 final 都在 voice 任务里做；listen 视图原地保留（REC 停表），
+    // AsrTick 继续轮询，final/失败落地后再切 chat / 出横幅。
     if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
-    Go(ViewState::Chat);
-    AppendUserRow(kPresetAsr);
-    ResetTurnState();
-    ScrollFeedToBottom();
-    s_last_user_prompt = kPresetAsr;
-    pi_agent_task_send_prompt(kPresetAsr);
+    VoiceSend(VoiceCmd::Finish);
 }
 
 // Error-banner retry: resend the same prompt without re-recording it (the
@@ -1725,7 +1963,8 @@ void OnKeyClickAsync(void*) {
 // (screen_util.h's documented UNLOAD contract).
 // ---------------------------------------------------------------------------
 void OnScreenUnloaded(lv_event_t*) {
-    pi_agent_task_abort();
+    pi_agent_task_abort();  // 也会异步打断 TTS 播报
+    if (s_voice_q != nullptr) VoiceSend(VoiceCmd::Cancel);  // 停采集/ASR 会话
     if (s_clock_timer != nullptr) { lv_timer_delete(s_clock_timer); s_clock_timer = nullptr; }
     if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
     if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
@@ -1754,7 +1993,7 @@ void OnScreenUnloaded(lv_event_t*) {
     s_idle_model_lbl = s_chat_model_lbl = nullptr;
     s_wave_row = s_asr_lbl = s_rec_lbl = nullptr;
     s_chat_ctx_fill = s_chat_ctx_lbl = nullptr;
-    s_mode_icon_flow = s_mode_icon_zen = s_mode_lbl = nullptr;
+    s_mode_icon_flow = s_mode_icon_zen = s_mode_lbl = s_tts_dot = nullptr;
     s_dock_stat_lbl = s_dock_action_box = s_stop_btn = s_talk_btn = nullptr;
     s_cur_think_row = s_cur_think_dot = s_cur_think_lbl = nullptr;
     s_cur_tool_card = s_cur_tool_dot = s_cur_tool_fn_lbl = nullptr;
@@ -1769,6 +2008,8 @@ void OnScreenUnloaded(lv_event_t*) {
 lv_obj_t* PiScreen::Create() {
     Settings settings("pi_screen", false);
     s_zen = settings.GetBool("zen_mode", false);
+    s_tts_on = settings.GetBool("tts_on", true);
+    pi_agent_tts_set_enabled(s_tts_on);
 
     lv_obj_t* scr = lv_obj_create(nullptr);
     s_scr = scr;
@@ -1782,6 +2023,7 @@ lv_obj_t* PiScreen::Create() {
     BuildListenView(scr);
     BuildChatView(scr);
     ApplyModeVisual();
+    ApplyTtsVisual();
     ApplyCtxUnknown();  // no real usage.input yet -> "CTX --", not a guess
     UpdateDockStat();
 

@@ -44,6 +44,7 @@
 #include "pi/pi.h"
 #include "pi_esp32.h"
 #include "pi_models_data.h"
+#include "volc_tts.h"
 
 /* Offline-debug channel: flip to 1 locally to replay the two-turn Anthropic
  * mock script instead of hitting the real API (no network required). Off by
@@ -129,6 +130,59 @@ static TaskHandle_t g_worker_task;
 static SemaphoreHandle_t g_prompt_sem;
 static char g_pending_prompt[512];
 static volatile bool g_running = false; /* true while pi_agent_prompt() is on the stack */
+
+/* ---------- TTS（火山 volc_tts，text_delta 流式喂入） ----------
+ * 会话状态（g_tts_session_open/g_tts_failed_this_run）只在 agent worker 任务
+ * 上下文读写（on_event 同步跑在 worker 栈上）；g_tts_enabled 跨线程只读写
+ * bool，无需锁。mock 走带下 speak_begin 无网络会失败一次并静默降级——文本
+ * 事件流不受影响，mock 流程不破坏。 */
+static volatile bool g_tts_enabled = true; /* 真值由 pi_screen 从 NVS 灌入 */
+static bool g_tts_session_open = false;
+static bool g_tts_failed_this_run = false;
+
+static void tts_on_error(int code, const char *msg, void *ctx) {
+    (void)ctx;
+    ESP_LOGW(TAG, "tts error %d: %s", code, msg);
+}
+
+static const volc_tts_callbacks_t TTS_CBS = {.on_audio_start = NULL,
+                                             .on_finished = NULL,
+                                             .on_error = tts_on_error,
+                                             .ctx = NULL};
+
+/* volc_tts_stop() 打断在播会话时最坏阻塞 ~2s（等服务端 SessionCanceled），
+ * 而它的调用点（STOP 按钮/状态栏开关/新会话）都在 LVGL 线程——丢进一次性
+ * 小任务执行，扬声器静音本身在 stop 内部第一步就发生，感知不到延迟。 */
+static void tts_stop_worker(void *arg) {
+    (void)arg;
+    volc_tts_stop();
+    vTaskDelete(NULL);
+}
+
+static void tts_stop_async(void) {
+    if (xTaskCreate(tts_stop_worker, "tts_stop", 4096, NULL, 4, NULL) != pdPASS) {
+        volc_tts_stop(); /* 退化为同步（内存紧张时）*/
+    }
+}
+
+/* worker 任务上下文：确保会话开启并追加一段文本 */
+static void tts_feed_delta(const char *delta) {
+    if (!g_tts_enabled || g_tts_failed_this_run || !delta || !delta[0]) return;
+    if (!g_tts_session_open) {
+        esp_err_t err = volc_tts_speak_begin(&TTS_CBS);
+        if (err == ESP_ERR_INVALID_STATE) { /* 上一场还在排空：打断后重试一次 */
+            volc_tts_stop();
+            err = volc_tts_speak_begin(&TTS_CBS);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "tts speak_begin failed (%d), muted for this run", (int)err);
+            g_tts_failed_this_run = true;
+            return;
+        }
+        g_tts_session_open = true;
+    }
+    volc_tts_feed_text(delta);
+}
 
 /* ---------- calc tool (real execution: mul(37,89)=3293, host_chat/main.c parity) ---------- */
 /* file-scope static initializer needs a compile-time constant: a `static const
@@ -223,6 +277,7 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         s_text_delta_seq = 0;
         s_last_usage_input = 0;
         s_last_usage_output = 0;
+        g_tts_failed_this_run = false;
         enqueue(UI_AGENT_START, NULL, NULL, 0, 0);
         break;
 
@@ -263,7 +318,10 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
 #endif
             break;
         case PI_AI_EV_TEXT_DELTA:
-            if (ai->delta) enqueue(UI_TEXT_DELTA, strdup(ai->delta), NULL, 0, ++s_text_delta_seq);
+            if (ai->delta) {
+                enqueue(UI_TEXT_DELTA, strdup(ai->delta), NULL, 0, ++s_text_delta_seq);
+                tts_feed_delta(ai->delta); /* 边出字边播（worker 栈上同步喂） */
+            }
             break;
         default:
             break; /* TEXT_START/END, THINKING_START, TOOLCALL_END: no bridge mapping */
@@ -298,6 +356,10 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         if (ev->message && ev->message->stop_reason == PI_STOP_ERROR) {
             const char *msg = ev->message->error_message ? ev->message->error_message : "error";
             enqueue(UI_ERROR, strdup(msg), NULL, 0, 0);
+            if (g_tts_session_open) { /* 出错即打断播报，不给用户读错误还在放音 */
+                g_tts_session_open = false;
+                volc_tts_stop();
+            }
         }
         /* capture real usage off every assistant message; the last one seen
          * before AGENT_END is this run's final turn (usage.input/.output are
@@ -309,6 +371,10 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         break;
 
     case PI_AG_EV_AGENT_END:
+        if (g_tts_session_open) { /* 文本收尾：FinishSession，余下音频继续播完 */
+            g_tts_session_open = false;
+            volc_tts_speak_end();
+        }
         enqueue(UI_DONE, NULL, NULL, (int)s_last_usage_input, (int)s_last_usage_output);
         break;
 
@@ -408,11 +474,13 @@ void pi_agent_task_send_prompt(const char *preset) {
 }
 
 void pi_agent_task_abort(void) {
+    tts_stop_async(); /* STOP/打断：文字流与播报一起停 */
     if (g_agent) pi_agent_abort(g_agent);
 }
 
 void pi_agent_task_new_session(void) {
     if (!g_agent) return;
+    tts_stop_async();
     pi_agent_abort(g_agent);
     /* pi_agent_destroy() is UB while a run is in progress (pi_agent.h contract,
      * blueprint R9): wait for worker()'s pi_agent_prompt() call to return
@@ -451,4 +519,11 @@ uint32_t pi_agent_context_window(void) {
 #else
     return g_model ? (uint32_t)g_model->context_window : 0;
 #endif
+}
+
+bool pi_agent_tts_enabled(void) { return g_tts_enabled; }
+
+void pi_agent_tts_set_enabled(bool enable) {
+    g_tts_enabled = enable;
+    if (!enable) tts_stop_async();
 }

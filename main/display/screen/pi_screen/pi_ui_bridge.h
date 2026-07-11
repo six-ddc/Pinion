@@ -6,6 +6,7 @@
 #ifndef PI_UI_BRIDGE_H
 #define PI_UI_BRIDGE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
@@ -53,6 +54,13 @@ void pi_agent_task_new_session(void); /* abort+wait+destroy+重建 agent（mock.
    pi_ui_evt_t.s1（TEXT above: "ERROR: s1=msg"）——POD 已经够用，未新增字段。 */
 const char *pi_agent_model_name(void); /* 真实模型名（model.name，缺省退回 model.id） */
 uint32_t pi_agent_context_window(void); /* model.context_window（deepseek=1000000）；模型未加载时 0 */
+
+/* TTS 播报开关（火山 volc_tts；同样是"加不减"扩展）。开关本体在 agent 线程侧
+   消费（text_delta 是否喂给 volc_tts）；持久化（NVS "pi_screen"/"tts_on"）由
+   pi_screen 负责，LOAD 与状态栏开关翻转时调 set。关闭时立即打断当前播报
+  （内部异步执行，不阻塞调用线程）。 */
+bool pi_agent_tts_enabled(void);
+void pi_agent_tts_set_enabled(bool enable);
 
 #ifdef __cplusplus
 }

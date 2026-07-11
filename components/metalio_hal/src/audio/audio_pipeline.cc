@@ -119,8 +119,9 @@ bool StartCapture(const CaptureConfig& cfg, CaptureCallbacks cbs) {
     s_cap.speaking = false;
     s_cap.silence_ms = 0;
     s_cap.running = true;
-    // 优先级对齐旧固件 audio_input 任务（8）：采集不能被 UI 饿死
-    if (xTaskCreate(CaptureTask, "audio_capture", 4096, nullptr, 8,
+    // 优先级对齐旧固件 audio_input 任务（8）：采集不能被 UI 饿死。栈 6KB：
+    // on_frame 消费者可能在本任务栈上跑 gzip + TLS 写（volc_asr_feed 路径）。
+    if (xTaskCreate(CaptureTask, "audio_capture", 6144, nullptr, 8,
                     &s_cap.task) != pdPASS) {
         s_cap.running = false;
         return false;
