@@ -29,143 +29,148 @@ components/metalio_hal/
       sysmon.h                 # CPU/内存/电池周期监控日志
     IOExpander.hpp             # TCA9555 门面（pi_screen 直接用，路径保持不变）
     settings.h                 # NVS 通用包装（pi_screen 直接用，路径保持不变）
+    audio_codec.h              # AudioCodec 基类（mhal::audio::Codec() 返回类型）
   src/                         # 私有实现（对外不可见）
-    board_pins.h               # 原 boards/metalio-claw-4/config.h
-    hal.cc                     # Init 序列（原 METALIO_CLAW_4 构造函数）
-    display/ (display.cc, touch_feed.{cc,h}, esp_lcd_nv3051f.{c,h}, esp_lcd_fl7707n.{c,h})
-    backlight.cc               # 原 boards/common/backlight.cc（PwmBacklight 内化）
-    net/ (network.cc, wifi_backend.cc, nt26_backend.{cc,h}, uart_eth_modem.{cc,h})
+    config.h                   # 原 boards/metalio-claw-4/config.h（引脚表，保留原名）
+    hal.cc                     # Init 序列（原 METALIO_CLAW_4 构造函数）+ I2C 总线
+    hal_internal.h             # lib 内部跨模块接口
+    display/ (display_hal.cc, touch_feed.{cc,h}, esp_lcd_nv3051f.{c,h}, esp_lcd_fl7707n.{c,h})
+    backlight.{cc,h} + backlight_facade.cc   # PwmBacklight 内化
+    net/ (network.cc[=旧 dual_network_board+wifi_board], nt26_modem.{cc,h}, uart_eth_modem.{cc,h})
     bt/ (bt_module.cc, SimpleUart.hpp)
-    audio/ (audio_codec.{cc,h}, bt_audio_codec.{cc,h})
-    power/ (power.cc, bq27220_gauge.{cc,h}, wireless_charger.cc, i2c_device.{cc,h})
-    sysmon.cc                  # 监控任务 + system_info 工具
+    audio/ (audio_codec.cc, bt_audio_codec.{cc,h}, audio_facade.cc)
+    power/ (power.cc[含 Wxcho 无线充+开机电量保护], bq27220_gauge.{cc,h}, i2c_device.{cc,h})
+    sysmon.cc                  # 监控任务（原板级匿名 lambda）
     settings.cc
+    SdCardManager.hpp
 ```
 
 `main/` 终态：`main.cc`（新写）、`display/screen/pi_screen/*`、`display/screen/screen_util.{cc,h}`、`display/font/font_pi_*.c`、`CMakeLists.txt`、`idf_component.yml`（仅 UI 侧依赖）、`Kconfig.projbuild`（仅 pi 相关残留，语言/board/audio 选项删）。
 
-## 2. 门面 API 草案（签名以最终头文件为准）
+## 2. 门面 API（as-built，与头文件一致；每能力附调用示例）
 
-### hal.h
+### 一站式初始化 + 调用示例（main.cc 即最小示例）
 ```cpp
-namespace mhal {
-// I2C → IOExpander(上电序列) → BQ27220 → 开机电量保护 → BT UART+默认模式
-// → SD 挂载(失败不致命) → LCD(NV3051F/FL7707N) → GT911 → LVGL adapter 起显
-// → 无线充监控任务 → 背光恢复。全部完成后即可加载 LVGL screen。
-struct InitOptions {
-    bool mount_sd_card   = true;
-    bool bt_default_mode = true;   // 开机发 AT+RX=2 / AT+MODE=1
-    bool battery_boot_guard = true;// 0% 且未充电 → PWR_KEY_PULSE 强制关机
-};
-esp_err_t Init(const InitOptions& opts = {});
-}
+#include "metalio_hal/hal.h"
+mhal::Init();                       // 全部硬件就绪，LVGL 已在跑
+// 可选项：mhal::Init({.mount_sd_card=false, .bt_default_mode=false,
+//                     .battery_boot_guard=false, .restore_backlight=false});
 ```
 
-### display.h
+### display.h — 屏幕操作
 ```cpp
-namespace mhal::display {
-lv_display_t* GetLvDisplay();          // Init() 后有效
-bool Lock(int timeout_ms = -1);        // esp_lv_adapter_lock 包装
-void Unlock();
-int  Width();  int Height();           // 720/720
-}
+lv_display_t* GetLvDisplay();  bool Lock(int timeout_ms=-1);  void Unlock();
+int Width();  int Height();
+// 示例：加载首屏
+if (mhal::display::Lock()) { lv_screen_load(MyScreen()); mhal::display::Unlock(); }
 ```
 
-### backlight.h
+### backlight.h — 亮度
 ```cpp
-namespace mhal::backlight {
-void    SetBrightness(uint8_t percent, bool persist = false); // NVS "display"/"brightness"
-uint8_t GetBrightness();
-void    Restore();                     // Init() 已自动调用
-}
+void SetBrightness(uint8_t percent, bool persist=false);
+uint8_t GetBrightness();  void Restore();
+// 示例：调到 40% 并记住
+mhal::backlight::SetBrightness(40, /*persist=*/true);
 ```
 
-### network.h
+### network.h — Wi-Fi/4G 双网
 ```cpp
-namespace mhal::network {
-enum class Type { WiFi = 0, Cellular = 1 };          // NVS "network"/"type"
-enum class Event { ModemDetecting, Connecting, Connected, Disconnected,
-                   ErrorNoSim, ErrorRegDenied, ErrorTimeout, WifiNoCredentials };
-void Start();                        // 阻塞式起网（在后台任务里调）
-void StartAsync();                   // 内部 xTaskCreate 包装
-Type GetType();
-void SwitchType();                   // 持久化另一类型 + esp_restart()
+enum class Type { WiFi=0, Cellular=1 };            // NVS "network"/"type"
+enum class Event { WifiScanning, WifiConnecting, WifiConnected,
+    WifiNoCredentials, WifiConnectFailed, WifiConfigPortal,
+    ModemDetecting, CellularConnecting, CellularConnected,
+    CellularDisconnected, CellularErrorNoSim, CellularErrorRegDenied,
+    CellularErrorInitFailed, CellularErrorTimeout };
+void OnEvent(std::function<void(Event, const std::string&)> cb);
+bool Start();  void StartAsync();
+Type GetType();  void SwitchType();               // 持久化另一类型并重启
 bool IsConnected();
-void OnEvent(std::function<void(Event)> cb);   // 替代原 Display::SetStatus 耦合
-// Wi-Fi 配网：
-void AddWifiCredential(const std::string& ssid, const std::string& password); // SsidManager
-void StartConfigPortal();            // softAP 网页配网（阻塞，配置完成后设备重启）
-}
+void AddWifiCredential(const std::string& ssid, const std::string& pass);
+void StartConfigPortal();                          // softAP 网页配网，阻塞
+esp_err_t SendAtCommand(const std::string& cmd, std::string& resp,
+                        uint32_t timeout_ms=5000, bool bypass_init_check=false);
+int GetSignalStrength();                           // 4G CSQ；未就绪 -1
+std::string GetRegistrationStateJson();            // AT+CEREG 状态
+// 示例：订阅事件 + 后台起网
+mhal::network::OnEvent([](auto e, const std::string& d){
+    if (e == mhal::network::Event::WifiConnected) ESP_LOGI("app", "wifi up: %s", d.c_str());
+});
+mhal::network::StartAsync();
 ```
 
-### bluetooth.h
+### bluetooth.h — BT 音频模组
 ```cpp
-namespace mhal::bt {
-enum class Mode { None = 0, Rx = 1, Tx = 2, MusicRx = 3 };
+enum class Mode { None=0, Rx=1, Tx=2, MusicRx=3 };
 enum class ConnState { Idle, Scanning, Connecting, Connected };
-struct Device { std::string addr_hex; std::string name; };
-struct Callbacks {
-    std::function<void(Mode)>               on_mode_changed;
-    std::function<void(ConnState)>          on_conn_state;
-    std::function<void(const Device&)>      on_device_found;
-    std::function<void(const std::string&)> on_status_text;  // 原 post_status 文案
-};
-void SetCallbacks(Callbacks cbs);     // UI 可选订阅；lib 不反向依赖 UI
-void ApplyDefaultMode();              // AT+RX=2 → AT+MODE=1（Init 可自动做）
-void SetMode(Mode m);
-void StartScan();                     // AT+INQUIRING
-void Connect(const std::string& addr_hex);   // AT+CONNECT=<12hex>
-void EnterCallMode();  void EnterMusicMode();
-void PowerCycle();                    // IOExpander BT_POWER 断电 300ms 重上电
+void SetCallbacks(Callbacks cbs);   // on_mode_changed/on_conn_state/on_device_found/on_status_text
+void ApplyDefaultMode();  void SetMode(Mode);
+void StartScan();  void Connect(const std::string& addr_hex);
+void EnterCallMode();  void EnterMusicMode();  void PowerCycle();
 Mode GetMode();  ConnState GetConnState();
-}
+// 示例：扫描并连第一个发现的设备
+mhal::bt::SetCallbacks({.on_device_found = [](const mhal::bt::Device& d){
+    mhal::bt::Connect(d.addr_hex);
+}});
+mhal::bt::SetMode(mhal::bt::Mode::Tx);   // 回包确认后
+mhal::bt::StartScan();
 ```
 
-### audio.h
+### audio.h — mic/speaker PCM（未来 ASR 入口；惰性初始化）
 ```cpp
-namespace mhal::audio {
-AudioCodec* Codec();                  // BTAudioCodecDuplex 单例（I2S0 slave 16k）
+AudioCodec* Codec();                       // 完整类见公共头 audio_codec.h
 void EnableInput(bool);  void EnableOutput(bool);
-int  ReadPcm(int16_t* dst, int samples);        // mic → PCM（ASR 喂料入口）
-int  WritePcm(const int16_t* src, int samples); // PCM → speaker
-void SetVolume(int percent, bool persist = true); // NVS "audio"/"output_volume"
-int  GetVolume();
-}
+int ReadPcm(int16_t* dst, int samples);    // 16kHz 16-bit mono
+int WritePcm(const int16_t* src, int samples);
+void SetVolume(int percent, bool persist=true);  int GetVolume();
+// 示例：抓 20ms mic 帧喂 ASR
+mhal::audio::EnableInput(true);
+int16_t frame[320];
+mhal::audio::ReadPcm(frame, 320);
 ```
 
-### power.h
+### power.h — 电池/电源
 ```cpp
-namespace mhal::power {
-bool GetBatteryLevel(int& level, bool& charging, bool& discharging); // BQ27220
-bool GetVoltageMv(uint16_t& mv);
-bool GetCurrentMa(int16_t& ma);
-void ForcePowerOff();                 // PWR_KEY_PULSE ×10 脉冲
-}
+bool GetBatteryLevel(int& level, bool& charging, bool& discharging);
+bool GetVoltageMv(uint16_t& mv);  bool GetCurrentMa(int16_t& ma);
+void ForcePowerOff();                      // PWR_KEY_PULSE ×10，不返回
+// 示例
+int lv; bool chg, dis;
+if (mhal::power::GetBatteryLevel(lv, chg, dis)) ESP_LOGI("app", "bat %d%%", lv);
 ```
 
-### sysmon.h
+### sysmon.h — 系统监控
 ```cpp
-namespace mhal::sysmon {
-void Start(uint32_t period_ms = 1000); // 双核CPU占用/内存水位/电池 周期日志任务
-}
+void Start(uint32_t period_ms = 1000);     // 幂等
+// 示例
+mhal::sysmon::Start();
 ```
 
-### 按键
-直接暴露 `IOExpander.hpp`（现有单例 API：`onClick/offClick/onLongPress/setLevel/readLevel`），
-pi_screen 现有 `IOExpander::getInstance().onClick(PWR_KEY,…)` 用法不变。
+### IOExpander.hpp — 按键/电源轨（原 API 不变）
+```cpp
+// 示例：pi_screen 的电源键注册（现有代码零改动）
+IOExpander::getInstance().onClick(IOExpander::Pin::PWR_KEY, [](){ /* ... */ });
+IOExpander::getInstance().onLongPress(IOExpander::Pin::PWR_KEY, 1500, [](){ /* 关机 */ });
+IOExpander::getInstance().setLevel(IOExpander::Pin::BT_POWER, true);
+```
+
+### settings.h — NVS 包装（原 API 不变）
+```cpp
+Settings s("pi_screen", /*read_write=*/true);
+s.SetInt("zen", 1);  int zen = s.GetInt("zen", 0);
+```
 
 ## 3. 剥离映射表（旧 → 新 → 耦合点处理）
 
 | 旧位置 | 新位置 | 耦合点处理 |
 |---|---|---|
 | boards/metalio-claw-4/metalio-claw-4.cc 构造序列 | src/hal.cc | 类解散为 Init()；DECLARE_BOARD/Board 单例删除 |
-| 〃 InitializeLCD/Touch（NV3051F/FL7707N/GT911） | src/display/display.cc | camera 用的 panel_io 全局导出删除（camera 已亡） |
+| 〃 InitializeLCD/Touch（NV3051F/FL7707N/GT911） | src/display/display_hal.cc | camera 用的 panel_io 全局导出删除（camera 已亡） |
 | 〃 监控任务(lambda "_task") | src/sysmon.cc | 无耦合，原样搬 |
 | 〃 CheckBatteryLevelAtBoot/Wxcho 无线充 | src/power/ | 无耦合，原样搬 |
 | 〃 InitializeBTAudio + bluetooth_screen 的 AT/状态机 | src/bt/bt_module.cc | UI 写屏（post_status/add_device_to_list/lv_async_call）翻转为 Callbacks；LOAD/UNLOAD 注册的 UART 回调改 Init 时常驻 |
-| boards/metalio-claw-4/config.h | src/board_pins.h | 无耦合 |
+| boards/metalio-claw-4/config.h | src/config.h（保留原名） | 无耦合 |
 | boards/metalio-claw-4/esp_lcd_{nv3051f,fl7707n}.{c,h} | src/display/ | 无耦合 |
-| boards/common/wifi_board.cc StartNetwork/EnterWifiConfigMode | src/net/wifi_backend.cc | Display::ShowNotification→OnEvent；Application::Alert/SetDeviceState→删；Lang::*→硬编码中文日志；afsk 声波配网删（Kconfig 未开） |
+| boards/common/wifi_board.cc StartNetwork/EnterWifiConfigMode | src/net/network.cc（Wi-Fi 分支） | Display::ShowNotification→OnEvent；Application::Alert/SetDeviceState→删；Lang::*→硬编码中文日志；afsk 声波配网删（Kconfig 未开） |
 | boards/common/{dual_network_board,nt26_board,uart_eth_modem}.cc | src/net/ | Display::SetStatus→OnEvent；Application::Reboot→esp_restart；Application::Schedule→一次性 task（沿 2f05882 方案）；GetBoardJson/GetDeviceStatusJson/GetNetworkStateIcon 删（唯一调用方 ota/mcp/状态栏均亡） |
 | boards/common/ml307_board.* | 删除 | 从未实例化（dual_network_board.cc:59 注释），78/esp-ml307 依赖一并删 |
 | boards/common/board.{h,cc}（Board 基类） | 解散删除 | GetUuid/GetSystemInfoJson 调用方全亡；http/websocket/mqtt/udp/NetworkInterface 抽象无人用（pi 走 esp_http_client） |
@@ -176,7 +181,7 @@ pi_screen 现有 `IOExpander::getInstance().onClick(PWR_KEY,…)` 用法不变�
 | audio/audio_codec.{h,cc}、boards/common/bt_audio_codec.* | src/audio/ | audio_codec.cc 的 `#include "board.h"` 删（无实际使用）；其余 codec（es83xx/box/no/dummy）+AudioService+processors+wake_words 删 |
 | main/settings.{cc,h} | lib include/settings.h + src/settings.cc | pi_screen include 路径不变 |
 | main/system_info.* | 并入 src/sysmon.cc 私有 | GetUserAgent（dynamic_cast DualNetworkBoard，仅 protocols 用）删 |
-| display/lv_adapter_display.cc 的 adapter 初始化 | src/display/display.cc | SetupUI/BootScreen 逻辑移出到 main.cc；resources mmap 两段删（pi 字体全编译进固件）；Display 类层次删除 |
+| display/lv_adapter_display.cc 的 adapter 初始化 | src/display/display_hal.cc | SetupUI/BootScreen 逻辑移出到 main.cc；resources mmap 两段删（pi 字体全编译进固件）；Display 类层次删除 |
 | display/touch_feed.* | src/display/ | 无耦合 |
 
 ## 4. 删除清单（业务层，git 历史保底）
