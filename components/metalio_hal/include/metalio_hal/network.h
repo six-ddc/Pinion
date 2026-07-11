@@ -1,0 +1,71 @@
+#pragma once
+
+#include <esp_err.h>
+#include <cstdint>
+#include <functional>
+#include <string>
+
+// 双网络门面：Wi-Fi（ESP32-C5 ESP-Hosted SDIO 全栈）+ 4G（NT26 UART1
+// 2Mbps + iot_eth）。当前网络类型持久化于 NVS "network"/"type"
+// （0=WiFi，1=Cellular），与旧固件一致。
+//
+// 原 board 层在起网过程中直接写 Display 状态栏；lib 化后全部翻转为
+// OnEvent() 回调，UI 想显示什么自己订阅。
+namespace mhal::network {
+
+enum class Type { WiFi = 0, Cellular = 1 };
+
+enum class Event {
+    // Wi-Fi 路径
+    WifiScanning,
+    WifiConnecting,        // data = ssid
+    WifiConnected,         // data = ssid
+    WifiNoCredentials,     // NVS "wifi" 无任何已存 SSID
+    WifiConnectFailed,     // 60s 内未连上
+    WifiConfigPortal,      // data = "ssid|url"（softAP 配网页已起）
+    // 4G 路径
+    ModemDetecting,
+    CellularConnecting,
+    CellularConnected,
+    CellularDisconnected,
+    CellularErrorNoSim,
+    CellularErrorRegDenied,
+    CellularErrorInitFailed,
+    CellularErrorTimeout,
+};
+
+using EventCallback = std::function<void(Event event, const std::string& data)>;
+
+// 事件回调（在网络栈自身任务上下文触发；要动 LVGL 请自行切线程/加锁）。
+// 必须在 Start 之前注册才能收到起网过程事件。
+void OnEvent(EventCallback cb);
+
+// 按当前 Type 起网。阻塞（Wi-Fi 最长 60s；4G 检测+注册最长约 90s），
+// 返回是否已连通。在专用任务里调，或直接用 StartAsync()。
+bool Start();
+// xTaskCreate 包装：后台起网，结果通过 OnEvent 观察。
+void StartAsync();
+
+Type GetType();
+// 持久化另一种网络类型并 esp_restart()（沿用旧固件的切换语义，不返回）。
+void SwitchType();
+
+bool IsConnected();
+
+// —— Wi-Fi 配网 ——
+// 追加一组凭据到 NVS "wifi"（SsidManager），下次 Start 即可用。
+void AddWifiCredential(const std::string& ssid, const std::string& password);
+// 起 softAP + 网页配网（阻塞不返回；用户提交凭据后设备重启）。
+void StartConfigPortal();
+
+// —— 4G 专属（WiFi 模式或 modem 未就绪时返回 ESP_ERR_INVALID_STATE）——
+// 透传 AT 命令（线程安全）。bypass_init_check 见旧 Nt26Board 注释：
+// 未插卡时 modem 不会 initialized 但 AT 通道可用（如切卡场景）。
+esp_err_t SendAtCommand(const std::string& cmd, std::string& response,
+                        uint32_t timeout_ms = 5000, bool bypass_init_check = false);
+// CSQ 信号强度（0-31，99/-1=未知）；modem 未就绪返回 -1。
+int GetSignalStrength();
+// AT+CEREG 注册状态 JSON（{"stat":1,...}；stat 1/5=已注册）。
+std::string GetRegistrationStateJson();
+
+}  // namespace mhal::network

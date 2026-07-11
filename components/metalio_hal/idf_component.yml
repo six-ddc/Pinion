@@ -1,0 +1,21 @@
+## metalio_hal —— metalio-claw-4 硬件能力库的自有依赖。
+## 版本号与原工程 main/idf_component.yml 中对应条目保持一致。
+dependencies:
+  # 显示：LVGL + esp_lv_adapter（其自身携带 esp_lcd_touch/esp_lv_decoder 等）
+  lvgl/lvgl: ~9.3.0
+  espressif/esp_lvgl_adapter: ^0.5.0
+  espressif/esp_lcd_touch_gt911: ^1
+  # IOExpander（TCA9555）
+  espressif/esp_io_expander_tca95xx_16bit: ^2.0.0
+  # Wi-Fi：ESP32-C5 ESP-Hosted SDIO + esp-wifi-connect（station/配网/凭据）
+  78/esp-wifi-connect: ~2.6.2
+  espressif/esp_hosted:
+    version: 2.12.3
+    rules:
+    - if: target in [esp32h2, esp32p4]
+  espressif/esp_wifi_remote: ^1.5.3
+  # 4G：uart_eth_modem（已 vendored 至 src/net/）的两个底层依赖
+  78/uart-uhci: ~0.2.1
+  espressif/iot_eth: ^0.1.0
+  # uart-uhci 需要 >=5.5.2 的 UHCI driver
+  idf: '>=5.5.2'
