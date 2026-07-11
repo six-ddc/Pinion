@@ -10,7 +10,7 @@ set(PROJECT_VER "2.0.5")
 add_compile_options(-Wno-missing-field-initializers)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(xiaozhi)
+project(pi_terminal)
 
 # Override esp-sr packed model with custom wakeword when present
 if(EXISTS "${CMAKE_SOURCE_DIR}/wakeword/srmodels.bin")

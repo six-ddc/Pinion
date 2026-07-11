@@ -8,7 +8,7 @@ build*/
 sdkconfig
 sdkconfig.old
 dependencies.lock
-.esp-idf/
+.esp-idf
 .idf-env.sh
 .env
 releases/
