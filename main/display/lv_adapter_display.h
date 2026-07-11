@@ -8,7 +8,6 @@
 #include <string>
 #include "display.h"
 #include "esp_lv_adapter.h"
-#include "lvgl_font.h"
 
 class LVAdapterDisplay : public Display {
 public:
@@ -16,9 +15,11 @@ public:
                      const esp_lcd_touch_handle_t touch_handle, int width, int height);
     virtual ~LVAdapterDisplay();
 
-    virtual void SetEmotion(const char* emotion) override;
+    // No SetEmotion/SetChatMessage override: those routed to chat_screen /
+    // digital_people_screen, which don't exist in this pi-only firmware.
+    // Display's base-class no-op implementations cover any residual caller
+    // (e.g. board/network code calling GetDisplay()->SetStatus(...)).
     virtual void SetStatus(const char* status) override;
-    virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void SetTheme(Theme* theme) override;
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
     virtual void UpdateStatusBar(bool update_all = false) override;

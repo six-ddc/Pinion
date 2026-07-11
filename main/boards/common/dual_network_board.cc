@@ -1,9 +1,9 @@
 #include "dual_network_board.h"
-#include "application.h"
 #include "display.h"
 #include "assets/lang_config.h"
 #include "settings.h"
 #include <esp_log.h>
+#include <esp_system.h>
 
 static const char *TAG = "DualNetworkBoard";
 
@@ -73,8 +73,9 @@ void DualNetworkBoard::SwitchNetworkType() {
         display->ShowNotification(Lang::Strings::SWITCH_TO_WIFI_NETWORK);
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
-    auto& app = Application::GetInstance();
-    app.Reboot();
+    // No Application in this firmware; esp_restart() is what
+    // Application::Reboot() ultimately called anyway.
+    esp_restart();
 }
 
  
