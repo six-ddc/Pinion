@@ -1,0 +1,7 @@
+## volc_speech —— 火山引擎流式语音（ASR/TTS）设备端直连组件的自有依赖。
+dependencies:
+  # WSS 客户端（TLS 走 esp-tls + 证书包，sdkconfig 已开 MBEDTLS_CERTIFICATE_BUNDLE）
+  espressif/esp_websocket_client: ^1.2.0
+  # gzip 压缩/解压（火山 v3 二进制协议 payload 压缩）
+  espressif/zlib: ^1.3.0
+  idf: '>=5.5.2'

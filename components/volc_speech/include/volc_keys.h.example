@@ -1,0 +1,12 @@
+// 火山引擎语音密钥模板。
+//
+// 使用方法：复制本文件为同目录 volc_keys.h（已在仓库 .gitignore 中按文件名
+// 全局忽略），填入火山引擎控制台的 App ID 与 Access Token。
+// 对应产品需开通：流式语音识别大模型（volc.seedasr.sauc.duration）与
+// 双向流式语音合成（seed-tts-2.0）。
+//
+// 红线：volc_keys.h 绝不提交入库，key 值绝不出现在日志里。
+#pragma once
+
+#define VOLC_APP_KEY    ""
+#define VOLC_ACCESS_KEY ""
