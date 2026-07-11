@@ -1,12 +1,12 @@
 #include "nt26_board.h"
 #include "display.h"
+#include "application.h"
+#include "audio_codec.h"
 #include "assets/lang_config.h"
 #include <esp_log.h>
 #include <font_awesome.h>
 #include <cJSON.h>
 #include "board.h"
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
 #define TAG "Nt26Board"
 
@@ -195,18 +195,11 @@ void Nt26Board::StartNetwork() {
 }
 
 void Nt26Board::ScheduleAsyncStop() {
-    // No Application event loop to Schedule() onto in this firmware; a
-    // one-shot task gives the same "defer off the current (likely modem
-    // callback) context" semantics.
-    xTaskCreate(
-        [](void* arg) {
-            auto* self = static_cast<Nt26Board*>(arg);
-            if (self->modem_) {
-                self->modem_->Stop();
-            }
-            vTaskDelete(nullptr);
-        },
-        "nt26_async_stop", 4096, this, tskIDLE_PRIORITY + 1, nullptr);
+    Application::GetInstance().Schedule([this]() {
+        if (modem_) {
+            modem_->Stop();
+        }
+    });
 }
 
 void Nt26Board::SetNetworkEventCallback(NetworkEventCallback callback) {
@@ -306,8 +299,12 @@ std::string Nt26Board::GetDeviceStatusJson() {
     auto& board = Board::GetInstance();
     auto root = cJSON_CreateObject();
 
-    // No audio codec in this pi-only firmware (AudioCodec doesn't exist).
+    // Audio speaker
     auto audio_speaker = cJSON_CreateObject();
+    auto audio_codec = board.GetAudioCodec();
+    if (audio_codec) {
+        cJSON_AddNumberToObject(audio_speaker, "volume", audio_codec->output_volume());
+    }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
     // Screen

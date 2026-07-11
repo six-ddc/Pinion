@@ -4,6 +4,9 @@
 
 #include "esp_log.h"
 
+#include "IOExpander.hpp"
+#include "application.h"
+
 namespace {
 
 constexpr const char* kScreenUtilTag = "ScreenUtil";
@@ -244,9 +247,17 @@ void screen_attach_lifecycle(lv_obj_t* scr, screen_lifecycle_cb_t cb) {
                         user_data);
 }
 
-// screen_register_pwr_key_toggle_chat()/screen_unregister_pwr_key_toggle_chat()
-// (the chat_screen/digital_people_screen PWR_KEY-toggles-chat-state helper)
-// were removed here: chat_screen is gone in this pi-only firmware, and
-// pi_screen registers its own PWR_KEY click handler directly via
-// IOExpander (see pi_screen.cc's LifecycleCallback), so nothing called
-// these. See screen_util.h for the matching declaration removal.
+void screen_register_pwr_key_toggle_chat() {
+    const esp_err_t err = IOExpander::getInstance().onClick(
+        IOExpander::Pin::PWR_KEY, []() {
+            Application::GetInstance().ToggleChatState();
+        });
+    if (err != ESP_OK) {
+        ESP_LOGW(kScreenUtilTag, "PWR_KEY toggle register failed: 0x%x",
+                 static_cast<unsigned>(err));
+    }
+}
+
+void screen_unregister_pwr_key_toggle_chat() {
+    IOExpander::getInstance().offClick(IOExpander::Pin::PWR_KEY);
+}

@@ -1,4 +1,5 @@
 #include "power_save_timer.h"
+#include "application.h"
 #include "settings.h"
 
 #include <esp_log.h>
@@ -59,10 +60,12 @@ void PowerSaveTimer::OnShutdownRequest(std::function<void()> callback) {
 }
 
 void PowerSaveTimer::PowerSaveCheck() {
-    // No Application/audio codec in this firmware (no CanEnterSleepMode()
-    // gate, no wake-word/audio-input to disable); PowerSaveTimer is never
-    // instantiated by metalio-claw-4's board ctor, so this runs unreached,
-    // but it still has to compile.
+    auto& app = Application::GetInstance();
+    if (!in_sleep_mode_ && !app.CanEnterSleepMode()) {
+        ticks_ = 0;
+        return;
+    }
+
     ticks_++;
     if (seconds_to_sleep_ != -1 && ticks_ >= seconds_to_sleep_) {
         if (!in_sleep_mode_) {
@@ -73,6 +76,19 @@ void PowerSaveTimer::PowerSaveCheck() {
             }
 
             if (cpu_max_freq_ != -1) {
+                // Disable wake word detection
+                auto& audio_service = app.GetAudioService();
+                is_wake_word_running_ = audio_service.IsWakeWordRunning();
+                if (is_wake_word_running_) {
+                    audio_service.EnableWakeWordDetection(false);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                // Disable audio input
+                auto codec = Board::GetInstance().GetAudioCodec();
+                if (codec) {
+                    codec->EnableInput(false);
+                }
+
                 esp_pm_config_t pm_config = {
                     .max_freq_mhz = cpu_max_freq_,
                     .min_freq_mhz = 40,
@@ -100,6 +116,13 @@ void PowerSaveTimer::WakeUp() {
                 .light_sleep_enable = false,
             };
             esp_pm_configure(&pm_config);
+
+            // Enable wake word detection
+            auto& app = Application::GetInstance();
+            auto& audio_service = app.GetAudioService();
+            if (is_wake_word_running_) {
+                audio_service.EnableWakeWordDetection(true);
+            }
         }
 
         if (on_exit_sleep_mode_) {

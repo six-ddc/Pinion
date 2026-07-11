@@ -1,3 +1,4 @@
+#include "application.h"
 #include "button.h"
 #include "config.h"
 #include "display/lv_adapter_display.h"
@@ -39,11 +40,14 @@
 #include <cstring>
 #include <iostream>
 #include "IOExpander.hpp"
+#include "SimpleUart.hpp"
 // #include "power_manager.h"
 // #include "power_save_timer.h"
 
 #include "SdCardManager.hpp"
 #include "bq27220_gauge.h"
+#include "bt_audio_codec.h"
+#include "display/screen/bluetooth_screen/bluetooth_screen.h"
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -173,9 +177,19 @@ private:
         iOExpander.setLevel(IOExpander::Pin::SD, false);
     }
 
-    // InitializeBTAudio() removed: it only ever drove BluetoothScreen
-    // (deleted -- pi-only firmware) via SimpleUart/BT_AUDIO_*_PIN, no other
-    // caller depended on it.
+    void InitializeBTAudio() {
+        SimpleUart& uart = SimpleUart::getInstance();
+        if (uart.begin(BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN, 115200, UART_NUM_2)) {
+            ESP_LOGI(TAG, "UART initialized successfully!");
+        } else {
+            ESP_LOGI(TAG, "UART initialization failed!");
+            return;
+        }
+        // 设备开机默认进入蓝牙模式1（AT+RX=2 -> AT+MODE=1，接收模式）。
+        // ApplyDefaultMode() 内部用独立 FreeRTOS task 发送 AT 命令，UI 未
+        // 起来阶段调用是安全的（post_status / lv_async_call 都有守卫）。
+        BluetoothScreen::ApplyDefaultMode();
+    }
 
     static esp_err_t bsp_enable_dsi_phy_power(void) {
 #if MIPI_DSI_PHY_PWR_LDO_CHAN > 0
@@ -513,6 +527,7 @@ public:
         // ESP_ERROR_CHECK。
         (void)Bq27220Gauge::GetInstance().Begin(i2c_bus_);
         CheckBatteryLevelAtBoot();
+        InitializeBTAudio();
         // SD 卡的 LDO（chan 4）在 InitializeSDWIFIPower() 里已经打开，这里
         // 直接挂载，进入 SdCardScreen 时就能直接看状态、不需要再 mount。
         InitializeSdCard();
@@ -649,10 +664,12 @@ public:
             "_task", 8192, this, 5, NULL);
     }
 
-    // No audio codec in this pi-only firmware (BtAudioCodec/audio subsystem
-    // deleted); matches ml307_board.h/nt26_board.h's own GetAudioCodec()
-    // override.
-    virtual AudioCodec* GetAudioCodec() override { return nullptr; }
+    virtual AudioCodec* GetAudioCodec() override {
+        static BTAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+                                              AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_MIC_GPIO_WS,
+                                              AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_DIN);
+        return &audio_codec;
+    }
 
     virtual Display* GetDisplay() override { return display_; }
 

@@ -1,11 +1,11 @@
 #include "wifi_board.h"
 
+#include "application.h"
 #include "assets/lang_config.h"
 #include "display.h"
 #include "settings.h"
 #include "system_info.h"
 
-#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_network.h>
 #include <freertos/FreeRTOS.h>
@@ -15,9 +15,7 @@
 #include <ssid_manager.h>
 #include <wifi_configuration_ap.h>
 #include <wifi_station.h>
-// Acoustic (audio-tone) Wi-Fi provisioning is gone with the audio
-// subsystem; CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING is unset in this
-// firmware's sdkconfig, so the #if below already compiles out.
+#include "afsk_demod.h"
 
 static const char* TAG = "WifiBoard";
 
@@ -32,27 +30,37 @@ WifiBoard::WifiBoard() {
 
 std::string WifiBoard::GetBoardType() { return "wifi"; }
 
-// Captive-portal AP config mode. Unreachable in this pi-only firmware as of
-// WP2 (its call sites in StartNetwork() below are commented out, same as
-// upstream) -- wiring it up for real is WP4's job (blueprint §3 WP4:
-// uncomment the call sites + this becomes the primary Wi-Fi provisioning
-// path). Application::Alert()/SetDeviceState() calls were dropped here
-// since Application doesn't exist in this firmware; when WP4 wires this up
-// it should drive pi_screen's own UI instead (a status line, not the old
-// voice-assistant alert banner).
 void WifiBoard::EnterWifiConfigMode() {
+    auto& application = Application::GetInstance();
+    application.SetDeviceState(kDeviceStateWifiConfiguring);
+
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
     wifi_ap.SetSsidPrefix("Xiaozhi");
     wifi_ap.Start();
 
-    ESP_LOGI(TAG, "WiFi config AP started: %s (%s)", wifi_ap.GetSsid().c_str(),
-             wifi_ap.GetWebServerUrl().c_str());
+    // Wait 1.5 seconds to display board information
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    // Display WiFi configuration AP SSID and web server URL
+    std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
+    hint += wifi_ap.GetSsid();
+    hint += Lang::Strings::ACCESS_VIA_BROWSER;
+    hint += wifi_ap.GetWebServerUrl();
+
+    // Announce WiFi configuration prompt
+    application.Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear",
+                      Lang::Sounds::OGG_WIFICONFIG);
 
 #if CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING
     auto display = Board::GetInstance().GetDisplay();
-    ESP_LOGI(TAG, "Start receiving WiFi credentials from audio");
-    audio_wifi_config::ReceiveWifiCredentialsFromAudio(nullptr, &wifi_ap, display, 1);
+    auto codec = Board::GetInstance().GetAudioCodec();
+    int channel = 1;
+    if (codec) {
+        channel = codec->input_channels();
+    }
+    ESP_LOGI(TAG, "Start receiving WiFi credentials from audio, input channels: %d", channel);
+    audio_wifi_config::ReceiveWifiCredentialsFromAudio(&application, &wifi_ap, display, channel);
 #endif
 
     // Wait forever until reset after configuration
@@ -202,10 +210,12 @@ std::string WifiBoard::GetDeviceStatusJson() {
     auto& board = Board::GetInstance();
     auto root = cJSON_CreateObject();
 
-    // No audio codec in this pi-only firmware (AudioCodec doesn't exist);
-    // GetBoardJson() is unreachable dead code now that mcp_server.cc/ota.cc
-    // (its only callers) are gone, but it still has to compile.
+    // Audio speaker
     auto audio_speaker = cJSON_CreateObject();
+    auto audio_codec = board.GetAudioCodec();
+    if (audio_codec) {
+        cJSON_AddNumberToObject(audio_speaker, "volume", audio_codec->output_volume());
+    }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
     // Screen brightness

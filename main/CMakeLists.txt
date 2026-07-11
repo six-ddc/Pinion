@@ -1,20 +1,108 @@
 # Define source files
-set(SOURCES "display/display.cc"
+set(SOURCES "audio/audio_codec.cc"
+            "audio/audio_service.cc"
+            "audio/codecs/no_audio_codec.cc"
+            "audio/codecs/box_audio_codec.cc"
+            "audio/codecs/es8311_audio_codec.cc"
+            "audio/codecs/es8374_audio_codec.cc"
+            "audio/codecs/es8388_audio_codec.cc"
+            "audio/codecs/es8389_audio_codec.cc"
+            "audio/codecs/dummy_audio_codec.cc"
+            "audio/processors/audio_debugger.cc"
+            "led/single_led.cc"
+            "led/circular_strip.cc"
+            "led/gpio_led.cc"
+            "display/display.cc"
+            "display/lcd_display.cc"
+            "display/oled_display.cc"
             "display/lv_adapter_display.cc"
             "display/touch_feed.cc"
+            "display/font/font_puhui_number_50_4.c"
+            "display/font/font_puhui_40_4.c"
+            "display/theme_manager.cc"
             "display/screen/screen_util.cc"
+            "display/screen/boot_screen/boot_screen.cc"
+            "display/screen/ota_screen/ota_screen.cc"
+            "display/screen/home_screen/home_screen.cc"
+            "display/screen/theme_screen/theme_screen.cc"
+            "display/screen/info_screen/info_screen.cc"
+            "display/screen/stock_screen/stock_screen.cc"
+            "display/screen/stock_screen/stock_list_view.cc"
+            "display/screen/stock_screen/stock_detail_view.cc"
+            "display/screen/stock_screen/stock_chart_renderer.cc"
+            "display/screen/stock_screen/stock_kline_window.cc"
+            "display/screen/stock_screen/stock_settings_view.cc"
+            "stock/stock_api.cc"
+            "stock/stock_fetch_worker.cc"
+            "stock/beijing_clock.cc"
+            "stock/stock_store.cc"
+            "stock/stock_config_server.cc"
+            "display/screen/ebook_screen/ebook_screen.cc"
+            "display/screen/ebook_screen/bookshelf_view.cc"
+            "display/screen/ebook_screen/reader_view.cc"
+            "display/screen/ebook_screen/reader_menu_view.cc"
+            "display/screen/ebook_screen/manage_view.cc"
+            "ebook/book_store.cc"
+            "ebook/book_source.cc"
+            "ebook/paginator.cc"
+            "ebook/ebook_worker.cc"
+            "ebook/ebook_font.cc"
+            "ebook/font_mem_vfs.cc"
+            "ebook/book_config_server.cc"
+            "ebook/zip_reader.cc"
+            "ebook/epub_source.cc"
+            "ebook/html_extract.cc"
+            "ebook/image_decode.cc"
+            "display/screen/game_2048_screen/game_2048_screen.cc"
+            "display/screen/calculator_screen/calculator_screen.cc"
+            "display/screen/calendar_screen/calendar_screen.cc"
+            "display/screen/music_screen/music_screen.cc"
+            "display/screen/weather_screen/weather_screen.cc"
+            "display/screen/weather_screen/weather_icon_map.cc"
+            "display/screen/weather_screen/weather_city_list.cc"
+            "display/screen/gps_screen/gps_screen.cc"
+            "display/screen/camera_screen/camera_screen.cc"
+            "display/screen/vibrate_screen/vibrate_screen.cc"
+            "display/screen/backlight_screen/backlight_screen.cc"
+            "display/screen/call_screen/call_screen.cc"
+            "display/screen/bluetooth_screen/bluetooth_screen.cc"
+            "display/screen/chat_screen/chat_screen.cc"
+            "display/screen/network_screen/network_screen.cc"
+            "display/screen/digital_people_screen/digital_people_screen.cc"
+            "display/screen/level_screen/level_screen.cc"
+            "display/screen/magnet_screen/magnet_screen.cc"
+            "display/screen/sd_card_screen/sd_card_screen.cc"
+            "display/screen/pin_test_screen/pin_test_screen.cc"
+            "display/screen/openclaw_screen/openclaw_screen.cc"
             "display/screen/pi_screen/pi_screen.cc"
             "display/screen/pi_screen/pi_agent_task.c"
             "display/screen/pi_screen/pi_mock_paced.c"
             "display/font/font_pi_mono_14.c"
             "display/font/font_pi_mono_17.c"
             "display/font/font_pi_clock_132.c"
+            "display/lvgl_display/lvgl_display.cc"
+            "display/lvgl_display/emoji_collection.cc"
+            "display/lvgl_display/lvgl_theme.cc"
+            "display/lvgl_display/lvgl_font.cc"
+            "display/lvgl_display/lvgl_image.cc"
+            "display/lvgl_display/gif/lvgl_gif.cc"
+            "display/lvgl_display/gif/gifdec.c"
+            "display/lvgl_display/jpg/image_to_jpeg.cpp"
+            "display/lvgl_display/jpg/jpeg_to_image.c"
+            "protocols/protocol.cc"
+            "protocols/mqtt_protocol.cc"
+            "protocols/websocket_protocol.cc"
+            "mcp_server.cc"
             "system_info.cc"
+            "application.cc"
+            "ota.cc"
             "settings.cc"
+            "device_state_event.cc"
+            "assets.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/font" "display/screen" "display/screen/pi_screen")
+set(INCLUDE_DIRS "." "display" "display/font" "display/lvgl_display" "display/lvgl_display/jpg" "display/screen" "display/screen/boot_screen" "display/screen/ota_screen" "display/screen/home_screen" "display/screen/game_2048_screen" "display/screen/calculator_screen" "display/screen/calendar_screen" "display/screen/music_screen" "display/screen/weather_screen" "display/screen/gps_screen" "display/screen/camera_screen" "display/screen/vibrate_screen" "display/screen/backlight_screen" "display/screen/call_screen" "display/screen/bluetooth_screen" "display/screen/chat_screen" "display/screen/network_screen" "display/screen/digital_people_screen" "display/screen/level_screen" "display/screen/magnet_screen" "display/screen/sd_card_screen" "display/screen/pin_test_screen" "display/screen/openclaw_screen" "display/screen/theme_screen" "display/screen/info_screen" "display/screen/stock_screen" "stock" "display/screen/ebook_screen" "ebook" "audio" "protocols" "display/screen/pi_screen")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
@@ -52,6 +140,19 @@ file(GLOB BOARD_SOURCES
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE})
+
+# Select audio processor according to Kconfig
+if(CONFIG_USE_AUDIO_PROCESSOR)
+    list(APPEND SOURCES "audio/processors/afe_audio_processor.cc")
+else()
+    list(APPEND SOURCES "audio/processors/no_audio_processor.cc")
+endif()
+if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
+    list(APPEND SOURCES "audio/wake_words/afe_wake_word.cc")
+    list(APPEND SOURCES "audio/wake_words/custom_wake_word.cc")
+else()
+    list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
+endif()
 
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
@@ -136,11 +237,46 @@ endif()
 set(LANG_JSON "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/${LANG_DIR}/language.json")
 set(LANG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_config.h")
 
-# No voice-prompt .ogg embedding: pi has no audio/TTS (blueprint WP2 "EMBED_FILES
-# 语音删"). LANG_JSON/LANG_HEADER above stay -- board.cc still uses Lang::CODE
-# for its device-info JSON.
+# Collect current language audio files
+file(GLOB LANG_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/${LANG_DIR}/*.ogg)
+
+# If not en-US, collect en-US audio files as fallback for missing files
+if(NOT LANG_DIR STREQUAL "en-US")
+    file(GLOB EN_US_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/en-US/*.ogg)
+    
+    # Extract filenames (without path) from current language
+    set(EXISTING_NAMES "")
+    foreach(SOUND_FILE ${LANG_SOUNDS})
+        get_filename_component(FILENAME ${SOUND_FILE} NAME)
+        list(APPEND EXISTING_NAMES ${FILENAME})
+    endforeach()
+    
+    # Only add en-US audio files that are missing in current language
+    foreach(EN_SOUND ${EN_US_SOUNDS})
+        get_filename_component(FILENAME ${EN_SOUND} NAME)
+        if(NOT ${FILENAME} IN_LIST EXISTING_NAMES)
+            list(APPEND LANG_SOUNDS ${EN_SOUND})
+            message(STATUS "Using en-US fallback for missing audio: ${FILENAME}")
+        endif()
+    endforeach()
+endif()
+
+file(GLOB COMMON_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/common/*.ogg)
+
+# If target chip is ESP32, exclude specific files to avoid build errors
+if(CONFIG_IDF_TARGET_ESP32)
+    list(REMOVE_ITEM SOURCES "audio/codecs/box_audio_codec.cc"
+                             "audio/codecs/es8388_audio_codec.cc"
+                             "audio/codecs/es8389_audio_codec.cc"
+                             "led/gpio_led.cc"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/esp32_camera.cc"
+                             "display/lvgl_display/jpg/image_to_jpeg.cpp"
+                             "display/lvgl_display/jpg/jpeg_to_image.c"
+                             )
+endif()
 
 idf_component_register(SRCS ${SOURCES}
+                    EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     )

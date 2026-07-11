@@ -11,6 +11,7 @@
 #include "esp_log.h"
 
 #include "IOExpander.hpp"
+#include "home_screen/home_screen.h"
 #include "pi_fonts.h"
 #include "pi_ui_bridge.h"
 #include "screen_util.h"
@@ -1788,6 +1789,10 @@ lv_obj_t* PiScreen::Create() {
     // Persistent PTT touch target, y:[kSbarH, kH). Built last so it sits on
     // top of the idle/listen content in z-order; hidden while in Chat so
     // the feed's scroll/tap and the dock buttons receive touches directly.
+    // Deliberately NOT tagged screen_swipe_back_ignore(): a clear rightward
+    // swipe across it should still exit to the home menu (a plain
+    // press-and-hold in place has dx~0 and never crosses the swipe-back
+    // threshold, so the two gestures don't collide in practice).
     s_ptt_layer = lv_obj_create(scr);
     screen_strip_obj_chrome(s_ptt_layer);
     lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_SCROLLABLE);
@@ -1805,8 +1810,14 @@ lv_obj_t* PiScreen::Create() {
     s_drain_timer = lv_timer_create(DrainQueueTick, 80, nullptr);
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);
 
-    // Single-app firmware (Claw6): no home menu to swipe back to, so unlike
-    // Claw5's pi_screen there is no screen_attach_swipe_back() here.
+    screen_attach_swipe_back(scr, []() {
+        lv_indev_t* indev = lv_indev_active();
+        if (indev != nullptr) lv_indev_wait_release(indev);
+        lv_obj_t* old_scr = lv_screen_active();
+        lv_obj_t* home = HomeScreen::Create();
+        lv_screen_load(home);
+        if (old_scr != nullptr && old_scr != home) lv_obj_delete_async(old_scr);
+    });
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
 
     return scr;

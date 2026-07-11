@@ -2,6 +2,7 @@
 #include "system_info.h"
 #include "settings.h"
 #include "display/display.h"
+#include "display/oled_display.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
@@ -158,11 +159,11 @@ std::string Board::GetSystemInfoJson() {
     auto display = GetDisplay();
     if (display) {
         json += R"("display":{)";
-        // No OledDisplay in this pi-only firmware (LVAdapterDisplay/color
-        // LCD only); GetSystemInfoJson() itself is unused dead code now
-        // that ota.cc/mcp_server.cc (its only callers) are gone, but it
-        // still has to compile as part of Board.
-        json += R"("monochrome":)" + std::string("false") + R"(,)";
+        if (dynamic_cast<OledDisplay*>(display)) {
+            json += R"("monochrome":)" + std::string("true") + R"(,)";
+        } else {
+            json += R"("monochrome":)" + std::string("false") + R"(,)";
+        }
         json += R"("width":)" + std::to_string(display->width()) + R"(,)";
         json += R"("height":)" + std::to_string(display->height()) + R"(,)";
         json.pop_back(); // Remove the last comma

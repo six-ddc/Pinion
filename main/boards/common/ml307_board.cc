@@ -1,9 +1,9 @@
 #include "ml307_board.h"
 
+#include "application.h"
 #include "display.h"
 #include "assets/lang_config.h"
 
-#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <font_awesome.h>
@@ -18,12 +18,8 @@ std::string Ml307Board::GetBoardType() {
     return "ml307";
 }
 
-// No Application in this firmware (no GetDeviceState()/Schedule()/Alert()
-// to notify); Ml307Board is never instantiated by DualNetworkBoard (its
-// InitializeCurrentBoard() uses Nt26Board for the ML307/4G case -- see the
-// commented-out make_unique<Ml307Board> there), so this runs unreached, but
-// it still has to compile.
 void Ml307Board::StartNetwork() {
+    auto& application = Application::GetInstance();
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(Lang::Strings::DETECTING_MODULE);
 
@@ -35,11 +31,17 @@ void Ml307Board::StartNetwork() {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    modem_->OnNetworkStateChanged([this](bool network_ready) {
+    modem_->OnNetworkStateChanged([this, &application](bool network_ready) {
         if (network_ready) {
             ESP_LOGI(TAG, "Network is ready");
         } else {
             ESP_LOGE(TAG, "Network is down");
+            auto device_state = application.GetDeviceState();
+            if (device_state == kDeviceStateListening || device_state == kDeviceStateSpeaking) {
+                application.Schedule([this, &application]() {
+                    application.SetDeviceState(kDeviceStateIdle);
+                });
+            }
         }
     });
 
@@ -48,9 +50,9 @@ void Ml307Board::StartNetwork() {
     while (true) {
         auto result = modem_->WaitForNetworkReady();
         if (result == NetworkStatus::ErrorInsertPin) {
-            ESP_LOGE(TAG, "%s", Lang::Strings::PIN_ERROR);
+            application.Alert(Lang::Strings::ERROR, Lang::Strings::PIN_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_PIN);
         } else if (result == NetworkStatus::ErrorRegistrationDenied) {
-            ESP_LOGE(TAG, "%s", Lang::Strings::REG_ERROR);
+            application.Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_REG);
         } else {
             break;
         }
@@ -135,8 +137,12 @@ std::string Ml307Board::GetDeviceStatusJson() {
     auto& board = Board::GetInstance();
     auto root = cJSON_CreateObject();
 
-    // No audio codec in this pi-only firmware (AudioCodec doesn't exist).
+    // Audio speaker
     auto audio_speaker = cJSON_CreateObject();
+    auto audio_codec = board.GetAudioCodec();
+    if (audio_codec) {
+        cJSON_AddNumberToObject(audio_speaker, "volume", audio_codec->output_volume());
+    }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
     // Screen brightness

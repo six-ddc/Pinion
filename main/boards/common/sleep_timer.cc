@@ -1,4 +1,5 @@
 #include "sleep_timer.h"
+#include "application.h"
 #include "board.h"
 #include "display.h"
 #include "settings.h"
@@ -63,11 +64,12 @@ void SleepTimer::OnEnterDeepSleepMode(std::function<void()> callback) {
 }
 
 void SleepTimer::CheckTimer() {
-    // No Application in this firmware (no CanEnterSleepMode()/audio-service
-    // gate to check, no event loop to Schedule() the light-sleep loop
-    // onto); SleepTimer is never instantiated by metalio-claw-4's board
-    // ctor, so this runs unreached, but it still has to compile. If a
-    // future board wires this up, run the light-sleep loop directly here.
+    auto& app = Application::GetInstance();
+    if (!app.CanEnterSleepMode()) {
+        ticks_ = 0;
+        return;
+    }
+
     ticks_++;
     if (seconds_to_light_sleep_ != -1 && ticks_ >= seconds_to_light_sleep_) {
         if (!in_light_sleep_mode_) {
@@ -76,26 +78,39 @@ void SleepTimer::CheckTimer() {
                 on_enter_light_sleep_mode_();
             }
 
-            while (in_light_sleep_mode_) {
-                auto& board = Board::GetInstance();
-                board.GetDisplay()->UpdateStatusBar(true);
-                lv_refr_now(nullptr);
-                lvgl_port_stop();
-
-                // 配置timer唤醒源（30秒后自动唤醒）
-                esp_sleep_enable_timer_wakeup(30 * 1000000);
-
-                // 进入light sleep模式
-                esp_light_sleep_start();
-                lvgl_port_resume();
-
-                auto wakeup_reason = esp_sleep_get_wakeup_cause();
-                ESP_LOGI(TAG, "Wake up from light sleep, wakeup_reason: %d", wakeup_reason);
-                if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
-                    break;
-                }
+            auto& audio_service = app.GetAudioService();
+            bool is_wake_word_running = audio_service.IsWakeWordRunning();
+            if (is_wake_word_running) {
+                audio_service.EnableWakeWordDetection(false);
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
-            WakeUp();
+        
+            app.Schedule([this, &app]() {
+                while (in_light_sleep_mode_) {
+                    auto& board = Board::GetInstance();
+                    board.GetDisplay()->UpdateStatusBar(true);
+                    lv_refr_now(nullptr);
+                    lvgl_port_stop();
+    
+                    // 配置timer唤醒源（30秒后自动唤醒）
+                    esp_sleep_enable_timer_wakeup(30 * 1000000);
+                    
+                    // 进入light sleep模式
+                    esp_light_sleep_start();
+                    lvgl_port_resume();
+
+                    auto wakeup_reason = esp_sleep_get_wakeup_cause();
+                    ESP_LOGI(TAG, "Wake up from light sleep, wakeup_reason: %d", wakeup_reason);
+                    if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
+                        break;
+                    }
+                }
+                WakeUp();
+            });
+
+            if (is_wake_word_running) {
+                audio_service.EnableWakeWordDetection(true);
+            }
         }
     }
     if (seconds_to_deep_sleep_ != -1 && ticks_ >= seconds_to_deep_sleep_) {
