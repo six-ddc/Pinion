@@ -237,9 +237,41 @@ PSRAM 全套、MIPI-DSI、LV_COLOR_DEPTH_24、CONFIG_LV_USE_FONT_COMPRESSED=y（
 CM 依 yml 重解析。绝不 idf.py set-target。
 `main/display/screen/pi_screen/pi_models_data.h`（gitignored 真钥）不动、不入库。
 
-## 7. 里程碑提交
+## 7. 能力对照表（验收凭证：任何一项不允许在终态固件里消失）
+
+| # | 能力 | 旧实现位置 | 新 lib API（metalio_hal） | 状态 |
+|---|---|---|---|---|
+| 1 | 屏幕亮度 | boards/common/backlight.{h,cc}（PwmBacklight GPIO52 LEDC，NVS "display"/"brightness"）+ metalio-claw-4.cc:676 GetBacklight/RestoreBrightness | `mhal::backlight::SetBrightness/GetBrightness/Restore`（NVS 键不变，Init 自动 Restore） | 迁移 |
+| 2 | 屏幕操作（面板/触摸/LVGL） | metalio-claw-4.cc InitializeLCD(NV3051F/FL7707N DSI)+InitializeTouch(GT911)+lv_adapter_display.cc adapter 初始化 | `mhal::Init()` 内起显；`mhal::display::GetLvDisplay/Lock/Unlock/Width/Height` | 迁移 |
+| 3 | Wi-Fi（ESP-Hosted C5 SDIO 全栈） | boards/common/wifi_board.cc（WifiStation/SsidManager/WifiConfigurationAp） | `mhal::network::Start/IsConnected/OnEvent/AddWifiCredential/StartConfigPortal`（Type::WiFi 分支） | 迁移 |
+| 4 | 4G（NT26/DualNetworkBoard） | boards/common/{dual_network_board,nt26_board,uart_eth_modem}.cc（UART1 2Mbps + iot_eth） | `mhal::network::Start`（Type::Cellular 分支）`/GetType/SwitchType/SendAtCommand/GetSignalStrength/GetRegistrationState` | 迁移 |
+| 5 | 蓝牙（BT 音频模组控制） | bluetooth_screen.cc AT 状态机 + metalio-claw-4.cc InitializeBTAudio(UART2 115200) | `mhal::bt::ApplyDefaultMode/SetMode/StartScan/Connect/EnterCallMode/EnterMusicMode/PowerCycle/SetCallbacks/GetMode/GetConnState` | 迁移（UI 删，硬件逻辑全保留） |
+| 6 | 音频 mic/speaker 编解码 | audio/audio_codec.{h,cc} + boards/common/bt_audio_codec.{h,cc}（I2S0 slave 16k 全双工）+ metalio-claw-4.cc:667 GetAudioCodec | `mhal::audio::Codec/ReadPcm/WritePcm/EnableInput/EnableOutput/SetVolume/GetVolume`（AudioCodec 类原样保留，ASR 可直用） | 迁移（仅删 AudioService 会话层/唤醒词） |
+| 7 | 电池/电源 | boards/common/bq27220_gauge.* + metalio-claw-4.cc CheckBatteryLevelAtBoot/Wxcho 无线充电流配置/GetBatteryLevel | `mhal::power::GetBatteryLevel/GetVoltageMv/GetCurrentMa/ForcePowerOff`；开机 0% 保护与无线充监控任务在 Init 内 | 迁移 |
+| 8 | IOExpander 按键/电源控制 | boards/common/IOExpander.hpp（TCA9555：PWR_KEY 单击/长按、BT_POWER、RST_4G、PA、SD、CAM_PWDN、PWR_KEY_PULSE） | `IOExpander.hpp` 整体成为 lib 公共头（API 不变，pi_screen 现有用法零改动）；上电序列在 `mhal::Init()` | 迁移 |
+| 9 | 系统监控 | metalio-claw-4.cc 匿名监控任务（双核 CPU 占用/内存水位/电池，1s 周期） | `mhal::sysmon::Start(period_ms)` | 迁移 |
+| 10 | SD 卡（顺带） | boards/common/SdCardManager.hpp + metalio-claw-4.cc InitializeSdCard | lib 内保留 SdCardManager（Init 内挂载，失败不致命） | 迁移 |
+
+## 8. 资产清理（用户追加需求）
+
+判定标准 = 终态代码可达性；逐项：
+
+| 资产 | 用途（旧） | 终态可达性 | 处置 |
+|---|---|---|---|
+| main/xingzhi-assets/ → resources.bin（4M resources 分区） | 已删 screen 的表情/图标/EAF 动画（"A:" 盘符 lv_image） | pi 零引用（字体全为编译进固件的 C 符号）；mmap 挂载点随 lv_adapter_display 删除 | 删目录 + 删 `spiffs_create_partition_assets` 块 + 删 esp_mmap_assets 依赖；分区闲置不烧 |
+| main/assets/locales/*.ogg（EMBED_FILES） | xiaozhi 语音提示音 | Application/AudioService 删除后零引用 | 删 assets/ 目录 + EMBED_FILES + gen_lang 生成链 + Kconfig LANGUAGE_* |
+| wakeword/srmodels.bin + esp-sr model | 唤醒词模型（model 分区） | 唤醒词子系统删除后零引用 | 删 wakeword/ + 顶层 CMake override 块 + esp-sr 依赖；model 分区闲置不烧 |
+| display/font/font_puhui_{40_4,number_50_4}.c | 已删 screen 专用大字体 | 零引用 | 删 |
+| 78/xiaozhi-fonts 的 font_puhui_20_4/30_4 | pi_screen 中文正文 | **pi_screen 直接引用** | 保留依赖 |
+| display/font/font_pi_*.c（3 个压缩字体） | pi 屏专用 | pi 引用 | 保留（LV_USE_FONT_COMPRESSED=y 承重） |
+| scripts/（gen_lang.py、build_default_assets.py 等） | 资产/语言生成链 | 生成链删除后零引用 | 删（无引用的辅助脚本一并删） |
+
+分区表 partitions/v1/32m.csv 本身不动：resources(4M)/model(960K) 分区闲置，
+flash_args 不再包含其烧写项（对应 CMake 声明删除后自动消失），风险最低且可回退。
+
+## 9. 里程碑提交
 
 1. docs/EXTRACTION.md（本文档）。
 2. components/metalio_hal 建立：硬件代码搬迁+耦合翻转，main 侧改用 lib（此时业务层可能仍在编译）。
-3. 删除全部业务层与残余 screen，main.cc 重写，CMake/依赖收敛；build + size + grep 验证。
+3. 删除全部业务层与残余 screen + 资产清理，main.cc 重写，CMake/依赖收敛；build + size + grep 验证。
 （2/3 若耦合导致无法各自独立编译通过，允许合并为一个 commit，以每 commit 可构建为先。）
