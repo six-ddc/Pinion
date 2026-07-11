@@ -35,18 +35,23 @@ volc_asr_callbacks_t cbs = {
     .ctx = ...,
 };
 volc_asr_start(&cbs);                 // 建连+握手，阻塞数百 ms
-mhal::audio::EnableInput(true);
-int16_t frame[320];                   // 20ms @16kHz
-while (recording) {
-    int n = mhal::audio::ReadPcm(frame, 320);
-    if (n > 0) volc_asr_feed(frame, n);   // 内部聚 200ms 段 gzip 上传
-}
+
+// 喂料：用 mhal::audio_pipeline 采集（推荐，带预热/VAD/固定帧回调）
+mhal::audio_pipeline::CaptureConfig cap_cfg;      // 默认 20ms 帧 + 能量 VAD
+mhal::audio_pipeline::CaptureCallbacks cap_cbs;
+cap_cbs.on_frame = [](const int16_t* pcm, size_t n) { volc_asr_feed(pcm, n); };
+cap_cbs.on_vad   = [](bool speaking) { /* 静音挂起可触发自动收音 */ };
+mhal::audio_pipeline::StartCapture(cap_cfg, cap_cbs);
+// ... 录音期间 ASR on_delta 持续回调 ...
+mhal::audio_pipeline::StopCapture();
 volc_asr_stop(10000);                 // 发末段(负序号)，最多等 10s final；返回后会话已释放
 // 用户取消：volc_asr_abort();  查询：volc_asr_is_active();
 ```
 
 采用**调用方推流（push）**而非组件自拉 mic：录音生命周期（按住说话/VAD）
 由上层控制，且 mic 通路未来还有回声消除/唤醒词等消费者，组件不独占。
+喂料端与 `mhal::audio_pipeline::StartCapture` 的 `on_frame` 直接对接
+（见《音频管线》一节）；不经管线直接 `mhal::audio::ReadPcm` 推 feed 也可以。
 
 ### TTS（include/volc_tts.h）— 会话式，连接跨会话复用
 
@@ -64,9 +69,32 @@ volc_tts_speak_end();                 // FinishSession；音频继续到达并�
 // 打断（barge-in）：volc_tts_stop();  // 丢缓冲 + CancelSession，连接保留
 ```
 
-音频路径：WS 任务 → 64KB PSRAM 抖动队列（≈2s）→ 独立播放任务 →
-`mhal::audio::WritePcm`。队列满时 WS 任务阻塞形成 TCP 背压；打断延迟
-≤128ms（单次写块上限）。
+音频路径走播放管线：WS 任务 → `mhal::audio_pipeline::FeedPlayback`
+（64KB PSRAM 抖动队列 ≈2s，满则阻塞 WS 任务形成 TCP 背压）→ 播放任务
+写 I2S。100ms 低水位预启动防欠载；打断延迟 ≤128ms（单次写块上限）；
+播完由 `OnPlaybackDrained` 排空回调驱动 `on_finished`。
+
+## 音频管线（metalio_hal/audio_pipeline.h）
+
+采集/播放基建从旧 xiaozhi 固件 AudioService 剥离（去 protocol/
+Application/wake_word/opus 耦合），落位 `mhal::audio_pipeline`：
+硬件邻接、协议无关，未来唤醒词/本地音效等消费者都在这一层。
+
+- **采集**：`StartCapture(cfg, cbs)` 独立任务（优先级 8）拉裸 codec 流，
+  120ms 预热丢弃后按固定帧（10–200ms 可配）回调；内置能量迟滞 VAD
+  （enter/exit 阈值 + hangover，可关）。`StopCapture()` 关 mic 通路。
+- **播放**：`EnsurePlayback()` 幂等起播放任务；`FeedPlayback` 流式喂入
+  （背压点）；`FlushPlayback()` barge-in 清空即静音；`OnPlaybackDrained`
+  一次性排空回调；队列空闲 15s 自动关扬声器通路。播放中音量控制直接用
+  `mhal::audio::SetVolume`（codec 级实时生效）。
+- **AFE（esp-sr）不纳入的理由**：其 vadnet/nsnet 模型链与 esp-sr 组件在
+  metalio_hal 提取期已整体裁掉（重加约 1MB+ flash、数 MB PSRAM 与模型
+  分区烧写链）；本板 mono mic 无回采参考通道，AEC 根本不可用、NS 近场
+  收益有限；火山 bigmodel 云端识别本身抗噪。管线处理器挂点与旧
+  AfeAudioProcessor 同形（Feed→帧回调），后续要上 AFE 时替换任务内处理
+  段即可，外部 API 不变。
+- **Opus 不剥离**：火山 ASR 上行是 gzip PCM、TTS 下行是裸 PCM，全链路
+  无 Opus 消费者（那是 xiaozhi 自有服务端协议的要求）。
 
 ### 自测（include/volc_speech_selftest.h）
 
@@ -101,23 +129,32 @@ header[2]=serialization<<4|compression   header[3]=0
   `X-Api-Resource-Id` + `X-Api-Request-Id`（ASR）/ `X-Api-Connect-Id`（TTS），
   TLS 走 esp-tls 证书包（sdkconfig `MBEDTLS_CERTIFICATE_BUNDLE` 承重）。
 
-## 采样率决策
+## 采样率链路
 
 板载 codec（`mhal::audio`，BTAudioCodecDuplex I2S0 slave）固定
-**16kHz/16bit/mono** 双向。参考服务端实现用 24kHz 是因为它面向的老固件如此；
-火山两个产品均原生支持 16k——ASR 在 full client request 里声明
-`rate:16000`，TTS 在 `audio_params.sample_rate:16000` 请求——因此**两向均
-零重采样**，直连 `ReadPcm`/`WritePcm`。
+**16kHz/16bit/mono** 双向，全链路统一 16k、**零重采样点**：
+
+```
+mic 16k ─→ audio_pipeline 采集帧 16k ─→ ASR 上行（请求声明 rate:16000）
+TTS 下行（audio_params.sample_rate:16000）─→ 播放队列 16k ─→ speaker 16k
+```
+
+参考服务端实现用 24kHz 是它面向的老固件如此；火山 SAUC 与 seed-tts 均
+原生支持 16k。若未来换 24k 硬件或产品强制 24k，重采样点应放在管线边界
+（采集帧回调后 / FeedPlayback 前），旧固件的 OpusResampler 可从
+MetalioClaw5 按需取回；AFE（若将来纳入）同样工作在 16k，槽位兼容。
 
 ## 资源占用
 
 - 新增 managed 依赖：`espressif/esp_websocket_client` ^1.2、`espressif/zlib`
   ^1.3（zlib 本已被 esp_lvgl_adapter 间接拉入）。固件增量 ≈ 85KB
   （0x620030 → 0x634d20），app 分区仍余 48%。
-- 运行期：每条 WS 连接 1 个任务（6KB 栈）+ 4KB 收发缓冲；TTS 另有播放
-  任务（4KB 栈）+ 64KB PSRAM 抖动队列；gzip 单流 ≈32KB（段级一次性）。
-- 回调上下文：ASR/TTS 事件回调运行在 WS 客户端任务，`on_finished` 在播放
-  任务——一律禁止阻塞/耗时操作（UI 更新请转投 LVGL 线程）。
+- 运行期：每条 WS 连接 1 个任务（6KB 栈）+ 4KB 收发缓冲；管线播放任务
+  （4KB 栈，常驻）+ 64KB PSRAM 抖动队列；采集任务（4KB 栈，仅录音期间）；
+  gzip 单流 ≈32KB（段级一次性）。
+- 回调上下文：ASR/TTS 事件回调运行在 WS 客户端任务，采集 `on_frame`/
+  `on_vad` 在采集任务，`on_finished` 在播放任务——一律禁止阻塞/耗时操作
+  （UI 更新请转投 LVGL 线程）。
 
 ## 已知边界
 
