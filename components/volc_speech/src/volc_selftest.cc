@@ -1,4 +1,4 @@
-// 设备端自测走带：录 3 秒 → ASR 全流式转写 → 文本喂 TTS → 扬声器播放。
+// 设备端自测走带：管线采集 3 秒 → ASR 全流式转写 → 文本喂 TTS → 播放。
 // 由后续接线阶段在网络就绪后调用（符号经 CMake -u 强制保留在固件中）。
 #include "volc_speech_selftest.h"
 
@@ -9,14 +9,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "metalio_hal/audio.h"
+#include "metalio_hal/audio_pipeline.h"
 #include "volc_asr.h"
 #include "volc_tts.h"
 
 static const char* TAG = "volc_selftest";
 
 #define RECORD_SECONDS 3
-#define FRAME_SAMPLES 320  // 20ms @16kHz
 
 struct SelftestCtx {
     SemaphoreHandle_t done;
@@ -64,7 +63,7 @@ void volc_speech_selftest(void) {
     ctx.error_code = 0;
     if (!ctx.done) ctx.done = xSemaphoreCreateBinary();
 
-    // —— ASR：推流 3 秒 mic ——
+    // —— ASR：管线采集 3 秒推流 ——
     volc_asr_callbacks_t asr_cbs = {};
     asr_cbs.on_delta = st_asr_delta;
     asr_cbs.on_final = st_asr_final;
@@ -78,19 +77,22 @@ void volc_speech_selftest(void) {
         return;
     }
 
-    mhal::audio::EnableInput(true);
-    ESP_LOGI(TAG, "recording... speak now");
-    int16_t frame[FRAME_SAMPLES];
-    const int total_frames = RECORD_SECONDS * 1000 / 20;
-    for (int i = 0; i < total_frames; i++) {
-        int got = mhal::audio::ReadPcm(frame, FRAME_SAMPLES);
-        if (got > 0) {
-            if (volc_asr_feed(frame, got) != ESP_OK) break;
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
+    mhal::audio_pipeline::CaptureConfig cap_cfg;  // 默认 20ms 帧 + 能量 VAD
+    mhal::audio_pipeline::CaptureCallbacks cap_cbs;
+    cap_cbs.on_frame = [](const int16_t* pcm, size_t samples) {
+        volc_asr_feed(pcm, samples);
+    };
+    cap_cbs.on_vad = [](bool speaking) {
+        ESP_LOGI(TAG, "vad: %s", speaking ? "speech" : "silence");
+    };
+    if (!mhal::audio_pipeline::StartCapture(cap_cfg, cap_cbs)) {
+        ESP_LOGE(TAG, "capture start failed");
+        volc_asr_abort();
+        return;
     }
-    mhal::audio::EnableInput(false);
+    ESP_LOGI(TAG, "recording... speak now");
+    vTaskDelay(pdMS_TO_TICKS(RECORD_SECONDS * 1000));
+    mhal::audio_pipeline::StopCapture();
 
     err = volc_asr_stop(10000);
     if (err != ESP_OK) {
@@ -101,7 +103,7 @@ void volc_speech_selftest(void) {
                                          : "自检没有听清，你好，我是小派。";
     ESP_LOGI(TAG, "speaking back: %s", text);
 
-    // —— TTS：合成并播放 ——
+    // —— TTS：合成并经播放管线放音 ——
     volc_tts_callbacks_t tts_cbs = {};
     tts_cbs.on_audio_start = st_tts_audio_start;
     tts_cbs.on_finished = st_tts_finished;

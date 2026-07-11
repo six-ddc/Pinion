@@ -7,6 +7,7 @@ set(SRCS
     "src/audio/audio_codec.cc"
     "src/audio/bt_audio_codec.cc"
     "src/audio/audio_facade.cc"
+    "src/audio/audio_pipeline.cc"
     "src/bt/bt_module.cc"
     "src/display/display_hal.cc"
     "src/display/touch_feed.cc"
@@ -25,4 +26,5 @@ idf_component_register(
     PRIV_INCLUDE_DIRS "src" "src/display" "src/net" "src/bt" "src/audio" "src/power"
     # 公共头用到：driver(i2c/gpio/i2s)、esp_timer(IOExpander)、nvs_flash(settings)
     REQUIRES driver esp_timer nvs_flash
-    PRIV_REQUIRES esp_lcd esp_event esp_netif esp_pm fatfs sdmmc lwip esp_hw_support)
+    PRIV_REQUIRES esp_lcd esp_event esp_netif esp_pm fatfs sdmmc lwip esp_hw_support
+                  esp_ringbuf)

@@ -10,11 +10,10 @@
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "metalio_hal/audio.h"
+#include "metalio_hal/audio_pipeline.h"
 #include "volc_proto.h"
 
 #if __has_include("volc_keys.h")
@@ -32,8 +31,7 @@ static const char* TAG = "volc_tts";
 #define TTS_SAMPLE_RATE 16000  // mhal::audio 板载 codec 固定 16kHz，免重采样
 #define TTS_CONNECT_TIMEOUT_MS 10000
 #define TTS_SEND_TIMEOUT_MS 5000
-#define TTS_RB_BYTES (64 * 1024)   // ~2s @16kHz/16bit 抖动缓冲（PSRAM）
-#define TTS_PLAYER_CHUNK 4096      // 单次取出上限：128ms，保证打断延迟可控
+#define TTS_FEED_TIMEOUT_MS 10000  // 抖动队列满时对 WS 任务的最大背压时长
 
 #define BIT_WS_CONNECTED BIT0
 #define BIT_CONN_STARTED BIT1
@@ -49,14 +47,11 @@ struct TtsState {
     bool conn_started;
     EventGroupHandle_t eg;
     SemaphoreHandle_t api_lock;
-    RingbufHandle_t rb;
-    TaskHandle_t player;
-    volatile bool player_exit;
     volc_tts_callbacks_t cbs;
     char session_id[37];
     volatile bool session_active;
     volatile bool pending_finish;  // SessionFinished 已到，待播放队列排空
-    volatile bool discard_audio;   // 打断后丢弃后续音频
+    volatile bool discard_audio;   // 打断后丢弃迟到的下行音频
     volatile bool audio_started;
     // WS 消息重组
     uint8_t* rx;
@@ -76,34 +71,29 @@ static void tts_emit_error(TtsState* s, int code, const char* msg,
     ESP_LOGE(TAG, "error %d: %s", code, buf);
     if (s->cbs.on_error) s->cbs.on_error(code, buf, s->cbs.ctx);
     s->session_active = false;
+    s->pending_finish = false;
     xEventGroupSetBits(s->eg, BIT_FAILED | BIT_DONE);
 }
 
 static void tts_enqueue_audio(TtsState* s, const uint8_t* pcm, size_t len) {
-    if (len == 0 || s->discard_audio) return;
+    if (len < 2 || s->discard_audio) return;
     if (!s->audio_started) {
         s->audio_started = true;
         if (s->cbs.on_audio_start) s->cbs.on_audio_start(s->cbs.ctx);
     }
-    // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓），打断时立即放弃
-    size_t off = 0;
-    while (off < len && !s->discard_audio) {
-        size_t chunk = len - off;
-        if (xRingbufferSend(s->rb, pcm + off, chunk, pdMS_TO_TICKS(100)) ==
-            pdTRUE) {
-            off += chunk;
-        } else if (chunk > 1024) {
-            // 整包放不下就按队列剩余空间切小重试
-            size_t free_bytes = xRingbufferGetCurFreeSize(s->rb);
-            if (free_bytes >= 2) {
-                size_t part = free_bytes & ~(size_t)1;  // 保持 16bit 对齐
-                if (part > chunk) part = chunk;
-                if (xRingbufferSend(s->rb, pcm + off, part, 0) == pdTRUE) {
-                    off += part;
-                }
-            }
-        }
-    }
+    // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓）；打断时管线立即丢弃
+    mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, len / 2,
+                                       TTS_FEED_TIMEOUT_MS);
+}
+
+// SessionFinished 后由播放管线在队列排空时触发（打断路径上被
+// pending_finish=false 短路）
+static void tts_on_drained(TtsState* s) {
+    if (!s->pending_finish) return;
+    s->pending_finish = false;
+    ESP_LOGI(TAG, "playback drained");
+    if (s->cbs.on_finished) s->cbs.on_finished(s->cbs.ctx);
+    xEventGroupSetBits(s->eg, BIT_DONE);
 }
 
 static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
@@ -137,8 +127,12 @@ static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
         case VOLC_EVT_SESSION_FINISHED:
             ESP_LOGI(TAG, "session finished");
             s->session_active = false;
-            s->pending_finish = true;  // 播放任务排空后触发 on_finished
+            s->pending_finish = true;
             xEventGroupSetBits(s->eg, BIT_SESS_FINISHED);
+            // 服务端音频帧先于本事件到达（同一 socket 顺序保证），此刻
+            // 队列里已是完整音频；排空（或已空）即整场播完。
+            mhal::audio_pipeline::OnPlaybackDrained(
+                [s]() { tts_on_drained(s); });
             break;
         case VOLC_EVT_SESSION_CANCELED:
             s->session_active = false;
@@ -204,28 +198,6 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
         default:
             break;
     }
-}
-
-static void tts_player_task(void* arg) {
-    auto* s = static_cast<TtsState*>(arg);
-    while (!s->player_exit) {
-        size_t got = 0;
-        uint8_t* item = (uint8_t*)xRingbufferReceiveUpTo(
-            s->rb, &got, pdMS_TO_TICKS(50), TTS_PLAYER_CHUNK);
-        if (item) {
-            if (!s->discard_audio && got >= 2) {
-                mhal::audio::WritePcm((const int16_t*)item, got / 2);
-            }
-            vRingbufferReturnItem(s->rb, item);
-        } else if (s->pending_finish) {
-            s->pending_finish = false;
-            ESP_LOGI(TAG, "playback drained");
-            if (s->cbs.on_finished) s->cbs.on_finished(s->cbs.ctx);
-            xEventGroupSetBits(s->eg, BIT_DONE);
-        }
-    }
-    s->player = nullptr;
-    vTaskDelete(nullptr);
 }
 
 static void tts_teardown_connection(TtsState* s) {
@@ -343,12 +315,9 @@ static TtsState* tts_get_state(void) {
     if (!s) return nullptr;
     s->eg = xEventGroupCreate();
     s->api_lock = xSemaphoreCreateMutex();
-    s->rb = xRingbufferCreateWithCaps(TTS_RB_BYTES, RINGBUF_TYPE_BYTEBUF,
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s->eg || !s->api_lock || !s->rb) {
+    if (!s->eg || !s->api_lock) {
         if (s->eg) vEventGroupDelete(s->eg);
         if (s->api_lock) vSemaphoreDelete(s->api_lock);
-        if (s->rb) vRingbufferDeleteWithCaps(s->rb);
         free(s);
         return nullptr;
     }
@@ -365,17 +334,10 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     esp_err_t err = ESP_OK;
     if (s->session_active || s->pending_finish) {
         err = ESP_ERR_INVALID_STATE;
+    } else if (!mhal::audio_pipeline::EnsurePlayback()) {
+        err = ESP_ERR_NO_MEM;
     } else {
         err = tts_ensure_connection(s);
-    }
-
-    if (err == ESP_OK && !s->player) {
-        s->player_exit = false;
-        if (xTaskCreate(tts_player_task, "volc_tts_play", 4096, s, 5,
-                        &s->player) != pdPASS) {
-            s->player = nullptr;
-            err = ESP_ERR_NO_MEM;
-        }
     }
 
     if (err == ESP_OK) {
@@ -403,7 +365,6 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
             pdMS_TO_TICKS(TTS_CONNECT_TIMEOUT_MS));
         if (bits & BIT_SESS_STARTED) {
             s->session_active = true;
-            mhal::audio::EnableOutput(true);
             ESP_LOGI(TAG, "session started");
         } else {
             err = (bits & BIT_FAILED) ? ESP_FAIL : ESP_ERR_TIMEOUT;
@@ -469,8 +430,9 @@ void volc_tts_stop(void) {
     TtsState* s = s_tts;
     if (!s) return;
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
-    s->discard_audio = true;  // 播放任务与入队路径立即丢弃
-    s->pending_finish = false;
+    s->discard_audio = true;    // 迟到的下行音频直接丢
+    s->pending_finish = false;  // 短路排空回调，不再触发 on_finished
+    mhal::audio_pipeline::FlushPlayback();
     if (s->session_active) {
         s->session_active = false;
         if (tts_send_event(s, VOLC_EVT_CANCEL_SESSION, s->session_id, "{}") ==
@@ -501,16 +463,11 @@ void volc_tts_shutdown(void) {
     if (!s) return;
     volc_tts_stop();
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
-    if (s->player) {
-        s->player_exit = true;
-        for (int i = 0; i < 20 && s->player; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    }
     tts_teardown_connection(s);
     s_tts = nullptr;
     xSemaphoreGive(s->api_lock);
     vSemaphoreDelete(s->api_lock);
     vEventGroupDelete(s->eg);
-    vRingbufferDeleteWithCaps(s->rb);
     free(s->rx);
     free(s);
     ESP_LOGI(TAG, "shutdown");
