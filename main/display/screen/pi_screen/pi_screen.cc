@@ -11,7 +11,6 @@
 #include "esp_log.h"
 
 #include "IOExpander.hpp"
-#include "home_screen/home_screen.h"
 #include "pi_fonts.h"
 #include "pi_ui_bridge.h"
 #include "screen_util.h"
@@ -1810,14 +1809,7 @@ lv_obj_t* PiScreen::Create() {
     s_drain_timer = lv_timer_create(DrainQueueTick, 80, nullptr);
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);
 
-    screen_attach_swipe_back(scr, []() {
-        lv_indev_t* indev = lv_indev_active();
-        if (indev != nullptr) lv_indev_wait_release(indev);
-        lv_obj_t* old_scr = lv_screen_active();
-        lv_obj_t* home = HomeScreen::Create();
-        lv_screen_load(home);
-        if (old_scr != nullptr && old_scr != home) lv_obj_delete_async(old_scr);
-    });
+    // 单 App 固件：无 home 菜单可返回，右滑返回手势不再挂接。
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
 
     return scr;

@@ -1,0 +1,224 @@
+#include "nt26_modem.h"
+
+#include <esp_log.h>
+#include <esp_netif.h>
+#include "freertos/task.h"
+
+#define TAG "Nt26Modem"
+
+using mhal::network::Event;
+
+namespace {
+
+constexpr uint32_t kWaitNetworkConnected = (1 << 0);
+constexpr uint32_t kWaitNetworkFailed = (1 << 1);
+constexpr uint32_t kWaitNetworkInFlight = (1 << 2);
+constexpr uint32_t kWaitNetworkAll =
+    kWaitNetworkConnected | kWaitNetworkFailed | kWaitNetworkInFlight;
+constexpr uint32_t kNetworkWaitTimeoutMs = 60 * 1000;
+
+}  // namespace
+
+Nt26Modem::Nt26Modem(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t mrdy_pin,
+                     gpio_num_t srdy_pin)
+    : tx_pin_(tx_pin), rx_pin_(rx_pin), mrdy_pin_(mrdy_pin), srdy_pin_(srdy_pin) {
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    esp_event_loop_create_default();
+    esp_netif_init();
+
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "nt26_cpu", &pm_lock_cpu_max_);
+
+    esp_timer_create_args_t timer_args = {
+        .callback = OnNetworkReadyTimeout,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "nt26_net_timer",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&timer_args, &network_ready_timer_);
+}
+
+Nt26Modem::~Nt26Modem() {
+    if (network_ready_timer_) {
+        esp_timer_stop(network_ready_timer_);
+        esp_timer_delete(network_ready_timer_);
+    }
+
+    if (network_wait_event_) {
+        vEventGroupDelete(network_wait_event_);
+        network_wait_event_ = nullptr;
+    }
+
+    if (modem_) {
+        modem_->Stop();
+    }
+
+    if (pm_lock_cpu_max_) {
+        esp_pm_lock_delete(pm_lock_cpu_max_);
+    }
+}
+
+void Nt26Modem::OnEvent(Event event, const std::string& data) {
+    if (event_callback_) {
+        event_callback_(event, data);
+    }
+}
+
+void Nt26Modem::OnNetworkReadyTimeout(void* arg) {
+    auto* self = static_cast<Nt26Modem*>(arg);
+    ESP_LOGW(TAG, "Network ready timeout");
+    if (self->network_wait_event_) {
+        xEventGroupSetBits(self->network_wait_event_, kWaitNetworkFailed);
+    }
+    self->OnEvent(Event::CellularErrorTimeout, "网络连接超时");
+}
+
+bool Nt26Modem::Start() {
+    OnEvent(Event::ModemDetecting);
+
+    UartEthModem::Config config = {
+        .uart_num = UART_NUM_1,
+        .baud_rate = 2000000,
+        .tx_pin = tx_pin_,
+        .rx_pin = rx_pin_,
+        .mrdy_pin = mrdy_pin_,
+        .srdy_pin = srdy_pin_,
+    };
+
+    network_wait_event_ = xEventGroupCreate();
+    if (!network_wait_event_) {
+        ESP_LOGE(TAG, "Failed to create network wait event group");
+        OnEvent(Event::CellularErrorInitFailed);
+        return false;
+    }
+
+    modem_ = std::make_unique<UartEthModem>(config);
+    modem_->SetDebug(false);
+    modem_->SetNetworkEventCallback([this](UartEthModem::UartEthModemEvent event) {
+        ESP_LOGI(TAG, "Modem event: %s", UartEthModem::GetNetworkEventName(event));
+        switch (event) {
+            case UartEthModem::UartEthModemEvent::Connected:
+                esp_timer_stop(network_ready_timer_);
+                if (network_wait_event_) {
+                    xEventGroupSetBits(network_wait_event_, kWaitNetworkConnected);
+                }
+                OnEvent(Event::CellularConnected);
+                break;
+            case UartEthModem::UartEthModemEvent::Disconnected:
+                OnEvent(Event::CellularDisconnected);
+                break;
+            case UartEthModem::UartEthModemEvent::ErrorNoSim:
+                esp_timer_stop(network_ready_timer_);
+                if (network_wait_event_) {
+                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                }
+                AsyncStop();
+                OnEvent(Event::CellularErrorNoSim);
+                break;
+            case UartEthModem::UartEthModemEvent::ErrorRegistrationDenied:
+                esp_timer_stop(network_ready_timer_);
+                if (network_wait_event_) {
+                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                }
+                AsyncStop();
+                OnEvent(Event::CellularErrorRegDenied);
+                break;
+            case UartEthModem::UartEthModemEvent::Connecting:
+                OnEvent(Event::CellularConnecting);
+                break;
+            case UartEthModem::UartEthModemEvent::ErrorInitFailed:
+            case UartEthModem::UartEthModemEvent::ErrorNoCarrier:
+                esp_timer_stop(network_ready_timer_);
+                if (network_wait_event_) {
+                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                }
+                AsyncStop();
+                OnEvent(Event::CellularErrorInitFailed);
+                break;
+            case UartEthModem::UartEthModemEvent::InFlightMode:
+                ESP_LOGW(TAG, "Modem in flight mode");
+                if (network_wait_event_) {
+                    xEventGroupSetBits(network_wait_event_, kWaitNetworkInFlight);
+                }
+                break;
+            case UartEthModem::UartEthModemEvent::RequestingPdpContext:
+                break;
+        }
+    });
+
+    if (modem_->Start() != ESP_OK) {
+        vEventGroupDelete(network_wait_event_);
+        network_wait_event_ = nullptr;
+        OnEvent(Event::CellularErrorInitFailed);
+        return false;
+    }
+
+    esp_timer_start_once(network_ready_timer_, 30000 * 1000ULL);
+    OnEvent(Event::CellularConnecting);
+
+    ESP_LOGI(TAG, "Waiting for network ready...");
+    EventBits_t bits = xEventGroupWaitBits(network_wait_event_, kWaitNetworkAll, pdFALSE,
+                                           pdFALSE, pdMS_TO_TICKS(kNetworkWaitTimeoutMs));
+    vEventGroupDelete(network_wait_event_);
+    network_wait_event_ = nullptr;
+
+    if (bits & kWaitNetworkConnected) {
+        ESP_LOGI(TAG, "Network ready");
+        return true;
+    }
+    if (bits & kWaitNetworkInFlight) {
+        ESP_LOGW(TAG, "Network unavailable (flight mode / no SIM)");
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Network wait failed or timed out (bits=0x%lx)", (unsigned long)bits);
+    return false;
+}
+
+void Nt26Modem::AsyncStop() {
+    xTaskCreate(
+        [](void* arg) {
+            auto* self = static_cast<Nt26Modem*>(arg);
+            if (self->modem_) {
+                self->modem_->Stop();
+            }
+            vTaskDelete(nullptr);
+        },
+        "nt26_async_stop", 4096, this, tskIDLE_PRIORITY + 1, nullptr);
+}
+
+void Nt26Modem::SetEventCallback(mhal::network::EventCallback callback) {
+    event_callback_ = std::move(callback);
+}
+
+int Nt26Modem::GetSignalStrength() {
+    if (modem_ == nullptr || !modem_->IsInitialized()) {
+        return -1;
+    }
+    return modem_->GetSignalStrength();
+}
+
+Nt26CeregState Nt26Modem::GetRegistrationState() {
+    Nt26CeregState state;
+    if (modem_) {
+        auto cell_info = modem_->GetCellInfo();
+        state.stat = cell_info.stat;
+        state.tac = cell_info.tac;
+        state.ci = cell_info.ci;
+        state.AcT = cell_info.act;
+    }
+    return state;
+}
+
+esp_err_t Nt26Modem::SendAtCommand(const std::string& cmd, std::string& response,
+                                   uint32_t timeout_ms, bool bypass_init_check) {
+    if (!modem_) {
+        ESP_LOGW(TAG, "SendAtCommand: modem 未实例化（当前可能是 WiFi 模式）");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!bypass_init_check && !modem_->IsInitialized()) {
+        ESP_LOGW(TAG, "SendAtCommand: modem 尚未完成初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return modem_->SendAt(cmd, response, timeout_ms);
+}

@@ -11,23 +11,3 @@ add_compile_options(-Wno-missing-field-initializers)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(pi_terminal)
-
-# Override esp-sr packed model with custom wakeword when present
-if(EXISTS "${CMAKE_SOURCE_DIR}/wakeword/srmodels.bin")
-    if(TARGET srmodels_bin)
-        add_custom_target(custom_wakeword_srmodels ALL
-            COMMAND ${CMAKE_COMMAND} -E copy
-                "${CMAKE_SOURCE_DIR}/wakeword/srmodels.bin"
-                "${CMAKE_BINARY_DIR}/srmodels/srmodels.bin"
-            COMMENT "Override srmodels.bin with custom wakeword"
-        )
-        add_dependencies(custom_wakeword_srmodels srmodels_bin)
-        if(TARGET flash)
-            add_dependencies(flash custom_wakeword_srmodels)
-        endif()
-        message(STATUS "Custom wakeword enabled: wakeword/srmodels.bin -> build/srmodels/srmodels.bin")
-    else()
-        message(WARNING "wakeword/srmodels.bin exists but srmodels_bin target not found; custom wakeword override skipped")
-    endif()
-endif()
-
