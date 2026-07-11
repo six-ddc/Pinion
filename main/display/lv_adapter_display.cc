@@ -14,9 +14,8 @@
 #include "mmap_generate_resources.h"
 
 #include "screen/boot_screen/boot_screen.h"
-#include "screen/chat_screen/chat_screen.h"
-#include "screen/digital_people_screen/digital_people_screen.h"
-#include "screen/home_screen/home_screen.h"
+#include "screen/pi_screen/pi_screen.h"
+#include "screen_util.h"
 
 #include "application.h"
 
@@ -168,14 +167,23 @@ void LVAdapterDisplay::SetupUI() {
     lv_obj_t* boot_scr = BootScreen::Create();
     lv_screen_load(boot_scr);
 
+    // Boot flow is unchanged (Application/board/network init proceed
+    // normally); only the screen loaded once the 2s boot splash finishes
+    // changes, from HomeScreen (deleted -- Claw6 keeps only pi as a home-menu
+    // app) to PiScreen directly. screen_attach_lifecycle() must run before
+    // lv_screen_load() so pi_screen's LOAD hook (pi_agent_task_start() +
+    // PWR_KEY registration) fires -- home_screen's LaunchPi() used to do
+    // this same pairing when pi was reached through the menu.
     lv_timer_t* timer = lv_timer_create(
         [](lv_timer_t* t) {
             lv_obj_t* old_scr = lv_screen_active();
 
             if (esp_lv_adapter_lock(-1) == ESP_OK) {
-                lv_obj_t* home_scr = HomeScreen::Create();
-                lv_screen_load(home_scr);
-                if (old_scr != NULL && old_scr != home_scr) {
+                lv_obj_t* pi_scr = PiScreen::Create();
+                screen_attach_lifecycle(
+                    pi_scr, [](screen_lifecycle_event_t e) { PiScreen::LifecycleCallback(e); });
+                lv_screen_load(pi_scr);
+                if (old_scr != NULL && old_scr != pi_scr) {
                     lv_obj_delete(old_scr);
                 }
                 esp_lv_adapter_unlock();
@@ -189,62 +197,21 @@ void LVAdapterDisplay::SetupUI() {
 
 LVAdapterDisplay::~LVAdapterDisplay() = default;
 
+// chat_screen/digital_people_screen (the only two things SetEmotion/
+// SetChatMessage ever routed to) are deleted in this build (Claw6: pi is
+// the only home-menu app). Application still calls these during normal
+// voice-assistant operation -- that's fine, they just have nothing left to
+// draw to, so they no-op rather than reference a screen that no longer
+// exists. GetEmoteCategory()/kEmoteCategoryMap above are now unused too but
+// harmless to leave (small const table).
 void LVAdapterDisplay::SetEmotion(const char* const emotion) {
-    // 1) 把细分表情名映射到 6 个大类之一（兜底 neutral）
-    const char* category = GetEmoteCategory(emotion);
-    ESP_LOGI(TAG, "SetEmotion: %s -> %s",
-             emotion != nullptr ? emotion : "<null>", category);
-
-    // 2) 转交给数字人屏。这把锁和 SetChatMessage 共用，确保 lv_eaf_set_src
-    //    与屏幕生命周期事件互斥。屏幕不在前台时 DigitalPeopleScreen::SetEmotion
-    //    也只是更新静态缓存，等下一次 Create() 时再加载，所以这里
-    //    无需判断 IsActive()，无条件转发即可。
-    if (esp_lv_adapter_lock(-1) != ESP_OK) {
-        return;
-    }
-    DigitalPeopleScreen::SetEmotion(category);
-    esp_lv_adapter_unlock();
+    ESP_LOGI(TAG, "SetEmotion: %s (no-op, digital_people_screen removed)",
+             emotion != nullptr ? emotion : "<null>");
 }
 
 void LVAdapterDisplay::SetChatMessage(const char* const role, const char* const content) {
-    if (role == nullptr || content == nullptr || content[0] == '\0') {
-        return;
-    }
-
-    // role 归一化：
-    //   user             -> 用户发言
-    //   assistant/system -> 设备 / AI 回应
-    const bool is_user = (std::strcmp(role, "user") == 0);
-    const bool is_bot  = (std::strcmp(role, "assistant") == 0 ||
-                          std::strcmp(role, "system") == 0);
-    if (!is_user && !is_bot) {
-        return;
-    }
-
-    // 路由策略：
-    //   1) 聊天屏在前台 -> 历史滚动气泡（双侧）。
-    //   2) 数字人屏在前台 -> user 走底部气泡，bot 走 gif 左上方气泡。
-    //   3) 其它屏 -> 直接丢弃，避免在后台无界堆积。
-    const bool chat_active = ChatScreen::IsActive();
-    const bool dp_active   = DigitalPeopleScreen::IsActive();
-    if (!chat_active && !dp_active) {
-        return;
-    }
-
-    if (esp_lv_adapter_lock(-1) != ESP_OK) {
-        return;
-    }
-    if (chat_active) {
-        ChatScreen::AddMessage(content,
-                               is_user ? ChatMsgDir::Right : ChatMsgDir::Left);
-    } else {
-        if (is_user) {
-            DigitalPeopleScreen::ShowUserMessage(content);
-        } else {
-            DigitalPeopleScreen::ShowSystemMessage(content);
-        }
-    }
-    esp_lv_adapter_unlock();
+    (void)role;
+    (void)content;
 }
 
 void LVAdapterDisplay::SetStatus(const char* const status) {}

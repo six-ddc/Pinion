@@ -22,7 +22,6 @@
 #ifdef HAVE_LVGL
 #include "ota_screen.h"
 #include "home_screen.h"
-#include "chat_screen/chat_screen.h"
 #endif
 
 #define TAG "Application"
@@ -759,9 +758,8 @@ void Application::SetDeviceState(DeviceState state) {
             break;
     }
 
-#ifdef HAVE_LVGL
-    ChatScreen::RefreshDeviceState();
-#endif
+    // ChatScreen::RefreshDeviceState() removed: chat_screen doesn't exist in
+    // this pi-only-app firmware.
 }
 
 void Application::Reboot() {

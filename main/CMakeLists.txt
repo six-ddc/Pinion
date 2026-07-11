@@ -1,4 +1,14 @@
 # Define source files
+#
+# Claw6: only pi_screen remains among the home-menu UI apps (the other 23 --
+# theme/info/stock/ebook/game_2048/calculator/calendar/music/weather/gps/
+# camera/vibrate/backlight/call/bluetooth/chat/network/digital_people/level/
+# magnet/sd_card/pin_test/openclaw -- were deleted). Everything else (audio,
+# led, board display backends, protocols, application/ota/mcp, the stock/
+# ebook *data layer* which the now-deleted screens used to front, board
+# infra) is kept exactly as in the MetalioClaw5 snapshot -- this firmware
+# keeps every hardware capability, it just doesn't expose most of them
+# through a menu app anymore.
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
             "audio/codecs/no_audio_codec.cc"
@@ -24,24 +34,12 @@ set(SOURCES "audio/audio_codec.cc"
             "display/screen/boot_screen/boot_screen.cc"
             "display/screen/ota_screen/ota_screen.cc"
             "display/screen/home_screen/home_screen.cc"
-            "display/screen/theme_screen/theme_screen.cc"
-            "display/screen/info_screen/info_screen.cc"
-            "display/screen/stock_screen/stock_screen.cc"
-            "display/screen/stock_screen/stock_list_view.cc"
-            "display/screen/stock_screen/stock_detail_view.cc"
-            "display/screen/stock_screen/stock_chart_renderer.cc"
-            "display/screen/stock_screen/stock_kline_window.cc"
-            "display/screen/stock_screen/stock_settings_view.cc"
+            "display/screen/bluetooth_screen/bluetooth_screen.cc"
             "stock/stock_api.cc"
             "stock/stock_fetch_worker.cc"
             "stock/beijing_clock.cc"
             "stock/stock_store.cc"
             "stock/stock_config_server.cc"
-            "display/screen/ebook_screen/ebook_screen.cc"
-            "display/screen/ebook_screen/bookshelf_view.cc"
-            "display/screen/ebook_screen/reader_view.cc"
-            "display/screen/ebook_screen/reader_menu_view.cc"
-            "display/screen/ebook_screen/manage_view.cc"
             "ebook/book_store.cc"
             "ebook/book_source.cc"
             "ebook/paginator.cc"
@@ -53,27 +51,6 @@ set(SOURCES "audio/audio_codec.cc"
             "ebook/epub_source.cc"
             "ebook/html_extract.cc"
             "ebook/image_decode.cc"
-            "display/screen/game_2048_screen/game_2048_screen.cc"
-            "display/screen/calculator_screen/calculator_screen.cc"
-            "display/screen/calendar_screen/calendar_screen.cc"
-            "display/screen/music_screen/music_screen.cc"
-            "display/screen/weather_screen/weather_screen.cc"
-            "display/screen/weather_screen/weather_icon_map.cc"
-            "display/screen/weather_screen/weather_city_list.cc"
-            "display/screen/gps_screen/gps_screen.cc"
-            "display/screen/camera_screen/camera_screen.cc"
-            "display/screen/vibrate_screen/vibrate_screen.cc"
-            "display/screen/backlight_screen/backlight_screen.cc"
-            "display/screen/call_screen/call_screen.cc"
-            "display/screen/bluetooth_screen/bluetooth_screen.cc"
-            "display/screen/chat_screen/chat_screen.cc"
-            "display/screen/network_screen/network_screen.cc"
-            "display/screen/digital_people_screen/digital_people_screen.cc"
-            "display/screen/level_screen/level_screen.cc"
-            "display/screen/magnet_screen/magnet_screen.cc"
-            "display/screen/sd_card_screen/sd_card_screen.cc"
-            "display/screen/pin_test_screen/pin_test_screen.cc"
-            "display/screen/openclaw_screen/openclaw_screen.cc"
             "display/screen/pi_screen/pi_screen.cc"
             "display/screen/pi_screen/pi_agent_task.c"
             "display/screen/pi_screen/pi_mock_paced.c"
@@ -102,7 +79,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/font" "display/lvgl_display" "display/lvgl_display/jpg" "display/screen" "display/screen/boot_screen" "display/screen/ota_screen" "display/screen/home_screen" "display/screen/game_2048_screen" "display/screen/calculator_screen" "display/screen/calendar_screen" "display/screen/music_screen" "display/screen/weather_screen" "display/screen/gps_screen" "display/screen/camera_screen" "display/screen/vibrate_screen" "display/screen/backlight_screen" "display/screen/call_screen" "display/screen/bluetooth_screen" "display/screen/chat_screen" "display/screen/network_screen" "display/screen/digital_people_screen" "display/screen/level_screen" "display/screen/magnet_screen" "display/screen/sd_card_screen" "display/screen/pin_test_screen" "display/screen/openclaw_screen" "display/screen/theme_screen" "display/screen/info_screen" "display/screen/stock_screen" "stock" "display/screen/ebook_screen" "ebook" "audio" "protocols" "display/screen/pi_screen")
+set(INCLUDE_DIRS "." "display" "display/font" "display/lvgl_display" "display/lvgl_display/jpg" "display/screen" "display/screen/boot_screen" "display/screen/ota_screen" "display/screen/home_screen" "stock" "ebook" "audio" "protocols" "display/screen/pi_screen")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
