@@ -25,3 +25,6 @@ tmp/
 # pi_models_data.h header comment); pi-c's own repo gitignores the source
 # file for the same reason.
 main/display/screen/pi_screen/pi_models_data.h
+
+# 火山引擎语音密钥（真钥，从模板 volc_keys.h.example 复制生成）——绝不入库。
+components/volc_speech/include/volc_keys.h
