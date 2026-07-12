@@ -41,7 +41,12 @@ extern "C" void app_main(void) {
     // mhal::Init() 已恢复过一次，这里显式再调一次保持语义自明）。不再拉满。
     {
         Settings audio_settings("audio", false);
-        mhal::audio::SetVolume(static_cast<int>(audio_settings.GetInt("output_volume", 70)));
+        int32_t vol = audio_settings.GetInt("output_volume", 70);
+        // 与 AudioCodec::Start()（audio_codec.cc:31）的静音兜底对齐：<=0 抬到
+        // 10。否则这里用 NVS 原始 0 覆盖 Start() 已钳制的结果，会让"静音"跨
+        // 重启永久保留（官方 Claw4 固件重启会回 10），是迁移引入的行为回归。
+        if (vol <= 0) vol = 10;
+        mhal::audio::SetVolume(static_cast<int>(vol));
     }
     mhal::backlight::Restore();
 

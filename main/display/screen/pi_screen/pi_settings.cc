@@ -82,8 +82,9 @@ lv_obj_t* s_net_portal_btn = nullptr;
 lv_obj_t* s_net_confirm_root = nullptr;  // 切网确认 sheet（网络页存续期间常驻）
 bool s_portal_started = false;           // 本次开机内已起配网热点（不可逆）
 
-// 蓝牙页
-lv_obj_t* s_bt_seg[3] = {};
+// 蓝牙页（两档：音箱 RX / 发射 TX。BT 模组硬件始终处于某个音频模式，
+// 无"关闭"AT 指令，故不设关闭档——与官方 Claw4 固件的模式语义一致。）
+lv_obj_t* s_bt_seg[2] = {};
 lv_obj_t* s_bt_state_lbl = nullptr;
 lv_obj_t* s_bt_dev_cap = nullptr;
 lv_obj_t* s_bt_dev_list = nullptr;
@@ -995,10 +996,8 @@ int BtSegIndexOf(mhal::bt::Mode m) {
     switch (m) {
         case mhal::bt::Mode::Tx:
             return 1;
-        case mhal::bt::Mode::None:
-            return 2;
         default:
-            return 0;  // Rx / MusicRx 都算"音箱"档
+            return 0;  // Rx / MusicRx / None 都归"音箱"档
     }
 }
 
@@ -1094,12 +1093,11 @@ void BtClearDeviceRows() {
 
 void OnBtSegClicked(lv_event_t* e) {
     intptr_t idx = reinterpret_cast<intptr_t>(lv_event_get_user_data(e));
-    static const mhal::bt::Mode kModes[3] = {mhal::bt::Mode::Rx, mhal::bt::Mode::Tx,
-                                             mhal::bt::Mode::None};
+    static const mhal::bt::Mode kModes[2] = {mhal::bt::Mode::Rx, mhal::bt::Mode::Tx};
     mhal::bt::Mode target = kModes[idx];
     if (BtSegIndexOf(mhal::bt::GetMode()) == static_cast<int>(idx))
         return;
-    SegSetSelected(s_bt_seg, 3, static_cast<int>(idx));  // 乐观切换；事件回填纠偏
+    SegSetSelected(s_bt_seg, 2, static_cast<int>(idx));  // 乐观切换；事件回填纠偏
     BtClearDeviceRows();
     s_bt_entered_connected = false;  // 切模式必断连，缓存匹配标绿作废
     SetBtStateLabel(mhal::bt::ConnState::Idle);
@@ -1111,7 +1109,7 @@ void OnBtRescanClicked(lv_event_t*) {
     BtClearDeviceRows();
     if (mhal::bt::GetMode() != mhal::bt::Mode::Tx) {
         // 未在发射档：先切档，Tx 落地（on_mode_changed）后自动扫描
-        SegSetSelected(s_bt_seg, 3, 1);
+        SegSetSelected(s_bt_seg, 2, 1);
         s_bt_scan_on_tx = true;
         mhal::bt::SetMode(mhal::bt::Mode::Tx);
         return;
@@ -1128,15 +1126,13 @@ void BuildBluetoothPage(lv_obj_t** out_page) {
     s_bt_entered_connected = mhal::bt::GetConnState() == mhal::bt::ConnState::Connected;
     s_bt_cached_addr = BtCachedAddr();
 
-    // 三档分段：音箱 RX / 发射 TX / 关闭
+    // 两档分段：音箱 RX / 发射 TX（模组无"关闭"AT，不设关闭档）
     lv_obj_t* seg_row = MakeFlexRow(content, kSegH);
     s_bt_seg[0] =
         MakeSegBtn(seg_row, "\xe9\x9f\xb3\xe7\xae\xb1 RX", &font_puhui_24_4, OnBtSegClicked, 0);
     s_bt_seg[1] =
         MakeSegBtn(seg_row, "\xe5\x8f\x91\xe5\xb0\x84 TX", &font_puhui_24_4, OnBtSegClicked, 1);
-    s_bt_seg[2] =
-        MakeSegBtn(seg_row, "\xe5\x85\xb3\xe9\x97\xad", &font_puhui_24_4, OnBtSegClicked, 2);
-    SegSetSelected(s_bt_seg, 3, BtSegIndexOf(mhal::bt::GetMode()));
+    SegSetSelected(s_bt_seg, 2, BtSegIndexOf(mhal::bt::GetMode()));
 
     // 状态行：左中文"状态"，右 mono 状态
     lv_obj_t* st_row = MakeFlexRow(content, 40);
@@ -1221,7 +1217,7 @@ void DrainBtSnapshot() {
         conn = s_bt_evt.conn;
         found.swap(s_bt_evt.found);
     }
-    SegSetSelected(s_bt_seg, 3, BtSegIndexOf(mode));
+    SegSetSelected(s_bt_seg, 2, BtSegIndexOf(mode));
     SetBtStateLabel(conn);
     if (s_bt_scan_on_tx && mode == mhal::bt::Mode::Tx) {
         s_bt_scan_on_tx = false;

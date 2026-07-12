@@ -4,7 +4,9 @@
 // 原 Nt26Board 剥离 xiaozhi Board 基类后的纯 NT26 4G modem 封装
 // （UART1 2Mbps + MRDY/SRDY 握手 + iot_eth netif）。事件不再写
 // Display，统一走 mhal::network::Event 回调。
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <driver/gpio.h>
@@ -13,6 +15,8 @@
 #include <uart_eth_modem.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "metalio_hal/network.h"
 
@@ -44,8 +48,11 @@ public:
     bool Start();
 
     // CSQ 0-31；99/-1/modem 未就绪 = -1。
+    // 非阻塞：返回后台任务缓存的上一次读数，并顺带触发一次异步刷新。
+    // 绝不在调用线程发同步 AT（原实现会阻塞，UI 线程调用会卡渲染）。
     int GetSignalStrength();
 
+    // 非阻塞：同 GetSignalStrength，返回缓存的注册态并触发异步刷新。
     Nt26CeregState GetRegistrationState();
 
     // 4G netif 只读句柄（iot_eth 起网后有效；未起网/未初始化返回 nullptr）。
@@ -67,6 +74,13 @@ private:
     // 用一次性 task 实现）。
     void AsyncStop();
 
+    // CSQ/CEREG 后台刷新任务：UI getter 只读缓存并 nudge，本任务在后台
+    // 线程发同步 AT 并回填缓存，把阻塞从 UI 线程剥离。纯按需（无 nudge
+    // 不轮询），故待机零额外功耗。
+    void StartSignalWorker();
+    void StopSignalWorker();
+    void SignalWorkerRun();
+
     std::unique_ptr<UartEthModem> modem_;
     gpio_num_t tx_pin_;
     gpio_num_t rx_pin_;
@@ -77,6 +91,14 @@ private:
     esp_pm_lock_handle_t pm_lock_cpu_max_ = nullptr;
     esp_timer_handle_t network_ready_timer_ = nullptr;
     EventGroupHandle_t network_wait_event_ = nullptr;
+
+    // 信号/注册态缓存 + 后台刷新任务
+    TaskHandle_t signal_task_ = nullptr;
+    SemaphoreHandle_t signal_nudge_ = nullptr;
+    std::atomic<bool> signal_task_stop_{false};
+    std::atomic<int> cached_csq_{99};
+    std::mutex cell_mutex_;
+    UartEthModem::CellInfo cached_cell_;
 };
 
 #endif  // NT26_MODEM_H

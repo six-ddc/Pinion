@@ -95,6 +95,10 @@ void CaptureTask(void*) {
     int dbg_peak = 0;
     while (!s_cap.stop_requested) {
         int got = mhal::audio::ReadPcm(buf, frame_samples);
+        // ReadPcm 底层是 I2S slave 的 portMAX_DELAY 阻塞读，可能跨越停止点
+        // 才返回。若此间已 StopCapture（并随后 volc_asr_stop 注销了会话），
+        // 绝不能再把这最后一帧喂给已释放的消费者——立即退出。
+        if (s_cap.stop_requested) break;
         if (got <= 0) {
             vTaskDelay(pdMS_TO_TICKS(s_cap.cfg.frame_ms));
             continue;
@@ -143,7 +147,21 @@ bool StartCapture(const CaptureConfig& cfg, CaptureCallbacks cbs) {
 void StopCapture() {
     if (!s_cap.running) return;
     s_cap.stop_requested = true;
-    while (s_cap.running) vTaskDelay(pdMS_TO_TICKS(10));
+    // 正常情况下采集任务在一帧内（≤frame_ms）就看到 stop_requested 退出。
+    // 但 ReadPcm 底层是 I2S slave 的 portMAX_DELAY 阻塞读：BT 模组掉时钟
+    // （未上电/PowerCycle/复位）时会长时间无法返回。join 加超时，避免把调用
+    // 线程（pi_voice 语音控制任务）一起拖死——超时后放弃 join，任务自行退出
+    // 且已被上面的 stop 守卫拦住不会再触碰消费者。最坏是下一轮 StartCapture
+    // 因 running 未清而暂时失败，而非整条语音链死锁。
+    const int kJoinTimeoutMs = 1000;
+    int waited = 0;
+    while (s_cap.running && waited < kJoinTimeoutMs) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited += 10;
+    }
+    if (s_cap.running) {
+        ESP_LOGW(TAG, "StopCapture: capture task stuck (I2S no clock?), abandoning join");
+    }
 }
 
 bool IsCapturing() { return s_cap.running; }
@@ -290,8 +308,22 @@ void FlushPlayback() {
            nullptr) {
         vRingbufferReturnItem(s_play.rb, item);
     }
-    // 等正在写的残帧（≤128ms）落地，保证返回后不再出声
-    while (s_play.writing) vTaskDelay(pdMS_TO_TICKS(10));
+    // 等正在写的残帧（≤128ms）落地，保证返回后不再出声。加超时兜底：
+    // WritePcm 底层 i2s_channel_write 是 portMAX_DELAY，BT 模组掉时钟时会
+    // 卡死——超时后放弃等待（此时 I2S 无时钟本就不出声），避免 FlushPlayback
+    // 的调用方（持 TTS api_lock 的 barge-in 路径）被无限拖死。300ms > 2x 单块
+    // 128ms，正常路径永不触发。
+    {
+        const int kWriteDrainTimeoutMs = 300;
+        int waited = 0;
+        while (s_play.writing && waited < kWriteDrainTimeoutMs) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            waited += 10;
+        }
+        if (s_play.writing) {
+            ESP_LOGW(TAG, "FlushPlayback: write stuck (I2S no clock?), abandoning wait");
+        }
+    }
     s_play.had_data = false;
     s_play.flushing = false;
     // 打断即视为一次排空（挂起的排空回调不再有意义，直接触发释放等待方）

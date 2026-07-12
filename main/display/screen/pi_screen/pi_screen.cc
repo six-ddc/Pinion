@@ -743,6 +743,10 @@ void UpdateRecTimer(lv_timer_t*) {
 // (defined with the rest of the real-ASR engine, before StartListen).
 constexpr int kAsrHighlightCodepoints = 6;
 
+// 按键（PWR_KEY）聆听无松手信号，靠 VAD 自动收尾；此为持续噪声/VAD 不回静音
+// 时的最大录音时长兜底（触摸 PTT 有松手信号，不受此限）。
+constexpr int kKeyPttMaxSecs = 30;
+
 void BuildListenView(lv_obj_t* parent) {
     s_listen_view = lv_obj_create(parent);
     screen_strip_obj_chrome(s_listen_view);
@@ -2113,6 +2117,14 @@ void AsrTick(lv_timer_t*) {
         if (mhal::audio_pipeline::IsVoiceDetected()) {
             s_key_heard_speech = true;
         } else if (s_key_heard_speech) {
+            s_ptt_via_key = false;
+            FinishListenSend();
+        }
+        // 兜底：按键聆听没有"松开"信号，靠 VAD 回静音自动收尾。持续噪声下
+        // VAD 可能永不回静音（或从没听到人声），会无限录音/上传。到最大录音
+        // 时长强制收音发送，避免采集/上传永不停止。
+        if (s_ptt_via_key && s_rec_secs >= kKeyPttMaxSecs) {
+            ESP_LOGW("pi_screen", "key PTT hit max %ds, force finish", kKeyPttMaxSecs);
             s_ptt_via_key = false;
             FinishListenSend();
         }

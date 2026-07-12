@@ -36,9 +36,15 @@ Nt26Modem::Nt26Modem(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t mrdy_pin,
         .skip_unhandled_events = true,
     };
     esp_timer_create(&timer_args, &network_ready_timer_);
+
+    StartSignalWorker();
 }
 
 Nt26Modem::~Nt26Modem() {
+    // 先停后台刷新任务——它持有 modem_ 指针并可能正阻塞在 SendAt 上，
+    // 必须在 modem_->Stop() 之前 join，避免 use-after-free。
+    StopSignalWorker();
+
     if (network_ready_timer_) {
         esp_timer_stop(network_ready_timer_);
         esp_timer_delete(network_ready_timer_);
@@ -195,19 +201,82 @@ int Nt26Modem::GetSignalStrength() {
     if (modem_ == nullptr || !modem_->IsInitialized()) {
         return -1;
     }
-    return modem_->GetSignalStrength();
+    // 触发一次后台刷新，立即返回上一次缓存读数（不阻塞调用线程）。
+    if (signal_nudge_) {
+        xSemaphoreGive(signal_nudge_);
+    }
+    return cached_csq_.load();
 }
 
 Nt26CeregState Nt26Modem::GetRegistrationState() {
     Nt26CeregState state;
-    if (modem_) {
-        auto cell_info = modem_->GetCellInfo();
-        state.stat = cell_info.stat;
-        state.tac = cell_info.tac;
-        state.ci = cell_info.ci;
-        state.AcT = cell_info.act;
+    if (modem_ == nullptr) {
+        return state;
     }
+    if (signal_nudge_) {
+        xSemaphoreGive(signal_nudge_);
+    }
+    std::lock_guard<std::mutex> lock(cell_mutex_);
+    state.stat = cached_cell_.stat;
+    state.tac = cached_cell_.tac;
+    state.ci = cached_cell_.ci;
+    state.AcT = cached_cell_.act;
     return state;
+}
+
+void Nt26Modem::StartSignalWorker() {
+    signal_nudge_ = xSemaphoreCreateBinary();
+    if (signal_nudge_ == nullptr) {
+        ESP_LOGE(TAG, "signal worker: nudge semaphore alloc failed");
+        return;
+    }
+    signal_task_stop_.store(false);
+    xTaskCreate(
+        [](void* arg) { static_cast<Nt26Modem*>(arg)->SignalWorkerRun(); },
+        "nt26_signal", 4096, this, tskIDLE_PRIORITY + 3, &signal_task_);
+}
+
+void Nt26Modem::StopSignalWorker() {
+    if (signal_task_ == nullptr) {
+        return;
+    }
+    signal_task_stop_.store(true);
+    if (signal_nudge_) {
+        xSemaphoreGive(signal_nudge_);  // 唤醒可能在等 nudge 的任务
+    }
+    // 等任务自删退出（它可能正阻塞在一次 SendAt 上，等它跑完当前刷新）。
+    while (signal_task_ != nullptr) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (signal_nudge_) {
+        vSemaphoreDelete(signal_nudge_);
+        signal_nudge_ = nullptr;
+    }
+}
+
+void Nt26Modem::SignalWorkerRun() {
+    while (!signal_task_stop_.load()) {
+        // 纯按需：无 UI 读取就一直阻塞，待机零轮询。
+        xSemaphoreTake(signal_nudge_, portMAX_DELAY);
+        if (signal_task_stop_.load()) {
+            break;
+        }
+        if (modem_ == nullptr) {
+            continue;
+        }
+        // CSQ 与原 Nt26Modem::GetSignalStrength 一样受 IsInitialized 门控。
+        if (modem_->IsInitialized()) {
+            cached_csq_.store(modem_->GetSignalStrength());
+        }
+        // CEREG 与原 GetRegistrationState 一样只要 modem 实例存在就查。
+        UartEthModem::CellInfo ci = modem_->GetCellInfo();
+        {
+            std::lock_guard<std::mutex> lock(cell_mutex_);
+            cached_cell_ = ci;
+        }
+    }
+    signal_task_ = nullptr;
+    vTaskDelete(nullptr);
 }
 
 esp_err_t Nt26Modem::SendAtCommand(const std::string& cmd, std::string& response,
