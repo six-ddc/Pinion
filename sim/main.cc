@@ -7,6 +7,7 @@
 //
 // Controls:
 //   F1               PWR_KEY click (idle→listen, listen→cancel, chat→listen/stop)
+//   F2               PWR_KEY long-press 1.2s (quick panel open/close)
 //   typing           speech while listening (pause 1s = VAD silence → auto-send)
 //   Enter            end of speech immediately
 //   Backspace        delete last codepoint of the "utterance"
@@ -45,6 +46,7 @@ namespace {
 
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_pwr_key_pending{false};
+std::atomic<bool> g_pwr_key_long_pending{false};
 std::atomic<bool> g_shot_pending{false};
 
 uint32_t TickCb() { return SDL_GetTicks(); }
@@ -59,6 +61,8 @@ int EventWatch(void*, SDL_Event* ev) {
         case SDL_KEYDOWN:
             if (ev->key.keysym.sym == SDLK_F1) {
                 g_pwr_key_pending = true;
+            } else if (ev->key.keysym.sym == SDLK_F2) {
+                g_pwr_key_long_pending = true;
             } else if (ev->key.keysym.sym == SDLK_F12) {
                 g_shot_pending = true;
             } else if (sim_asr_session_active()) {
@@ -165,8 +169,8 @@ void VirtTouchRead(lv_indev_t*, lv_indev_data_t* data) {
     }
 }
 
-// One command per line: key | type <text> | enter | backspace | click <x> <y> |
-// press <x> <y> | move <x> <y> | release | shot <path> | quit
+// One command per line: key | longkey | type <text> | enter | backspace |
+// click <x> <y> | press <x> <y> | move <x> <y> | release | shot <path> | quit
 void ExecCmd(const std::string& line) {
     std::fprintf(stderr, "[sim][cmd] %s\n", line.c_str());
     std::istringstream ss(line);
@@ -174,6 +178,8 @@ void ExecCmd(const std::string& line) {
     ss >> cmd;
     if (cmd == "key") {
         g_pwr_key_pending = true;
+    } else if (cmd == "longkey") {
+        g_pwr_key_long_pending = true;
     } else if (cmd == "enter") {
         sim_asr_end_of_speech();
     } else if (cmd == "backspace") {
@@ -261,6 +267,11 @@ void Pump() {
         IOExpander::getInstance().simTriggerClick(IOExpander::Pin::PWR_KEY);
         lv_unlock();
     }
+    if (g_pwr_key_long_pending.exchange(false)) {
+        lv_lock();
+        IOExpander::getInstance().simTriggerLongPress(IOExpander::Pin::PWR_KEY);
+        lv_unlock();
+    }
     if (g_shot_pending.exchange(false)) TakeScreenshot(ShotPath());
     if (shot_ms > 0 && !shot_done && now > shot_ms) {
         shot_done = true;
@@ -284,6 +295,7 @@ int main() {
     std::fprintf(stderr,
                  "pi_sim — Metalio Claw pi_screen simulator (LVGL %d.%d SDL2)\n"
                  "  F1        = PWR_KEY(待机->聆听 / 聆听->取消 / chat->聆听|STOP)\n"
+                 "  F2        = PWR_KEY 长按 1.2s(快捷面板呼出/收起)\n"
                  "  打字      = 聆听时说话(停顿1秒自动发送; 回车立即; 退格删字)\n"
                  "  F12       = 截图 BMP\n"
                  "  鼠标      = 触摸\n",

@@ -15,6 +15,7 @@
 
 #include "pi_screen/pi_screen.h"
 #include "screen_util.h"
+#include "settings.h"
 
 #define TAG "main"
 
@@ -35,10 +36,14 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(mhal::Init());
 
-    // 产品决策：开机音量/亮度一律拉满，不吃 NVS 里的历史小值
-    // （TTS 音量是软件缩放，历史值 10 会小到听不见）。
-    mhal::audio::SetVolume(80);
-    mhal::backlight::SetBrightness(100);
+    // P0：开机吃 NVS——音量取 "audio"/"output_volume"（无历史值默认 70），
+    // 亮度走 backlight::Restore()（内部有 NVS 默认 75%、下限 5% 逻辑，
+    // mhal::Init() 已恢复过一次，这里显式再调一次保持语义自明）。不再拉满。
+    {
+        Settings audio_settings("audio", false);
+        mhal::audio::SetVolume(static_cast<int>(audio_settings.GetInt("output_volume", 70)));
+    }
+    mhal::backlight::Restore();
 
     // 唯一 UI：直进 pi 对话屏。lifecycle 必须在 lv_screen_load 之前挂上，
     // LOAD 回调里才会跑 pi_agent_task_start() 与 PWR_KEY 注册。

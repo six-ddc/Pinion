@@ -1,6 +1,7 @@
 /* sim shim — public surface of the TCA9555 IOExpander wrapper that pi_screen
- * uses (getInstance / Pin::PWR_KEY / onClick / offClick). Clicks are injected
- * from the SDL side via simTriggerClick() instead of a physical button. */
+ * uses (getInstance / Pin::PWR_KEY / onClick / offClick / onLongPress /
+ * offLongPress). Clicks / long-presses are injected from the SDL side via
+ * simTriggerClick() / simTriggerLongPress() instead of a physical button. */
 #ifndef IO_EXPANDER_HPP
 #define IO_EXPANDER_HPP
 
@@ -31,6 +32,7 @@ public:
     };
 
     using ClickCallback = std::function<void()>;
+    using LongPressCallback = std::function<void()>;
 
     static IOExpander& getInstance();
 
@@ -38,13 +40,20 @@ public:
                       uint32_t max_duration_ms = 500);
     esp_err_t offClick(Pin pin);
 
-    /* sim-only: fire the registered click callback for `pin` (call with the
-     * LVGL lock held — the pi_screen callback does lv_async_call). */
+    esp_err_t onLongPress(Pin pin, uint32_t duration_ms, LongPressCallback callback,
+                          bool pressed_level = false);
+    esp_err_t offLongPress(Pin pin);
+
+    /* sim-only: fire the registered click / long-press callback for `pin`
+     * (call with the LVGL lock held — the pi_screen callbacks do
+     * lv_async_call). */
     void simTriggerClick(Pin pin);
+    void simTriggerLongPress(Pin pin);
 
 private:
     std::mutex mu_;
     std::map<Pin, ClickCallback> handlers_;
+    std::map<Pin, LongPressCallback> lp_handlers_;
 };
 
 #endif

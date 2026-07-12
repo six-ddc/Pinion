@@ -52,10 +52,18 @@ add_executable(pi_sim
     shim/src/settings_shim.cc
     shim/src/ioexpander_shim.cc
     shim/src/audio_pipeline_shim.cc
+    shim/src/mhal_shim.cc
+    shim/src/net_shim.cc
+    shim/src/bt_shim.cc
     shim/src/volc_stub.cc
     # firmware UI sources, unchanged
     ${CLAW_ROOT}/main/display/screen/screen_util.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_screen.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_quick_panel.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_settings.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_net_events.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_sleep.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_theme.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_agent_task.c
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_mock_paced.c
     ${CLAW_ROOT}/main/display/font/font_pi_mono_14.c

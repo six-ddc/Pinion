@@ -85,6 +85,10 @@ void OnEvent(std::function<void(Event, const std::string&)> cb);
 bool Start();  void StartAsync();
 Type GetType();  void SwitchType();               // 持久化另一类型并重启
 bool IsConnected();
+std::string GetWifiSsid();                         // WiFi 已连接时的 SSID；非 WiFi/未连接 ""
+int GetWifiRssi();                                 // WiFi RSSI（dBm 负值）；非 WiFi/未连接 0
+std::string GetIpAddress();                        // 当前 IP（WiFi 经 esp-wifi-connect 缓存，
+                                                   //  4G 读 iot_eth netif）；未连接/未拿到 IP ""
 void AddWifiCredential(const std::string& ssid, const std::string& pass);
 void StartConfigPortal();                          // softAP 网页配网，阻塞
 esp_err_t SendAtCommand(const std::string& cmd, std::string& resp,
@@ -145,11 +149,22 @@ void Start(uint32_t period_ms = 1000);     // 幂等
 mhal::sysmon::Start();
 ```
 
+### storage.h — SD 卡状态（只读快照；挂载动作在 mhal::Init 内完成，失败不致命）
+```cpp
+bool IsSdMounted();            // Init 时挂载成功即 true（常驻挂载，无热插拔监测）
+const char* GetMountPoint();   // VFS 挂载点，恒定 "/sdcard"（与挂载成败无关）
+// 示例：依赖 SD 的功能按需降级
+if (mhal::storage::IsSdMounted())
+    ESP_LOGI("app", "SD ready at %s", mhal::storage::GetMountPoint());
+```
+
 ### IOExpander.hpp — 按键/电源轨（原 API 不变）
 ```cpp
 // 示例：pi_screen 的电源键注册（现有代码零改动）
 IOExpander::getInstance().onClick(IOExpander::Pin::PWR_KEY, [](){ /* ... */ });
 IOExpander::getInstance().onLongPress(IOExpander::Pin::PWR_KEY, 1500, [](){ /* 关机 */ });
+IOExpander::getInstance().offLongPress(IOExpander::Pin::PWR_KEY);  // 撤销该 pin 全部长按回调
+                                                                   // （offClick 的对称清理，screen 卸载时用）
 IOExpander::getInstance().setLevel(IOExpander::Pin::BT_POWER, true);
 ```
 

@@ -32,3 +32,32 @@ void IOExpander::simTriggerClick(Pin pin) {
     }
     cb();
 }
+
+esp_err_t IOExpander::onLongPress(Pin pin, uint32_t duration_ms, LongPressCallback callback,
+                                  bool pressed_level) {
+    (void)duration_ms;
+    (void)pressed_level;
+    if (!callback)
+        return ESP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(mu_);
+    lp_handlers_[pin] = std::move(callback);
+    return ESP_OK;
+}
+
+esp_err_t IOExpander::offLongPress(Pin pin) {
+    std::lock_guard<std::mutex> lk(mu_);
+    lp_handlers_.erase(pin);
+    return ESP_OK;
+}
+
+void IOExpander::simTriggerLongPress(Pin pin) {
+    LongPressCallback cb;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = lp_handlers_.find(pin);
+        if (it == lp_handlers_.end())
+            return;
+        cb = it->second;
+    }
+    cb();
+}

@@ -22,8 +22,11 @@ eth-modem). Network type is persisted in NVS `"network"/"type"` (0=WiFi, 1=4G; d
 ## Layout
 
 - `main/` — UI only: `main.cc` (boot chain: nvs + event loop → `mhal::Init()` → load pi_screen →
-  `mhal::network::StartAsync()` → `mhal::sysmon::Start()`), `display/screen/pi_screen/`,
-  `display/screen/screen_util.{cc,h}`, 3 compressed pi fonts.
+  `mhal::network::StartAsync()` → `mhal::sysmon::Start()`), `display/screen/pi_screen/` (chat UI
+  `pi_screen.cc` plus its satellites: `pi_quick_panel` quick panel, `pi_settings` six-page settings
+  stack, `pi_sleep` screen-off state machine, `pi_net_events` network-event fan-out, `pi_theme`
+  dual-theme tokens, `pi_sys_info.h`/`sys_info.cc` platform info), `display/screen/screen_util.{cc,h}`,
+  3 compressed pi fonts.
 - `components/metalio_hal/` — the hardware library. Public facade headers in
   `include/metalio_hal/` (`hal.h` `display.h` `backlight.h` `network.h` `bluetooth.h` `audio.h`
   `power.h` `sysmon.h`) plus pass-through `include/IOExpander.hpp`, `include/settings.h`,
@@ -73,7 +76,8 @@ idf.py -p /dev/ttyACM0 flash monitor   # P4 port = "USB JTAG/serial debug unit";
 cmake -S sim -B sim/build && cmake --build sim/build -j && ./sim/build/pi_sim
 ```
 
-F1 = PWR_KEY, typing while listening = speech (1s pause auto-sends), F12 = screenshot. All
+F1 = PWR_KEY click, F2 = PWR_KEY long-press (quick panel), typing while listening = speech
+(1s pause auto-sends), F12 = screenshot. All
 platform differences live in `sim/shim/` — never patch `main/display/**` for host reasons.
 See `sim/README.md` for the interaction map and the unattended self-test/screenshot mode.
 
@@ -95,10 +99,19 @@ Boot: `app_main` → `mhal::Init()` (I2C → TCA9555 power rails → BQ27220 gau
 backlight restore) → load pi_screen under `mhal::display::Lock()` with `screen_attach_lifecycle`
 (the LOAD hook starts `pi_agent_task` and registers the PWR_KEY click) → `network::StartAsync()`.
 
+Interaction shell around the chat UI: PWR_KEY long-press or status-bar pull-down opens
+`pi_quick_panel` (brightness/volume sliders, theme ◐, gear → `pi_settings` six-page stack with
+swipe-right-back); swiping right in Chat returns to standby (new-conversation confirm sheet);
+`pi_sleep` dims then blanks the screen after the configured idle time (touch/PWR_KEY wakes, first
+input is swallowed). `pi_theme::Init()` must run before any widget is built.
+
 - UI code (pi_screen) talks to hardware only through the lib's public headers
   (`IOExpander.hpp` for PWR_KEY, `settings.h` for NVS persistence).
 - The lib never calls into UI; anything it needs to report goes through registered callbacks
-  (`mhal::network::OnEvent`, `mhal::bt::SetCallbacks`).
+  (`mhal::network::OnEvent` — UI side multiplexes it via `pi_net_events` since it is a single
+  overwrite-style callback — and `mhal::bt::SetCallbacks`).
+- UI-owned NVS keys: `ui/theme` (0 dark / 1 light), `ui/sleep_s` (screen-off seconds, 0 = never),
+  `bt/last_name` + `bt/last_addr` (UI-side cache of the last successfully connected BT device).
 - pi_screen is the validated product UI — keep changes to it adaptation-only.
 
 For every capability's API and a call example, read `docs/EXTRACTION.md` §2.
