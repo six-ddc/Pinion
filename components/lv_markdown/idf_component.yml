@@ -1,0 +1,7 @@
+## lv_markdown —— 流式 Markdown 有限子集渲染（解析核心零 LVGL 依赖，
+## md_view 渲染层依赖 LVGL 9；公共头 include lvgl.h，故 public: true）。
+dependencies:
+  lvgl/lvgl:
+    version: '~9.3.0'
+    public: true
+  idf: '>=5.5.2'

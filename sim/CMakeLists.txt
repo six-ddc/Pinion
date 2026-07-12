@@ -58,6 +58,11 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_screen.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_agent_task.c
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_mock_paced.c
+    # lv_markdown component (markdown rendering for assistant replies)
+    ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
+    ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
+    ${CLAW_ROOT}/components/lv_markdown/src/md_theme.cc
+    ${CLAW_ROOT}/components/lv_markdown/src/md_view.cc
     ${CLAW_ROOT}/main/display/font/font_pi_mono_14.c
     ${CLAW_ROOT}/main/display/font/font_pi_mono_17.c
     ${CLAW_ROOT}/main/display/font/font_pi_clock_132.c
@@ -70,6 +75,23 @@ target_include_directories(pi_sim PRIVATE
     ${CLAW_ROOT}/main/display/screen
     ${CLAW_ROOT}/main/display/screen/pi_screen
     ${CLAW_ROOT}/components/volc_speech/include # real volc headers, stub impls
+    ${CLAW_ROOT}/components/lv_markdown/include
 )
 
 target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2)
+
+# Offline deterministic replay of the two-turn mock script (pi_scr_mock.h)
+# instead of the real API -- markdown-rendering fixture included. Usage:
+#   cmake -S sim -B sim/build -DPI_SIM_MOCK=ON && cmake --build sim/build -j
+option(PI_SIM_MOCK "pi_sim replays the built-in mock script (no network)" OFF)
+if(PI_SIM_MOCK)
+    target_compile_definitions(pi_sim PRIVATE PI_AGENT_TASK_USE_MOCK=1)
+endif()
+
+# ---- md_test: host unit tests for the LVGL-free markdown parser core ----
+add_executable(md_test
+    md_test.cc
+    ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
+    ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
+)
+target_include_directories(md_test PRIVATE ${CLAW_ROOT}/components/lv_markdown/include)
