@@ -52,6 +52,15 @@ void SwitchType();
 
 bool IsConnected();
 
+// —— 连接信息快照（设置页显示用；全部即取即回，不阻塞） ——
+// WiFi 已连接时的 SSID；非 WiFi 模式或未连接返回 ""。
+std::string GetWifiSsid();
+// WiFi RSSI（dBm，负值）；非 WiFi 模式或未连接返回 0。
+int GetWifiRssi();
+// 当前 IP（WiFi 路径经 esp-wifi-connect 缓存；4G 路径读 iot_eth netif）；
+// 未连接或尚未拿到 IP 返回 ""。
+std::string GetIpAddress();
+
 // —— Wi-Fi 配网 ——
 // 追加一组凭据到 NVS "wifi"（SsidManager），下次 Start 即可用。
 void AddWifiCredential(const std::string& ssid, const std::string& password);

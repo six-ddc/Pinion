@@ -7,6 +7,7 @@
 #include <atomic>
 
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <esp_netif_sntp.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
@@ -155,6 +156,40 @@ bool IsConnected() {
         return WifiStation::GetInstance().IsConnected();
     }
     return s_cellular_connected;
+}
+
+std::string GetWifiSsid() {
+    if (CachedType() != Type::WiFi) {
+        return "";
+    }
+    auto& station = WifiStation::GetInstance();
+    return station.IsConnected() ? station.GetSsid() : "";
+}
+
+int GetWifiRssi() {
+    if (CachedType() != Type::WiFi) {
+        return 0;
+    }
+    auto& station = WifiStation::GetInstance();
+    return station.IsConnected() ? station.GetRssi() : 0;
+}
+
+std::string GetIpAddress() {
+    if (CachedType() == Type::WiFi) {
+        auto& station = WifiStation::GetInstance();
+        return station.IsConnected() ? station.GetIpAddress() : "";
+    }
+    // 4G：从 Nt26Modem 持有的 iot_eth netif 读 IP（未连通/未拿到 IP 返回 ""）。
+    if (s_modem != nullptr && s_cellular_connected) {
+        esp_netif_t* netif = s_modem->GetNetif();
+        esp_netif_ip_info_t info{};
+        if (netif != nullptr && esp_netif_get_ip_info(netif, &info) == ESP_OK &&
+            info.ip.addr != 0) {
+            char buf[16];
+            return esp_ip4addr_ntoa(&info.ip, buf, sizeof(buf));
+        }
+    }
+    return "";
 }
 
 void AddWifiCredential(const std::string& ssid, const std::string& password) {

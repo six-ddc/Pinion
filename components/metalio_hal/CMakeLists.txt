@@ -1,6 +1,7 @@
 set(SRCS
     "src/hal.cc"
     "src/settings.cc"
+    "src/storage.cc"
     "src/sysmon.cc"
     "src/backlight.cc"
     "src/backlight_facade.cc"

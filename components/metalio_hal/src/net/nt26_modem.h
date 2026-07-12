@@ -48,6 +48,10 @@ public:
 
     Nt26CeregState GetRegistrationState();
 
+    // 4G netif 只读句柄（iot_eth 起网后有效；未起网/未初始化返回 nullptr）。
+    // 供 network.cc 取 IP 等 netif 级信息用，不转移所有权。
+    esp_netif_t* GetNetif() const { return modem_ ? modem_->GetNetif() : nullptr; }
+
     // 转发到 UartEthModem::SendAt。线程安全（modem 内部用 mutex 串行化）。
     // modem 未实例化或未初始化时返回 ESP_ERR_INVALID_STATE。
     // bypass_init_check=true: 只要 modem 实例存在就直接转发——外置 SIM 卡

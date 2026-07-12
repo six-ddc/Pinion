@@ -464,6 +464,20 @@ public:
         return ESP_OK;
     }
 
+    // Remove all long-press handlers registered for `pin` -- the symmetric
+    // teardown to offClick(); use it when a screen unloads.
+    esp_err_t offLongPress(Pin pin) {
+        std::lock_guard<std::mutex> lock(handlers_mutex_);
+        const auto before = handlers_.size();
+        handlers_.erase(std::remove_if(handlers_.begin(), handlers_.end(),
+                                       [pin](const LongPressHandler& h) { return h.pin == pin; }),
+                        handlers_.end());
+        if (handlers_.size() < before) {
+            ESP_LOGI(TAG, "offLongPress: removed handlers for pin '%s'", PinName(pin));
+        }
+        return ESP_OK;
+    }
+
     // ----------------------------------------------------------------------
     // Direction / mapping introspection.
     // ----------------------------------------------------------------------
