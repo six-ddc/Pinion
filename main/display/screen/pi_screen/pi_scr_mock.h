@@ -1,7 +1,10 @@
 /* pi-c — MetalioClaw5 pi_screen App: two-turn Anthropic Messages SSE mock
  * script (blueprint §3e / §2 "pi_scr_mock.h"). turn1 = thinking -> tool_use
- * (calc 37*89); turn2 = text (answer, split into several text_delta chunks
- * to drive incremental UI append). Consumed by pi_agent_task.c:
+ * (calc 37*89); turn2 = markdown answer exercising the full lv_markdown
+ * subset (H1-3, both list kinds, fenced code with literal '#' + Chinese
+ * comment, inline bold/code/link, quote, rule, literal "C#"), with the bold
+ * run and the fence marker deliberately split across text_delta chunks to
+ * drive the streaming tail re-render. Consumed by pi_agent_task.c:
  *   g_responses[] = {{200, PI_MOCK_TURN1}, {200, PI_MOCK_TURN2}};
  *   pi_mock_init(&g_mock, g_responses, 2, 24);
  * SPDX-License-Identifier: MIT */
@@ -36,15 +39,26 @@
     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_"    \
     "block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"                                                \
     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
-    "\"type\":\"text_delta\",\"text\":\"37 \\u00d7 89 = 3293\\uff0c\"}}\n\n"                         \
+    "\"type\":\"text_delta\",\"text\":\"# 结果报告\\n37 × 89 = **32\"}}\n\n"                         \
     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
-    "\"type\":\"text_delta\",\"text\":\"\\u5df2\\u7ecf\\u5e2e\\u4f60\\u5b58\\u8fdb\\u5907\\u5fd8\"}" \
-    "}\n\n"                                                                                          \
+    "\"type\":\"text_delta\",\"text\":\"93**，已存进备忘「计算结果」。\\n\\n## 实现细节\\n"          \
+    "用的是 `ca\"}}\n\n"                                                                             \
     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
-    "\"type\":\"text_delta\",\"text\":\"\\u300c\\u8ba1\\u7b97\\u7ed3\\u679c\\u300d\\u3002\"}}\n\n"  \
+    "\"type\":\"text_delta\",\"text\":\"lc` 工具，参考 [文档](https://example.com/calc)。\\n\\n"     \
+    "### 注意事项\\n- 字面井号：C# 和 #tag 不应变色\\n- **粗体**与`行内代码`混排\\n\"}}\n\n"           \
     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
-    "\"type\":\"text_delta\",\"text\":\"\\u8fd8\\u9700\\u8981\\u6211\\u7b97\\u522b\\u7684\\u5417"   \
-    "\\uff1f\"}}\n\n"                                                                                \
+    "\"type\":\"text_delta\",\"text\":\"- [x] 已接入 mock\\n- [ ] 待办：真机验证\\n\\n"              \
+    "#### 四级标题\\n*斜体强调*与~~已废弃~~混排\\n\\n| 引脚 | 功能 |\\n|---|---|\\n"                  \
+    "| 50 | `CMD` |\\n| 51 | CLK |\\n\\n\"}}\n\n"                                                    \
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
+    "\"type\":\"text_delta\",\"text\":\"1. 第一步\\n2. 第二步\\n\\n> 引用：精度已核对过。\\n\\n"      \
+    "--\"}}\n\n"                                                                                     \
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
+    "\"type\":\"text_delta\",\"text\":\"-\\n\\n``\"}}\n\n"                                           \
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"   \
+    "\"type\":\"text_delta\",\"text\":\"`c\\n#include <stdio.h>\\nint main() {\\n"                   \
+    "    printf(\\\"3293\\\\n\\\");  // 中文注释触发字体回退\\n    return 0;\\n}\\n```\\n\\n"          \
+    "还需要我算别的吗？\"}}\n\n"                                                                      \
     "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"            \
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_"     \
     "turn\"},\"usage\":{\"output_tokens\":96}}\n\n"                                                  \

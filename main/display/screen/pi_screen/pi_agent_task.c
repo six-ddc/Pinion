@@ -46,10 +46,13 @@
 #include "pi_models_data.h"
 #include "volc_tts.h"
 
-/* Offline-debug channel: flip to 1 locally to replay the two-turn Anthropic
- * mock script instead of hitting the real API (no network required). Off by
- * default — production always uses models.json + pi_esp32_transport(). */
+/* Offline-debug channel: flip to 1 locally (or define via the build, e.g.
+ * sim's -DPI_SIM_MOCK=ON) to replay the two-turn Anthropic mock script
+ * instead of hitting the real API (no network required). Off by default —
+ * production always uses models.json + pi_esp32_transport(). */
+#ifndef PI_AGENT_TASK_USE_MOCK
 #define PI_AGENT_TASK_USE_MOCK 0
+#endif
 
 #if PI_AGENT_TASK_USE_MOCK
 #include "pi_mock_paced.h"
