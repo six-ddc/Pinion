@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "IOExpander.hpp"
+#include "lv_markdown/md_view.h"
 #include "metalio_hal/audio_pipeline.h"
 #include "pi_fonts.h"
 #include "pi_ui_bridge.h"
@@ -141,9 +142,7 @@ lv_obj_t* s_cur_tool_fn_lbl = nullptr;
 lv_obj_t* s_cur_tool_ret_lbl = nullptr;
 lv_obj_t* s_cur_tool_body_args_lbl = nullptr;
 lv_obj_t* s_cur_tool_body_partial_row = nullptr;  // "partial 等待流式返回" row, RUNNING-only
-lv_obj_t* s_cur_assistant_lbl = nullptr;
-lv_obj_t* s_cursor_obj = nullptr;
-std::string s_assistant_text;
+lvmd::MdView* s_cur_md = nullptr;  // current reply stream; owned by the LVGL tree, not us
 uint32_t s_turn_start_ms = 0;
 uint32_t s_think_start_ms = 0;
 uint32_t s_tool_start_ms = 0;
@@ -1301,57 +1300,65 @@ void BuildChatView(lv_obj_t* parent) {
 }
 
 // ---------------------------------------------------------------------------
-// assistant streaming text + blinking block cursor
-//
-// The cursor is a real 14x32 amber lv_obj (not a font glyph -- LVGL has no
-// inline-block text flow), kept in sync with the wrapped label's last
-// character via lv_label_get_letter_pos(). It is FLOATING so the flex feed
-// layout skips it; positioning is manual. This tracks the true wrap point
-// exactly for the common case (a run of text that ends on whichever visual
-// line is widest isn't required -- letter_pos already returns the correct
-// per-glyph pixel coordinate regardless of wrapping).
+// assistant streaming text -- markdown block rendering (components/
+// lv_markdown). One MdView per uninterrupted text stream: a thinking/tool
+// event finalizes the current stream so later text opens a new view BELOW
+// the card (the single-label version kept appending above it). The blinking
+// block cursor (same 14x32 amber rect, FLOATING, letter_pos-tracked) now
+// lives inside MdView.
 // ---------------------------------------------------------------------------
-void UpdateCursorPos() {
-    if (s_cursor_obj == nullptr || s_cur_assistant_lbl == nullptr) return;
-    lv_obj_update_layout(s_cur_assistant_lbl);
-    lv_point_t pos;
-    lv_label_get_letter_pos(s_cur_assistant_lbl, LV_LABEL_POS_LAST, &pos);
-    lv_obj_set_pos(s_cursor_obj, lv_obj_get_x(s_cur_assistant_lbl) + pos.x + 2,
-                   lv_obj_get_y(s_cur_assistant_lbl) + pos.y - 4);
+const lvmd::MdTheme& PiMdTheme() {
+    static const lvmd::MdTheme theme = [] {
+        lvmd::MdTheme t = lvmd::MdThemeDefaultDark();
+        t.body = &font_puhui_30_4;
+        t.heading = &font_puhui_30_4;
+        t.mono = &font_pi_mono_17;
+        t.mono_cjk = &font_puhui_20_4;  // code containing non-ASCII: readable beats monospaced
+        t.code_info_font = &font_pi_mono_14;
+        t.text = kText;
+        t.bold = 0xFFD584;    // light amber: no CJK bold font, and white-on-cream was too subtle
+        t.italic = 0xFFFFFF;  // no italic glyphs either; gentle emphasis-by-color
+        t.strike = kFaint;    // per-span strikethrough is impossible; deleted = faded
+        t.inline_code = kAmber;
+        t.link = kAmber;
+        t.task_done_text = kDim;
+        t.table_header = kAmberDim;
+        t.heading_color[0] = kAmber;
+        t.heading_color[1] = kAmber;
+        t.heading_color[2] = kAmberDim;
+        t.quote_text = kDim;
+        t.quote_bar = kAmberDim;
+        t.rule = kLine;
+        t.marker = kAmber;
+        t.code_text = kText;
+        t.code_bg = kCard;
+        t.code_border = kLine;
+        t.code_info = kFaint;
+        return t;
+    }();
+    return theme;
 }
 
-void EnsureAssistantLabel() {
-    if (s_cur_assistant_lbl != nullptr) return;
-    lv_obj_t* lbl = lv_label_create(s_feed);
-    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, kW - 32 * 2);
-    lv_label_set_text(lbl, "");
-    SetLabelFont(lbl, &font_puhui_30_4, kText);
-    lv_obj_set_style_text_line_space(lbl, 12, LV_PART_MAIN);  // ~30px * 1.55 line-height
-    s_cur_assistant_lbl = lbl;
-    s_assistant_text.clear();
-
-    lv_obj_t* cur = MakeRect(s_feed, 14, 32, kAmber);
-    lv_obj_add_flag(cur, LV_OBJ_FLAG_FLOATING);
-    s_cursor_obj = cur;
-    UpdateCursorPos();
+void EnsureMdView() {
+    if (s_cur_md != nullptr) return;
+    s_cur_md = lvmd::MdView::Create(s_feed, PiMdTheme(), kW - 32 * 2);
 }
 
 void AppendAssistantText(const char* delta) {
-    EnsureAssistantLabel();
-    s_assistant_text += delta;
-    lv_label_set_text(s_cur_assistant_lbl, s_assistant_text.c_str());
-    UpdateCursorPos();
-    lv_obj_remove_flag(s_cursor_obj, LV_OBJ_FLAG_HIDDEN);
+    EnsureMdView();
+    s_cur_md->Append(delta);
+}
+
+// Idempotent; the next TEXT_DELTA opens a fresh MdView appended after
+// whatever entered the feed in between.
+void FinalizeMdView() {
+    if (s_cur_md == nullptr) return;
+    s_cur_md->Finish();
+    s_cur_md = nullptr;
 }
 
 void CursorBlinkTick(lv_timer_t*) {
-    if (s_cursor_obj == nullptr) return;
-    if (lv_obj_has_flag(s_cursor_obj, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_remove_flag(s_cursor_obj, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_cursor_obj, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (s_cur_md != nullptr) s_cur_md->BlinkCursor();
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,12 +1368,7 @@ void ResetTurnState() {
     s_cur_think_row = s_cur_think_dot = s_cur_think_lbl = nullptr;
     s_cur_tool_card = s_cur_tool_dot = s_cur_tool_fn_lbl = nullptr;
     s_cur_tool_ret_lbl = s_cur_tool_body_args_lbl = s_cur_tool_body_partial_row = nullptr;
-    s_cur_assistant_lbl = nullptr;
-    if (s_cursor_obj != nullptr) {
-        lv_obj_delete(s_cursor_obj);
-        s_cursor_obj = nullptr;
-    }
-    s_assistant_text.clear();
+    FinalizeMdView();
     s_turn_start_ms = lv_tick_get();
     s_think_start_ms = 0;
     s_tool_start_ms = 0;
@@ -1399,10 +1401,21 @@ void ResetTurnState() {
 
 void ScrollFeedToBottom() {
     if (s_feed == nullptr) return;
-    uint32_t n = lv_obj_get_child_count(s_feed);
-    if (n == 0) return;
-    lv_obj_t* last = lv_obj_get_child(s_feed, n - 1);
-    if (last != nullptr) lv_obj_scroll_to_view_recursive(last, LV_ANIM_ON);
+    // scroll_to_view(last child) only aligns the child's TOP edge once it is
+    // taller than the viewport -- a streaming MdView reply quickly is -- so
+    // follow the stream by scrolling to the real content bottom instead.
+    // This update_layout is the tick's ONE forced layout pass; MdView's
+    // SyncCursor below piggybacks on it.
+    lv_obj_update_layout(s_feed);
+    int32_t below = lv_obj_get_scroll_bottom(s_feed);
+    // While streaming, ANIM_ON would restart a 200-400ms scroll animation
+    // every 80ms tick -- it never finishes, so every 16ms refresh has a
+    // scroll step and (in FULL render mode) a full-screen repaint. Content
+    // already grows tick by tick; snapping is visually equivalent.
+    if (below > 0) {
+        lv_obj_scroll_to_y(s_feed, lv_obj_get_scroll_y(s_feed) + below,
+                           s_cur_md != nullptr ? LV_ANIM_OFF : LV_ANIM_ON);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,6 +1467,7 @@ void DrainQueueTick(lv_timer_t*) {
     std::string batched_text;
     int budget = 64;
     bool touched = false;
+    bool stat_dirty = false;
     while (budget-- > 0 && xQueueReceive(q, &evt, 0) == pdTRUE) {
         touched = true;
         switch (evt.kind) {
@@ -1461,6 +1475,14 @@ void DrainQueueTick(lv_timer_t*) {
                 ShowStopBtn();
                 break;
             case UI_THINKING_START:
+                // A card is about to enter the feed: flush pending text into
+                // the current reply stream and close it, so post-card text
+                // starts a new stream below the card (correct visual order).
+                if (!batched_text.empty()) {
+                    AppendAssistantText(batched_text.c_str());
+                    batched_text.clear();
+                }
+                FinalizeMdView();
                 s_turn_had_thinking = true;
                 s_think_start_ms = lv_tick_get();
                 if (!s_zen && s_cur_think_row == nullptr) {
@@ -1488,6 +1510,11 @@ void DrainQueueTick(lv_timer_t*) {
                 }
                 break;
             case UI_TOOL_START: {
+                if (!batched_text.empty()) {
+                    AppendAssistantText(batched_text.c_str());
+                    batched_text.clear();
+                }
+                FinalizeMdView();
                 s_turn_tool_count++;
                 const char* name = evt.s1 != nullptr ? evt.s1 : "tool";
                 if (!s_zen) {
@@ -1553,19 +1580,18 @@ void DrainQueueTick(lv_timer_t*) {
                 if (s_ttfb_ms < 0) s_ttfb_ms = static_cast<int32_t>(lv_tick_get() - s_turn_start_ms);
                 if (evt.s1 != nullptr) batched_text += evt.s1;
                 // Streaming approximation (per-turn i2 from TEXT_DELTA); DONE
-                // corrects both ^ and v to the real pi_usage_t values.
+                // corrects both ^ and v to the real pi_usage_t values. The
+                // dock label itself is refreshed once per tick, after the
+                // loop -- not per event.
                 s_out_tokens = evt.i2;
-                UpdateDockStat();
+                stat_dirty = true;
                 break;
             case UI_DONE: {
                 if (!batched_text.empty()) {
                     AppendAssistantText(batched_text.c_str());
                     batched_text.clear();
                 }
-                if (s_cursor_obj != nullptr) {
-                    lv_obj_delete(s_cursor_obj);
-                    s_cursor_obj = nullptr;
-                }
+                FinalizeMdView();
                 ShowTalkBtn();
                 s_zen_turn_done = true;
                 StopBreath(s_act_dot);
@@ -1611,10 +1637,11 @@ void DrainQueueTick(lv_timer_t*) {
                     lv_timer_delete(s_think_timer);
                     s_think_timer = nullptr;
                 }
-                if (s_cursor_obj != nullptr) {
-                    lv_obj_delete(s_cursor_obj);
-                    s_cursor_obj = nullptr;
+                if (!batched_text.empty()) {
+                    AppendAssistantText(batched_text.c_str());
+                    batched_text.clear();
                 }
+                FinalizeMdView();
                 ShowTalkBtn();
                 break;
             }
@@ -1623,7 +1650,11 @@ void DrainQueueTick(lv_timer_t*) {
         if (evt.s2 != nullptr) free(evt.s2);
     }
     if (!batched_text.empty()) AppendAssistantText(batched_text.c_str());
-    if (touched) ScrollFeedToBottom();
+    if (stat_dirty) UpdateDockStat();
+    if (touched) {
+        ScrollFeedToBottom();  // the tick's single forced layout pass...
+        if (s_cur_md != nullptr) s_cur_md->SyncCursor();  // ...which cursor placement reuses
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,7 +2032,7 @@ void OnScreenUnloaded(lv_event_t*) {
     s_cur_think_row = s_cur_think_dot = s_cur_think_lbl = nullptr;
     s_cur_tool_card = s_cur_tool_dot = s_cur_tool_fn_lbl = nullptr;
     s_cur_tool_ret_lbl = s_cur_tool_body_args_lbl = s_cur_tool_body_partial_row = nullptr;
-    s_cur_assistant_lbl = s_cursor_obj = nullptr;
+    s_cur_md = nullptr;  // the MdView frees itself when the LVGL tree is deleted
     s_wave_bars.clear();
     s_tool_cache.clear();
 }
