@@ -954,6 +954,9 @@ lv_obj_t* CreateToolCard(lv_obj_t* parent, const char* name) {
     lv_obj_set_style_clip_corner(card, true, LV_PART_MAIN);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     screen_swipe_back_ignore(card, true);
+    // head 与 body 纵向堆叠；漏掉这行时二者都落在 (0,0)，展开 body 会与
+    // 标题行重叠（sim 交互测试发现的真机同现 bug）。
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 
     lv_obj_t* head = lv_obj_create(card);
     screen_strip_obj_chrome(head);

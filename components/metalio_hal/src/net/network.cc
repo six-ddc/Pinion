@@ -7,6 +7,7 @@
 #include <atomic>
 
 #include <esp_log.h>
+#include <esp_netif_sntp.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -52,6 +53,20 @@ Type CachedType() {
     return type;
 }
 
+// 网络连通后起 SNTP 对时（幂等）。系统时间没同步前 UI 时钟只能显示
+// 占位符（pi_screen 以年份 >= 2025 判定时间可信）。
+void StartSntpOnce() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    if (esp_netif_sntp_init(&cfg) == ESP_OK) {
+        ESP_LOGI(TAG, "SNTP started (ntp.aliyun.com)");
+    } else {
+        ESP_LOGW(TAG, "SNTP init failed");
+    }
+}
+
 bool StartWifi() {
     {
         // 网页配网入口旗标（旧 WifiBoard::ResetWifiConfiguration 语义）：
@@ -84,6 +99,7 @@ bool StartWifi() {
         Emit(Event::WifiConnectFailed);
         return false;
     }
+    StartSntpOnce();
     return true;
 }
 
@@ -93,6 +109,7 @@ bool StartCellular() {
         s_modem->SetEventCallback([](Event e, const std::string& data) {
             if (e == Event::CellularConnected) {
                 s_cellular_connected = true;
+                StartSntpOnce();
             } else if (e == Event::CellularDisconnected) {
                 s_cellular_connected = false;
             }

@@ -64,6 +64,19 @@ idf.py -p /dev/ttyACM0 flash monitor   # P4 port = "USB JTAG/serial debug unit";
   `Code/esp32/MetalioClaw6` ↔ `Code/six-ddc/pi-c`.
 - Code style: `.clang-format` (Google-based, 4-space indent, 120 col). Format C/C++ before committing.
 
+## Host simulator (sim/)
+
+`sim/` builds the pi_screen UI **unchanged** into a macOS SDL2 window (LVGL taken straight from
+`managed_components/lvgl__lvgl`, agent = pi-c POSIX port + libcurl → real DeepSeek):
+
+```bash
+cmake -S sim -B sim/build && cmake --build sim/build -j && ./sim/build/pi_sim
+```
+
+F1 = PWR_KEY, typing while listening = speech (1s pause auto-sends), F12 = screenshot. All
+platform differences live in `sim/shim/` — never patch `main/display/**` for host reasons.
+See `sim/README.md` for the interaction map and the unattended self-test/screenshot mode.
+
 ## sdkconfig — handle with care
 
 The local `sdkconfig` is hand-tuned for this hardware and **not tracked by git**;

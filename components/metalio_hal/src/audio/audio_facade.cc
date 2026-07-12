@@ -3,6 +3,10 @@
 #include <cstring>
 #include <vector>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include "IOExpander.hpp"
 #include "audio_codec.h"
 #include "bt_audio_codec.h"
 #include "config.h"
@@ -29,14 +33,31 @@ AudioCodec* Codec() { return Impl(); }
 
 void EnableInput(bool enable) { Impl()->EnableInput(enable); }
 
-void EnableOutput(bool enable) { Impl()->EnableOutput(enable); }
+void EnableOutput(bool enable) {
+    Impl()->EnableOutput(enable);
+    // PA 跟随播放开关（开机不常开）：闲置断电由播放任务触发，消除功放
+    // 持续放大 BT codec 空闲底噪的滋滋声。
+    IOExpander::getInstance().setLevel(IOExpander::Pin::PA, enable);
+    if (enable) {
+        vTaskDelay(pdMS_TO_TICKS(30));  // 功放上电稳定，避免吞掉首音
+    }
+}
 
 int ReadPcm(int16_t* dst, int samples) {
-    std::vector<int16_t> buf(samples);
+    // codec 输入可能是交错多声道（通道0=mic，其余为回采参考，旧 AudioService
+    // 的拆法）：按声道数整读一帧，再抽取 mic 声道还原成单声道。
+    const int ch = Impl()->input_channels();
+    std::vector<int16_t> buf(samples * ch);
     if (!Impl()->InputData(buf)) {
         return 0;
     }
-    std::memcpy(dst, buf.data(), samples * sizeof(int16_t));
+    if (ch <= 1) {
+        std::memcpy(dst, buf.data(), samples * sizeof(int16_t));
+    } else {
+        for (int i = 0; i < samples; i++) {
+            dst[i] = buf[(size_t)i * ch];
+        }
+    }
     return samples;
 }
 

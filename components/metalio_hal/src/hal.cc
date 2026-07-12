@@ -39,7 +39,9 @@ void InitIoExpander() {
     auto& io = IOExpander::getInstance();
     io.begin(s_i2c_bus);
     io.setLevel(IOExpander::Pin::BT_POWER, true);
-    io.setLevel(IOExpander::Pin::PA, true);
+    // PA 不再开机常开：常开会持续放大 BT codec 空闲底噪（滋滋声）。
+    // 播放侧经 mhal::audio::EnableOutput 按需开关（audio_facade.cc）。
+    io.setLevel(IOExpander::Pin::PA, false);
     io.setLevel(IOExpander::Pin::PA_SWITCH, true);
     io.setLevel(IOExpander::Pin::RST_4G, true);
     // CAM_PWDN 高 = 摄像头断电（本固件无相机功能，保持断电省电）。

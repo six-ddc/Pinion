@@ -91,11 +91,22 @@ void CaptureTask(void*) {
 
     ESP_LOGI(TAG, "capture started: %dms/frame (%d samples)",
              s_cap.cfg.frame_ms, frame_samples);
+    uint32_t dbg_ms = 0;
+    int dbg_peak = 0;
     while (!s_cap.stop_requested) {
         int got = mhal::audio::ReadPcm(buf, frame_samples);
         if (got <= 0) {
             vTaskDelay(pdMS_TO_TICKS(s_cap.cfg.frame_ms));
             continue;
+        }
+        // 每秒一条 mic 电平：判断"没识别出来"是没采到声还是链路问题
+        int level = FrameMeanAbs(buf, got);
+        if (level > dbg_peak) dbg_peak = level;
+        dbg_ms += s_cap.cfg.frame_ms;
+        if (dbg_ms >= 1000) {
+            ESP_LOGI(TAG, "mic level: peak %d (1s)", dbg_peak);
+            dbg_ms = 0;
+            dbg_peak = 0;
         }
         if (s_cap.cfg.enable_vad) CaptureVad(buf, got);
         if (s_cap.cbs.on_frame) s_cap.cbs.on_frame(buf, got);
