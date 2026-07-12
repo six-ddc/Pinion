@@ -1794,8 +1794,10 @@ void HandleAsrFinal() {
     std::string text;
     AsrLock();
     text = s_asr_live_text;
+    s_asr_error_text.clear();
     AsrUnlock();
     s_asr_final_ready = false;
+    s_asr_failed = false;  // final 已定局，teardown 期间迟到的 error 是噪声
     s_asr_waiting_final = false;
     StopListenTimers();
     if (text.empty()) {  // 没说话/没听清：安静回到来处，不发空 prompt
@@ -1816,6 +1818,7 @@ void HandleAsrFailure() {
     msg = s_asr_error_text;
     AsrUnlock();
     s_asr_failed = false;
+    s_asr_final_ready = false;  // 错误定局后丢弃悬空的 final，防串到下次会话
     s_asr_waiting_final = false;
     StopListenTimers();
     VoiceSend(VoiceCmd::Cancel);  // 兜底清理采集/半开会话（无会话时是 no-op）
@@ -1827,12 +1830,14 @@ void HandleAsrFailure() {
 
 void AsrTick(lv_timer_t*) {
     if (s_asr_lbl == nullptr) return;
-    if (s_asr_failed) {
-        HandleAsrFailure();
-        return;
-    }
+    // final 优先于 failed：final 已到说明识别成功，同 tick 并存的 error
+    // 只可能是收尾噪声，不能让它抢走识别文本
     if (s_asr_final_ready) {
         HandleAsrFinal();
+        return;
+    }
+    if (s_asr_failed) {
+        HandleAsrFailure();
         return;
     }
 

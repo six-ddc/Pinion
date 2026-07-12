@@ -201,7 +201,10 @@ static esp_err_t asr_send(AsrSession* s, const uint8_t* frame, size_t len) {
 }
 
 static void asr_destroy_locked_out(AsrSession* s) {
-    // 必须在非 WS 任务上下文调用
+    // 必须在非 WS 任务上下文调用。
+    // 会话结论至此已定，teardown 期间的 WS 事件都是噪声（服务端 final 后
+    // 主动断连，close 帧写失败会触发 ERROR），先注销回调防止污染上层标志。
+    esp_websocket_unregister_events(s->ws, WEBSOCKET_EVENT_ANY, asr_ws_event);
     esp_websocket_client_close(s->ws, pdMS_TO_TICKS(2000));
     esp_websocket_client_destroy(s->ws);
     vEventGroupDelete(s->eg);
