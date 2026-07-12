@@ -216,7 +216,7 @@ lv_obj_t* MakeSliderRow(lv_obj_t* parent, const char* name, int32_t min, int32_t
 
     lv_obj_t* lbl = lv_label_create(row);
     lv_label_set_text(lbl, name);
-    SetLabelFont(lbl, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
     lv_obj_set_width(lbl, 48);
 
@@ -239,7 +239,7 @@ lv_obj_t* MakeSliderRow(lv_obj_t* parent, const char* name, int32_t min, int32_t
 
     lv_obj_t* val = lv_label_create(row);
     lv_label_set_text(val, "--");
-    SetLabelFont(val, &font_pi_mono_17, Tok::Tx);
+    SetLabelFont(val, &font_pi_mono_20, Tok::Tx);
     lv_obj_set_width(val, 56);
     lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     *out_val = val;
@@ -319,12 +319,12 @@ lv_obj_t* MakeGridBtn(lv_obj_t* parent, const char* text_utf8) {
     screen_strip_obj_chrome(icon);
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(icon, 20, 20);
+    lv_obj_set_size(icon, 24, 24);
     lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
 
     lv_obj_t* lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text_utf8);
-    SetLabelFont(lbl, &font_puhui_20_4, Tok::Tx);
+    SetLabelFont(lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
     return btn;
 }
@@ -342,9 +342,9 @@ void BuildActionGrid(lv_obj_t* parent) {
     // 「✚ 新对话」：加号 = 两根交叉的琥珀短条
     lv_obj_t* btn_new = MakeGridBtn(grid, "\xe6\x96\xb0\xe5\xaf\xb9\xe8\xaf\x9d");  // "新对话"
     lv_obj_t* icon_new = lv_obj_get_child(btn_new, 0);
-    lv_obj_t* ph = MakeRect(icon_new, 18, 2, Tok::Accent);
+    lv_obj_t* ph = MakeRect(icon_new, 22, 2, Tok::Accent);
     lv_obj_align(ph, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* pv = MakeRect(icon_new, 2, 18, Tok::Accent);
+    lv_obj_t* pv = MakeRect(icon_new, 2, 22, Tok::Accent);
     lv_obj_align(pv, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_event_cb(
         btn_new,
@@ -358,9 +358,9 @@ void BuildActionGrid(lv_obj_t* parent) {
     // 「⚙ 设置」：环 + 心点（P1 已接线：收起面板 -> 推入设置 Hub）
     lv_obj_t* btn_set = MakeGridBtn(grid, "\xe8\xae\xbe\xe7\xbd\xae");  // "设置"
     lv_obj_t* icon_set = lv_obj_get_child(btn_set, 0);
-    lv_obj_t* ring_set = MakeRing(icon_set, 18, Tok::Dim, 2);
+    lv_obj_t* ring_set = MakeRing(icon_set, 22, Tok::Dim, 2);
     lv_obj_align(ring_set, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* dot_set = MakeCircle(icon_set, 6, Tok::Dim);
+    lv_obj_t* dot_set = MakeCircle(icon_set, 8, Tok::Dim);
     lv_obj_align(dot_set, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_event_cb(
         btn_set,
@@ -375,9 +375,9 @@ void BuildActionGrid(lv_obj_t* parent) {
     // 样式即时翻转，面板本身也当场换装），持久化 NVS "ui"/"theme"。
     lv_obj_t* btn_theme = MakeGridBtn(grid, "\xe4\xb8\xbb\xe9\xa2\x98");  // "主题"
     lv_obj_t* icon_theme = lv_obj_get_child(btn_theme, 0);
-    lv_obj_t* ring_theme = MakeRing(icon_theme, 18, Tok::Dim, 2);
+    lv_obj_t* ring_theme = MakeRing(icon_theme, 22, Tok::Dim, 2);
     lv_obj_align(ring_theme, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* half = MakeCircle(icon_theme, 8, Tok::Dim);
+    lv_obj_t* half = MakeCircle(icon_theme, 10, Tok::Dim);
     lv_obj_align(half, LV_ALIGN_LEFT_MID, 3, 0);
     lv_obj_add_event_cb(
         btn_theme, [](lv_event_t*) { pi_theme::Set(!pi_theme::IsLight()); }, LV_EVENT_CLICKED,
@@ -386,9 +386,9 @@ void BuildActionGrid(lv_obj_t* parent) {
     // 「⏻ 关机」：环 + 顶部短竖条；长按 2s 才关机
     s_off_btn = MakeGridBtn(grid, "\xe5\x85\xb3\xe6\x9c\xba");  // "关机"
     lv_obj_t* icon_off = lv_obj_get_child(s_off_btn, 0);
-    lv_obj_t* ring_off = MakeRing(icon_off, 18, Tok::Dim, 2);
+    lv_obj_t* ring_off = MakeRing(icon_off, 22, Tok::Dim, 2);
     lv_obj_align(ring_off, LV_ALIGN_CENTER, 0, 1);
-    lv_obj_t* stem = MakeRect(icon_off, 2, 9, Tok::Dim);
+    lv_obj_t* stem = MakeRect(icon_off, 2, 11, Tok::Dim);
     lv_obj_align(stem, LV_ALIGN_TOP_MID, 0, -1);
     lv_obj_add_event_cb(s_off_btn, OnOffPressed, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(s_off_btn, OnOffReleased, LV_EVENT_RELEASED, nullptr);
@@ -486,7 +486,7 @@ void Create(lv_obj_t* parent, const Hooks& hooks) {
 
     s_net_lbl = lv_label_create(status);
     lv_label_set_text(s_net_lbl, "--");
-    SetLabelFont(s_net_lbl, &font_pi_mono_17, Tok::Dim);
+    SetLabelFont(s_net_lbl, &font_pi_mono_20, Tok::Dim);
     lv_obj_set_style_text_letter_space(s_net_lbl, 1, LV_PART_MAIN);
 
     lv_obj_t* batt_box = lv_obj_create(status);
@@ -503,7 +503,7 @@ void Create(lv_obj_t* parent, const Hooks& hooks) {
     lv_obj_add_flag(s_chg_dot, LV_OBJ_FLAG_HIDDEN);
     s_batt_lbl = lv_label_create(batt_box);
     lv_label_set_text(s_batt_lbl, "--%");
-    SetLabelFont(s_batt_lbl, &font_pi_mono_17, Tok::Tx);
+    SetLabelFont(s_batt_lbl, &font_pi_mono_20, Tok::Tx);
 
     lv_obj_t* rule = MakeRect(s_panel, kW - 64, 1, Tok::Line);
     (void)rule;
@@ -521,7 +521,7 @@ void Create(lv_obj_t* parent, const Hooks& hooks) {
 
     s_toast_lbl = lv_label_create(s_panel);
     lv_label_set_text(s_toast_lbl, "");
-    SetLabelFont(s_toast_lbl, &font_pi_mono_14, Tok::Accent);
+    SetLabelFont(s_toast_lbl, &font_pi_mono_17, Tok::Accent);
     lv_obj_set_style_text_align(s_toast_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(s_toast_lbl, LV_PCT(100));
     lv_obj_add_flag(s_toast_lbl, LV_OBJ_FLAG_HIDDEN);

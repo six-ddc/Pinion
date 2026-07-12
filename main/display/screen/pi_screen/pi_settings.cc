@@ -190,7 +190,7 @@ lv_obj_t* MakeCard(lv_obj_t* parent, const char* cap_ascii, lv_obj_t** out_cap =
     if (cap_ascii != nullptr) {
         lv_obj_t* cap = lv_label_create(card);
         lv_label_set_text(cap, cap_ascii);
-        SetLabelFont(cap, &font_pi_mono_14, Tok::Faint);
+        SetLabelFont(cap, &font_pi_mono_17, Tok::Faint);
         lv_obj_set_style_text_letter_space(cap, 2, LV_PART_MAIN);
         if (out_cap != nullptr)
             *out_cap = cap;
@@ -269,7 +269,7 @@ lv_obj_t* MakeActionBtn(lv_obj_t* parent, const char* text_utf8, lv_event_cb_t c
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t* lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text_utf8);
-    SetLabelFont(lbl, &font_puhui_20_4, Tok::Accent);
+    SetLabelFont(lbl, &font_puhui_24_4, Tok::Accent);
     lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
     if (cb != nullptr)
         lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
@@ -300,8 +300,8 @@ lv_obj_t* MakeBigSliderRow(lv_obj_t* parent, int32_t min, int32_t max, lv_obj_t*
 
     lv_obj_t* val = lv_label_create(row);
     lv_label_set_text(val, "--");
-    SetLabelFont(val, &font_pi_mono_17, Tok::Tx);
-    lv_obj_set_width(val, 64);
+    SetLabelFont(val, &font_pi_mono_20, Tok::Tx);
+    lv_obj_set_width(val, 72);
     lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     *out_val = val;
     return row;
@@ -441,13 +441,13 @@ lv_obj_t* MakePage(PageId id, const char* title_utf8, lv_obj_t** out_page,
     lv_obj_set_flex_align(back, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t* back_lbl = lv_label_create(back);
     lv_label_set_text(back_lbl, "<");
-    SetLabelFont(back_lbl, &font_pi_mono_17, Tok::Dim);
+    SetLabelFont(back_lbl, &font_pi_mono_20, Tok::Dim);
     lv_obj_remove_flag(back_lbl, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(back, OnBackClicked, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* title = lv_label_create(hdr);
     lv_label_set_text(title, title_utf8);
-    SetLabelFont(title, &font_puhui_20_4, Tok::Tx);
+    SetLabelFont(title, &font_puhui_24_4, Tok::Tx);
 
     lv_obj_t* sp = lv_obj_create(hdr);
     screen_strip_obj_chrome(sp);
@@ -528,7 +528,7 @@ void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_ascii, const char* t
 
     lv_obj_t* title = lv_label_create(row);
     lv_label_set_text(title, title_utf8);
-    SetLabelFont(title, &font_puhui_20_4, Tok::Tx);
+    SetLabelFont(title, &font_puhui_24_4, Tok::Tx);
 
     lv_obj_t* sp = lv_obj_create(row);
     screen_strip_obj_chrome(sp);
@@ -787,7 +787,7 @@ void BuildNetConfirmSheet() {
         lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t* lbl = lv_label_create(b);
         lv_label_set_text(lbl, text);
-        SetLabelFont(lbl, &font_puhui_20_4, color);
+        SetLabelFont(lbl, &font_puhui_24_4, color);
         lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
         return b;
     };
@@ -855,8 +855,8 @@ void BuildNetworkPage(lv_obj_t** out_page) {
 
     // WiFi / 4G 分段
     lv_obj_t* seg_row = MakeFlexRow(content, kSegH);
-    s_net_seg[0] = MakeSegBtn(seg_row, "WiFi", &font_pi_mono_17, OnNetSegClicked, 0);
-    s_net_seg[1] = MakeSegBtn(seg_row, "4G", &font_pi_mono_17, OnNetSegClicked, 1);
+    s_net_seg[0] = MakeSegBtn(seg_row, "WiFi", &font_pi_mono_20, OnNetSegClicked, 0);
+    s_net_seg[1] = MakeSegBtn(seg_row, "4G", &font_pi_mono_20, OnNetSegClicked, 1);
 
     // 警示行「! 切换网络通道将重启设备」
     lv_obj_t* warn = MakeFlexRow(content, 32);
@@ -1131,11 +1131,11 @@ void BuildBluetoothPage(lv_obj_t** out_page) {
     // 三档分段：音箱 RX / 发射 TX / 关闭
     lv_obj_t* seg_row = MakeFlexRow(content, kSegH);
     s_bt_seg[0] =
-        MakeSegBtn(seg_row, "\xe9\x9f\xb3\xe7\xae\xb1 RX", &font_puhui_20_4, OnBtSegClicked, 0);
+        MakeSegBtn(seg_row, "\xe9\x9f\xb3\xe7\xae\xb1 RX", &font_puhui_24_4, OnBtSegClicked, 0);
     s_bt_seg[1] =
-        MakeSegBtn(seg_row, "\xe5\x8f\x91\xe5\xb0\x84 TX", &font_puhui_20_4, OnBtSegClicked, 1);
+        MakeSegBtn(seg_row, "\xe5\x8f\x91\xe5\xb0\x84 TX", &font_puhui_24_4, OnBtSegClicked, 1);
     s_bt_seg[2] =
-        MakeSegBtn(seg_row, "\xe5\x85\xb3\xe9\x97\xad", &font_puhui_20_4, OnBtSegClicked, 2);
+        MakeSegBtn(seg_row, "\xe5\x85\xb3\xe9\x97\xad", &font_puhui_24_4, OnBtSegClicked, 2);
     SegSetSelected(s_bt_seg, 3, BtSegIndexOf(mhal::bt::GetMode()));
 
     // 状态行：左中文"状态"，右 mono 状态
@@ -1311,7 +1311,7 @@ void BuildSoundPage(lv_obj_t** out_page) {
     // "回复语音播报"
     lv_label_set_text(lbl,
                       "\xe5\x9b\x9e\xe5\xa4\x8d\xe8\xaf\xad\xe9\x9f\xb3\xe6\x92\xad\xe6\x8a\xa5");
-    SetLabelFont(lbl, &font_puhui_20_4, Tok::Tx);
+    SetLabelFont(lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_t* sp = lv_obj_create(row);
     screen_strip_obj_chrome(sp);
     lv_obj_remove_flag(sp, LV_OBJ_FLAG_SCROLLABLE);
@@ -1438,7 +1438,7 @@ void BuildDisplayPage(lv_obj_t** out_page) {
         lv_obj_t* lbl = lv_label_create(c);
         lv_label_set_text(lbl, i == 0 ? "\xe6\xb7\xb1\xe8\x89\xb2"    // "深色"
                                       : "\xe6\xb5\x85\xe8\x89\xb2");  // "浅色"
-        lv_obj_set_style_text_font(lbl, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl, &font_puhui_24_4, LV_PART_MAIN);
         lv_obj_set_style_text_color(lbl, pv.dim, LV_PART_MAIN);  // 真值在 ApplyThemeCardVisual
         lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(c, OnThemeCardClicked, LV_EVENT_CLICKED,
@@ -1453,7 +1453,7 @@ void BuildDisplayPage(lv_obj_t** out_page) {
     static const char* kSleepTexts[4] = {"30s", "1min", "5min",
                                          "\xe6\xb0\xb8\xe4\xb8\x8d"};  // "永不"
     for (int i = 0; i < 4; i++) {
-        s_sleep_seg[i] = MakeSegBtn(sleep_row, kSleepTexts[i], &font_puhui_20_4, OnSleepSegClicked,
+        s_sleep_seg[i] = MakeSegBtn(sleep_row, kSleepTexts[i], &font_puhui_24_4, OnSleepSegClicked,
                                     static_cast<intptr_t>(i));
     }
     Settings ui("ui", false);
@@ -1476,8 +1476,8 @@ void BuildChatPage(lv_obj_t** out_page) {
 
     lv_obj_t* mode_card = MakeCard(content, "MODE");
     lv_obj_t* seg_row = MakeFlexRow(mode_card, kSegH);
-    s_mode_seg[0] = MakeSegBtn(seg_row, "FLOW", &font_pi_mono_17, OnModeSegClicked, 0);
-    s_mode_seg[1] = MakeSegBtn(seg_row, "ZEN", &font_pi_mono_17, OnModeSegClicked, 1);
+    s_mode_seg[0] = MakeSegBtn(seg_row, "FLOW", &font_pi_mono_20, OnModeSegClicked, 0);
+    s_mode_seg[1] = MakeSegBtn(seg_row, "ZEN", &font_pi_mono_20, OnModeSegClicked, 1);
     bool zen = s_hooks.get_zen != nullptr && s_hooks.get_zen();
     SegSetSelected(s_mode_seg, 2, zen ? 1 : 0);
     lv_obj_t* desc = lv_label_create(mode_card);
@@ -1493,7 +1493,7 @@ void BuildChatPage(lv_obj_t** out_page) {
     lv_obj_t* row = MakeFlexRow(hist_card, 56);
     lv_obj_t* lbl = lv_label_create(row);
     lv_label_set_text(lbl, "\xe5\x8e\x86\xe5\x8f\xb2\xe4\xbc\x9a\xe8\xaf\x9d");  // "历史会话"
-    SetLabelFont(lbl, &font_puhui_20_4, Tok::Faint);
+    SetLabelFont(lbl, &font_puhui_24_4, Tok::Faint);
     lv_obj_t* sp = lv_obj_create(row);
     screen_strip_obj_chrome(sp);
     lv_obj_remove_flag(sp, LV_OBJ_FLAG_SCROLLABLE);

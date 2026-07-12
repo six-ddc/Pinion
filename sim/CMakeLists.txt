@@ -73,7 +73,9 @@ add_executable(pi_sim
     ${CLAW_ROOT}/components/lv_markdown/src/md_view.cc
     ${CLAW_ROOT}/main/display/font/font_pi_mono_14.c
     ${CLAW_ROOT}/main/display/font/font_pi_mono_17.c
+    ${CLAW_ROOT}/main/display/font/font_pi_mono_20.c
     ${CLAW_ROOT}/main/display/font/font_pi_clock_132.c
+    ${CLAW_ROOT}/main/display/font/font_puhui_24_4.c
     ${CLAW_ROOT}/managed_components/78__xiaozhi-fonts/src/font_puhui_20_4.c
     ${CLAW_ROOT}/managed_components/78__xiaozhi-fonts/src/font_puhui_30_4.c
 )

@@ -428,7 +428,7 @@ lv_obj_t* BuildIdBox(lv_obj_t* parent) {
 
     lv_obj_t* lbl = lv_label_create(box);
     lv_label_set_text(lbl, "pi");
-    SetLabelFont(lbl, &font_pi_mono_17, Tok::Tx);
+    SetLabelFont(lbl, &font_pi_mono_20, Tok::Tx);
     lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_add_event_cb(box, [](lv_event_t*) { OpenNewSessionSheet(); }, LV_EVENT_CLICKED, nullptr);
@@ -453,7 +453,7 @@ lv_obj_t* BuildWifi(lv_obj_t* parent) {
 
     w.g4_lbl = lv_label_create(box);
     lv_label_set_text(w.g4_lbl, "4G");
-    SetLabelFont(w.g4_lbl, &font_pi_mono_14, Tok::Dim);
+    SetLabelFont(w.g4_lbl, &font_pi_mono_17, Tok::Dim);
     lv_obj_set_style_pad_right(w.g4_lbl, 4, LV_PART_MAIN);
     lv_obj_add_flag(w.g4_lbl, LV_OBJ_FLAG_HIDDEN);  // WiFi 模式隐藏
 
@@ -549,7 +549,7 @@ lv_obj_t* BuildCtx(lv_obj_t* parent, lv_obj_t** out_fill, lv_obj_t** out_label) 
 
     lv_obj_t* lbl = lv_label_create(box);
     lv_label_set_text(lbl, "CTX");
-    SetLabelFont(lbl, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
     *out_label = lbl;
 
@@ -660,7 +660,7 @@ void BuildIdleView(lv_obj_t* parent) {
     (void)idbox;
     s_idle_model_lbl = lv_label_create(sbar);
     lv_label_set_text(s_idle_model_lbl, "...");  // filled in by UpdateModelLabels() on LOAD
-    SetLabelFont(s_idle_model_lbl, &font_pi_mono_17, Tok::Dim);
+    SetLabelFont(s_idle_model_lbl, &font_pi_mono_20, Tok::Dim);
     MakeSpacer(sbar);
     lv_obj_t* ctx_fill = nullptr;
     lv_obj_t* ctx_lbl = nullptr;
@@ -688,7 +688,7 @@ void BuildIdleView(lv_obj_t* parent) {
 
     s_date_lbl = lv_label_create(mid);
     lv_label_set_text(s_date_lbl, "");
-    SetLabelFont(s_date_lbl, &font_pi_mono_17, Tok::Dim);
+    SetLabelFont(s_date_lbl, &font_pi_mono_20, Tok::Dim);
     lv_obj_set_style_text_letter_space(s_date_lbl, 3, LV_PART_MAIN);
 
     UpdateIdleClock(nullptr);
@@ -713,10 +713,10 @@ void BuildIdleView(lv_obj_t* parent) {
 
     lv_obj_t* h1 = lv_label_create(hint);
     lv_label_set_text(h1, "\xe6\x8c\x89\xe4\xbd\x8f\xe8\xaf\xb4\xe8\xaf\x9d");  // "按住说话"
-    SetLabelFont(h1, &font_puhui_20_4, Tok::Faint);
+    SetLabelFont(h1, &font_puhui_24_4, Tok::Faint);
     lv_obj_t* h2 = lv_label_create(hint);
     lv_label_set_text(h2, "HOLD KEY / TOUCH TO TALK");
-    SetLabelFont(h2, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(h2, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(h2, 2, LV_PART_MAIN);
 
     s_clock_timer = lv_timer_create(UpdateIdleClock, 1000, nullptr);
@@ -759,7 +759,7 @@ void BuildListenView(lv_obj_t* parent) {
     lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_CLICKABLE);
     s_rec_lbl = lv_label_create(sbar);
     lv_label_set_text(s_rec_lbl, "REC 0:00");
-    SetLabelFont(s_rec_lbl, &font_pi_mono_17, Tok::Accent);
+    SetLabelFont(s_rec_lbl, &font_pi_mono_20, Tok::Accent);
     MakeSpacer(sbar);
     BuildWifi(sbar);
 
@@ -842,10 +842,10 @@ void BuildListenView(lv_obj_t* parent) {
 
     lv_obj_t* cancel_lbl = lv_label_create(hint);
     lv_label_set_text(cancel_lbl, "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\x96\xe6\xb6\x88");  // "^ 上滑取消"
-    SetLabelFont(cancel_lbl, &font_puhui_20_4, Tok::Faint);
+    SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Faint);
     lv_obj_t* go_lbl = lv_label_create(hint);
     lv_label_set_text(go_lbl, "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81 ->");  // "松开发送 ->"
-    SetLabelFont(go_lbl, &font_puhui_20_4, Tok::Accent);
+    SetLabelFont(go_lbl, &font_puhui_24_4, Tok::Accent);
 }
 
 // ---------------------------------------------------------------------------
@@ -902,7 +902,7 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     BuildIdBox(sbar);
     s_chat_model_lbl = lv_label_create(sbar);
     lv_label_set_text(s_chat_model_lbl, "...");  // filled in by UpdateModelLabels() on LOAD
-    SetLabelFont(s_chat_model_lbl, &font_pi_mono_17, Tok::Dim);
+    SetLabelFont(s_chat_model_lbl, &font_pi_mono_20, Tok::Dim);
     MakeSpacer(sbar);
     lv_obj_t* ctx_fill = nullptr;
     lv_obj_t* ctx_lbl = nullptr;
@@ -947,7 +947,7 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
 
     s_mode_lbl = lv_label_create(mode_btn);
     lv_label_set_text(s_mode_lbl, "FLOW");
-    SetLabelFont(s_mode_lbl, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(s_mode_lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_mode_lbl, 1, LV_PART_MAIN);
 
     lv_obj_add_event_cb(
@@ -970,7 +970,7 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_obj_remove_flag(s_tts_dot, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t* tts_lbl = lv_label_create(tts_btn);
     lv_label_set_text(tts_lbl, "TTS");
-    SetLabelFont(tts_lbl, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(tts_lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(tts_lbl, 1, LV_PART_MAIN);
     lv_obj_remove_flag(tts_lbl, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(
@@ -997,14 +997,14 @@ void AppendUserRow(const std::string& text) {
 
     lv_obj_t* who = lv_label_create(row);
     lv_label_set_text(who, "YOU");
-    SetLabelFont(who, &font_pi_mono_14, Tok::Accent);
+    SetLabelFont(who, &font_pi_mono_17, Tok::Accent);
     lv_obj_set_style_text_letter_space(who, 2, LV_PART_MAIN);
 
     lv_obj_t* t = lv_label_create(row);
     lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
     lv_obj_set_flex_grow(t, 1);
     lv_label_set_text(t, text.c_str());
-    SetLabelFont(t, &font_puhui_20_4, Tok::Dim);
+    SetLabelFont(t, &font_puhui_30_4, Tok::Dim);
 }
 
 // Thin red-line error banner in the chat feed (design: 红色细线横幅) --
@@ -1201,7 +1201,7 @@ void BuildActLine(lv_obj_t* parent) {
 
     s_act_text = lv_label_create(s_act_line);
     lv_label_set_text(s_act_text, "connecting...");
-    SetLabelFont(s_act_text, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(s_act_text, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_act_text, 1, LV_PART_MAIN);
 
     MakeSpacer(s_act_line);
@@ -1325,7 +1325,7 @@ void BuildDock(lv_obj_t* parent) {
 
     s_dock_stat_lbl = lv_label_create(dock);
     lv_label_set_text(s_dock_stat_lbl, "");
-    SetLabelFont(s_dock_stat_lbl, &font_pi_mono_14, Tok::Faint);
+    SetLabelFont(s_dock_stat_lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_dock_stat_lbl, 1, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(s_dock_stat_lbl, 6, LV_PART_MAIN);
 
@@ -1360,7 +1360,7 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_t* stop_lbl = lv_label_create(s_stop_btn);
     lv_label_set_text(stop_lbl, "STOP \xc2\xb7 \xe7\x9f\xad\xe6\x8c\x89 KEY");  // "STOP · 短按 KEY"
     // Mixed ASCII+CJK: needs the CJK font (mono has no "短按" glyphs).
-    SetLabelFont(stop_lbl, &font_puhui_20_4, Tok::Tx);
+    SetLabelFont(stop_lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_set_style_text_letter_space(stop_lbl, 1, LV_PART_MAIN);
     lv_obj_add_event_cb(
         s_stop_btn, [](lv_event_t*) { pi_agent_task_abort(); }, LV_EVENT_CLICKED, nullptr);
@@ -1387,7 +1387,7 @@ void BuildDock(lv_obj_t* parent) {
     MakeRing(s_talk_btn, 14, Tok::Accent, 2);
     lv_obj_t* talk_lbl = lv_label_create(s_talk_btn);
     lv_label_set_text(talk_lbl, "\xe6\x8c\x89\xe4\xbd\x8f\xe8\xaf\xb4\xe8\xaf\x9d");  // "按住说话"
-    SetLabelFont(talk_lbl, &font_puhui_20_4, Tok::Accent);  // CJK text needs the CJK font
+    SetLabelFont(talk_lbl, &font_puhui_24_4, Tok::Accent);  // CJK text needs the CJK font
     lv_obj_set_style_text_letter_space(talk_lbl, 2, LV_PART_MAIN);
     void* ret_chat = reinterpret_cast<void*>(static_cast<intptr_t>(ViewState::Chat));
     lv_obj_add_event_cb(s_talk_btn, OnPttPressed, LV_EVENT_PRESSED, ret_chat);
@@ -2315,12 +2315,12 @@ void BuildNewSessionSheet(lv_obj_t* parent) {
     lv_obj_t* cancel_lbl = nullptr;
     lv_obj_t* cancel_btn = MakeSheetButton(btn_row, Tok::Line2, &cancel_lbl);
     lv_label_set_text(cancel_lbl, "\xe5\x8f\x96\xe6\xb6\x88");  // "取消"
-    SetLabelFont(cancel_lbl, &font_puhui_20_4, Tok::Dim);
+    SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Dim);
     lv_obj_add_event_cb(
         cancel_btn, [](lv_event_t*) { CloseNewSessionSheet(); }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* confirm_btn = MakeSheetButton(btn_row, Tok::Accent, &s_sheet_confirm_lbl);
-    SetLabelFont(s_sheet_confirm_lbl, &font_puhui_20_4, Tok::Accent);
+    SetLabelFont(s_sheet_confirm_lbl, &font_puhui_24_4, Tok::Accent);
     lv_obj_add_event_cb(
         confirm_btn,
         [](lv_event_t*) {
