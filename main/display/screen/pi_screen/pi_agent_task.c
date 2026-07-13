@@ -42,6 +42,7 @@
 #include "freertos/task.h"
 
 #include "pi/pi.h"
+#include "pi_card/pi_card_tools.h"
 #include "pi_esp32.h"
 #include "pi_models_data.h"
 #include "volc_tts.h"
@@ -392,12 +393,61 @@ static int calc_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
     return PI_OK;
 }
 
+/* ---------- pi_card 声明式 UI 工具（ui.render / ui.update / ui.close） ----------
+ * execute 在 worker 线程调 pi_card_tool_*（校验 + 入 pi_ui_queue，不碰 LVGL），
+ * 秒回，绝不在 SSE 读循环上做重活。真正建控件在 pi_screen 的 DrainQueueTick。 */
+static int card_tool_run(char *(*fn)(const cJSON *, bool *), const pi_alloc_t *alloc,
+                         const cJSON *args, pi_tool_result_t *out) {
+    bool is_err = false;
+    char *res = fn(args, &is_err);
+    out->output = pi_strdup(alloc, res ? res : "error");
+    out->is_error = is_err;
+    free(res);
+    return PI_OK;
+}
+static int ui_render_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
+                          volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
+                          void *user, pi_tool_result_t *out) {
+    (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
+    return card_tool_run(pi_card_tool_render, alloc, args, out);
+}
+static int ui_update_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
+                          volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
+                          void *user, pi_tool_result_t *out) {
+    (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
+    return card_tool_run(pi_card_tool_update, alloc, args, out);
+}
+static int ui_close_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
+                         volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
+                         void *user, pi_tool_result_t *out) {
+    (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
+    return card_tool_run(pi_card_tool_close, alloc, args, out);
+}
+
 static const pi_agent_tool_t TOOLS[] = {
     {
         .def = {.name = "calc",
                 .description = "Basic arithmetic on two numbers",
                 .parameters_schema_json = CALC_SCHEMA},
         .execute = calc_exec,
+    },
+    {
+        .def = {.name = "ui.render",
+                .description = PI_CARD_RENDER_DESC,
+                .parameters_schema_json = PI_CARD_RENDER_SCHEMA},
+        .execute = ui_render_exec,
+    },
+    {
+        .def = {.name = "ui.update",
+                .description = PI_CARD_UPDATE_DESC,
+                .parameters_schema_json = PI_CARD_UPDATE_SCHEMA},
+        .execute = ui_update_exec,
+    },
+    {
+        .def = {.name = "ui.close",
+                .description = PI_CARD_CLOSE_DESC,
+                .parameters_schema_json = PI_CARD_CLOSE_SCHEMA},
+        .execute = ui_close_exec,
     },
 };
 
@@ -408,6 +458,7 @@ static void enqueue(pi_ui_kind_t kind, char *s1, char *s2, int i1, int i2) {
     evt.kind = kind;
     evt.s1 = s1;
     evt.s2 = s2;
+    evt.s3 = NULL; /* 本地事件不用 s3；卡片事件由 pi_card_host 侧自建 evt 设置 */
     evt.i1 = i1;
     evt.i2 = i2;
     QueueHandle_t q = pi_ui_queue();
@@ -644,6 +695,15 @@ void pi_agent_task_send_prompt(const char *preset) {
 void pi_agent_task_abort(void) {
     tts_cancel_run(); /* STOP/打断：作废本 run 未播文本 + 异步停播 */
     if (g_agent) pi_agent_abort(g_agent);
+}
+
+void pi_agent_task_inject(const char *text) {
+    if (!g_agent || !text || !text[0]) return;
+    if (g_running) {
+        pi_agent_steer(g_agent, text); /* 运行中：插到下一轮之前 */
+    } else {
+        pi_agent_task_send_prompt(text); /* 空闲：起一轮，助手回应用户的选择 */
+    }
 }
 
 void pi_agent_task_tts_cancel(void) { tts_cancel_run(); }

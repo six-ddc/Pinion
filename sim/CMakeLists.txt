@@ -66,6 +66,12 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_theme.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_agent_task.c
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_mock_paced.c
+    # pi_card 声明式 UI 卡片框架（LLM 下发 JSON → LVGL 渲染）
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_data.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_icons.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_actions.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
@@ -84,6 +90,7 @@ target_include_directories(pi_sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include   # must precede everything ESP-flavored
     ${CLAW_ROOT}/main/display/screen
     ${CLAW_ROOT}/main/display/screen/pi_screen
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
     ${CLAW_ROOT}/components/volc_speech/include # real volc headers, stub impls
     ${CLAW_ROOT}/components/lv_markdown/include
 )

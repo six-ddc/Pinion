@@ -36,7 +36,9 @@
 
 #include "lvgl.h"
 
+#include "cJSON.h"
 #include "IOExpander.hpp"
+#include "pi_card/pi_card_tools.h"
 #include "pi_screen.h"
 #include "screen_util.h"
 #include "sim_hooks.h"
@@ -46,6 +48,145 @@ namespace {
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_pwr_key_held{false};  // F1 held = PWR_KEY pressed (press-and-hold)
 std::atomic<bool> g_shot_pending{false};
+std::atomic<bool> g_demo_pending{false};  // F9 = 渲染一张 pi_card 演示卡（overlay，任何视图可见）
+
+// pi_card 声明式 UI 演示卡：覆盖 icon/slider/bar/label(mono+puhui)/switch/button/
+// divider/spacer + 双向 bind + tone 语义色 + 自适应布局。走完整管道（校验→入队→
+// drain 渲染），是渲染器 + 主题 + 图标 + 自适应的单图核验。
+constexpr const char* kCard0 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":22,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"PI CONTROL\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"设备控制\"}]},"
+    "{\"type\":\"column\",\"gap\":18,\"children\":["
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},"
+    "{\"type\":\"slider\",\"bind\":\"audio.volume\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\"},"
+    "{\"type\":\"slider\",\"bind\":\"display.brightness\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"display.brightness\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
+    "{\"type\":\"bar\",\"bind\":\"battery.level\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\",\"bind\":\"battery.level\","
+    "\"fmt\":\"%d%%\"}]}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"switch\",\"checked\":true}]},"
+    "{\"type\":\"row\",\"gap\":12,\"children\":["
+    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"取消\",\"on_click\":[{\"do\":\"close\"}]},"
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"确认\","
+    "\"on_click\":[{\"do\":\"report\",\"text\":\"确认\"},{\"do\":\"close\"}]}]}"
+    "]}}";
+
+// ---- 稳定性压力测试语料：多样 + 对抗性用例，验证"怎么拼都不崩不溢出不难看" ----
+// 1 确认框（长正文换行 + ghost/primary 层级）
+constexpr const char* kCard1 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"CONFIRM\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"切换到 4G?\"}]},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"当前使用 WiFi。切换到蜂窝网络会断开连接"
+    "并重启设备,大约需要 30 秒,期间无法使用。确定继续吗?\"},"
+    "{\"type\":\"row\",\"gap\":12,\"children\":["
+    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"取消\",\"on_click\":[{\"do\":\"close\"}]},"
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"切换并重启\","
+    "\"on_click\":[{\"do\":\"report\",\"text\":\"切换到4G\"},{\"do\":\"close\"}]}]}]}}";
+// 2 菜单/列表（一列全宽按钮）
+constexpr const char* kCard2 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"SELECT\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"选择操作\"},"
+    "{\"type\":\"spacer\",\"h\":4},"
+    "{\"type\":\"button\",\"text\":\"新建对话\",\"on_click\":[{\"do\":\"report\",\"text\":\"新建对话\"},{\"do\":\"close\"}]},"
+    "{\"type\":\"button\",\"text\":\"导出记录\",\"on_click\":[{\"do\":\"report\",\"text\":\"导出记录\"},{\"do\":\"close\"}]},"
+    "{\"type\":\"button\",\"text\":\"清空历史\",\"on_click\":[{\"do\":\"report\",\"text\":\"清空历史\"},{\"do\":\"close\"}]},"
+    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"关闭\",\"on_click\":[{\"do\":\"close\"}]}]}}";
+// 3 信息/状态卡（键值行 + spacer 对齐 + 只读 bind + 字符串 bind）
+constexpr const char* kCard3 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STATUS\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"设备状态\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"电量\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.level\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"音量\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.type\"}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"SIGNAL\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\",\"bind\":\"net.rssi\","
+    "\"fmt\":\"%d dBm\"}]}]}}";
+// 4 换行/分配压力（超长正文 + 一排 6 按钮）
+constexpr const char* kCard4 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"换行与分配压力测试\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"这是一段刻意写得很长很长很长的说明文字,"
+    "用来验证固定宽度卡片里长文本会正确折行显示完整,而不是溢出边界或被裁剪,连续无空格的中文"
+    "也应当逐字换行铺满可用宽度。\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"button\",\"text\":\"一\"},{\"type\":\"button\",\"text\":\"二\"},"
+    "{\"type\":\"button\",\"text\":\"三\"},{\"type\":\"button\",\"text\":\"四\"},"
+    "{\"type\":\"button\",\"text\":\"五\"},{\"type\":\"button\",\"text\":\"六\"}]}]}}";
+// 5 对抗/退化（min>max 滑块 / 无文字按钮 / 未知图标→圆点 / 空容器 / 极简）
+constexpr const char* kCard5 =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"退化输入兜底\"},"
+    "{\"type\":\"slider\",\"min\":80,\"max\":20,\"value\":50},"
+    "{\"type\":\"button\"},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wibblewobble\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"未知图标 → 圆点\"}]},"
+    "{\"type\":\"column\",\"children\":[]},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"以上均应安全渲染,不崩不溢出\"}]}}";
+
+constexpr const char* kCards[] = {kCard0, kCard1, kCard2, kCard3, kCard4, kCard5};
+
+// 6 超高卡片（overlay 高度封顶 + 内部滚动的稳定性验证），运行时拼多行。
+std::string BuildTallCard() {
+    static const char* icons[] = {"volume", "sun", "battery", "wifi", "gear", "clock", "info", "music"};
+    std::string s = "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":[";
+    s += "{\"type\":\"label\",\"role\":\"title\",\"text\":\"很高的卡片 / 滚动\"},";
+    const int rows = 20;  // 每行 3 节点 → 20 行 61 节点，压进 64 上限；总高超屏 → 滚动
+    for (int i = 0; i < rows; i++) {
+        char row[200];
+        std::snprintf(row, sizeof(row),
+                      "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"%s\"},"
+                      "{\"type\":\"label\",\"role\":\"value\",\"text\":\"ITEM %02d      OK\"}]}%s",
+                      icons[i % 8], i + 1, i < rows - 1 ? "," : "");
+        s += row;
+    }
+    s += "]}}";
+    return s;
+}
+
+void RenderDemoCard() {
+    const char* idx_env = std::getenv("PI_SIM_CARD_IDX");
+    int idx = idx_env ? std::atoi(idx_env) : 0;
+    std::string tall;
+    const char* spec;
+    const int n_static = static_cast<int>(sizeof(kCards) / sizeof(kCards[0]));
+    if (idx >= 0 && idx < n_static) {
+        spec = kCards[idx];
+    } else {
+        tall = BuildTallCard();  // idx == n_static（=6）→ 超高卡
+        spec = tall.c_str();
+    }
+    cJSON* args = cJSON_Parse(spec);
+    if (!args) {
+        std::fprintf(stderr, "[sim] demo card %d JSON parse failed\n", idx);
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    std::fprintf(stderr, "[sim] demo card %d render: %s (%s)\n", idx, res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
 
 uint32_t TickCb() { return SDL_GetTicks(); }
 
@@ -61,6 +202,8 @@ int EventWatch(void*, SDL_Event* ev) {
                 g_pwr_key_held = true;  // PWR_KEY 按下（按住说话）
             } else if (ev->key.keysym.sym == SDLK_F12) {
                 g_shot_pending = true;
+            } else if (ev->key.keysym.sym == SDLK_F9) {
+                g_demo_pending = true;  // pi_card 演示卡
             } else if (sim_asr_session_active()) {
                 if (ev->key.keysym.sym == SDLK_BACKSPACE) sim_asr_backspace();
             }
@@ -240,9 +383,16 @@ void Pump() {
     static const char* demo_text = std::getenv("PI_SIM_AUTODEMO");
     static const uint32_t shot_ms = EnvMs("PI_SIM_SHOT_MS");
     static const uint32_t exit_ms = EnvMs("PI_SIM_EXIT_MS");
+    static const uint32_t card_ms = EnvMs("PI_SIM_CARD_MS");  // 到点渲染 pi_card 演示卡
     static int demo_phase = 0;
     static bool shot_done = false;
+    static bool card_done = false;
     const uint32_t now = SDL_GetTicks();
+
+    if (card_ms > 0 && !card_done && now > card_ms) {
+        card_done = true;
+        RenderDemoCard();
+    }
 
     PollCmdFile(now);
 
@@ -268,6 +418,7 @@ void Pump() {
         IOExpander::getInstance().simPoll(now);
         lv_unlock();
     }
+    if (g_demo_pending.exchange(false)) RenderDemoCard();  // 校验+入队；drain 下一拍渲染
     if (g_shot_pending.exchange(false)) TakeScreenshot(ShotPath());
     if (shot_ms > 0 && !shot_done && now > shot_ms) {
         shot_done = true;
@@ -292,6 +443,7 @@ int main() {
                  "pi_sim — Metalio Claw pi_screen simulator (LVGL %d.%d SDL2)\n"
                  "  F1 按住   = PWR_KEY 按住说话(按住录音/松开发送; 轻点无反应; 生成中点按打断)\n"
                  "  打字      = 聆听时说话(退格删字)\n"
+                 "  F9        = 渲染 pi_card 演示卡(overlay)\n"
                  "  F12       = 截图 BMP\n"
                  "  鼠标      = 触摸(状态栏下拉 = 快捷面板)\n",
                  LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR);

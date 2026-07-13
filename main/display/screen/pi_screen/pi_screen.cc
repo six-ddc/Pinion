@@ -18,6 +18,7 @@
 #include "IOExpander.hpp"
 #include "lv_markdown/md_inline.h"
 #include "lv_markdown/md_view.h"
+#include "pi_card/pi_card_host.h"
 #include "metalio_hal/audio_pipeline.h"
 #include "metalio_hal/network.h"
 #include "pi_fonts.h"
@@ -1750,6 +1751,25 @@ void ScrollFeedToBottom() {
 }
 
 // ---------------------------------------------------------------------------
+// pi_card 声明式 UI 卡片的消息流接入点（pi_card::SetFeedHooks 注册；LVGL 线程）。
+// 在 feed 末尾建一个全宽透明行给卡片渲染，并把常驻 act_line 钉回最后（同 tool
+// card 的插入惯例）；渲染完滚到底。卡片 root 的 depth0 会自带卡片外观，故这里
+// 的行仅作占位包装、透明。ClearFeed 会连同删除，卡片经 root 的 DELETE 自清理。
+// ---------------------------------------------------------------------------
+lv_obj_t* CardBeginRow() {
+    if (s_feed == nullptr) return nullptr;
+    lv_obj_t* row = lv_obj_create(s_feed);
+    screen_strip_obj_chrome(row);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_move_to_index(s_act_line, lv_obj_get_child_count(s_feed) - 1);
+    return row;
+}
+void CardEndRow() { ScrollFeedToBottom(); }
+
+// ---------------------------------------------------------------------------
 // pi_ai event -> queue -> widget drain (LVGL thread, 80ms; no adapter lock
 // needed here -- see blueprint R8)
 // ---------------------------------------------------------------------------
@@ -1991,9 +2011,28 @@ void DrainQueueTick(lv_timer_t*) {
                 ShowTalkBtn();
                 break;
             }
+            case UI_CARD_RENDER: {
+                // 卡片即将进 feed：先冲刷/收尾当前文本流，卡片后的文本另起新流在
+                // 卡片下方（与 tool card 同款正确视觉顺序）。ZEN 也照常渲染——卡片
+                // 是内容而非过程，用户要的控件不该被隐藏。
+                if (!batched_text.empty()) {
+                    AppendAssistantText(batched_text.c_str());
+                    batched_text.clear();
+                }
+                FinalizeMdView();
+                pi_card::OnRenderEvent(evt.s1, evt.s2, evt.i1, evt.i2);
+                break;
+            }
+            case UI_CARD_UPDATE:
+                pi_card::OnUpdateEvent(evt.s1, evt.s2, evt.s3);
+                break;
+            case UI_CARD_CLOSE:
+                pi_card::OnCloseEvent(evt.s1);
+                break;
         }
         if (evt.s1 != nullptr) free(evt.s1);
         if (evt.s2 != nullptr) free(evt.s2);
+        if (evt.s3 != nullptr) free(evt.s3);
     }
     if (!batched_text.empty()) AppendAssistantText(batched_text.c_str());
     if (stat_dirty) UpdateDockStat();
@@ -2912,6 +2951,7 @@ lv_obj_t* PiScreen::Create() {
         return s_agent_busy ||                                                       // 生成中
                !mhal::audio_pipeline::IsPlaybackIdle() ||                            // TTS 播报中
                pi_quick_panel::IsOpen() || pi_settings::IsOpen() || s_sheet_open ||  // 浮层
+               pi_card::HasOpenOverlay() ||                                          // 卡片浮层
                s_state == ViewState::Listen;                                         // 聆听中
     };
     sl_hooks.on_dim = [](bool dim) { ApplySleepDimVisual(dim); };
@@ -2929,6 +2969,15 @@ lv_obj_t* PiScreen::Create() {
     s_session_start_ms = lv_tick_get();
 
     Go(ViewState::Idle);
+
+    // pi_card 声明式 UI：注册 DataHub 内置路径 + 消息流接入钩子。DataHub 须在
+    // agent 首次跑工具（校验器查 bind 路径）之前就绪；这里在 Create 早于任何
+    // prompt，满足。
+    pi_card::Init();
+    pi_card::FeedHooks card_hooks;
+    card_hooks.begin_row = CardBeginRow;
+    card_hooks.end_row = CardEndRow;
+    pi_card::SetFeedHooks(card_hooks);
 
     s_drain_timer = lv_timer_create(DrainQueueTick, 80, nullptr);
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);

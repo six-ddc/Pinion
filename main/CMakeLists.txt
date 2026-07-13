@@ -9,6 +9,11 @@ set(SOURCES "display/screen/screen_util.cc"
             "display/screen/pi_screen/pi_theme.cc"
             "display/screen/pi_screen/pi_agent_task.c"
             "display/screen/pi_screen/pi_mock_paced.c"
+            "display/screen/pi_screen/pi_card/pi_card_data.cc"
+            "display/screen/pi_screen/pi_card/pi_card_icons.cc"
+            "display/screen/pi_screen/pi_card/pi_card_actions.cc"
+            "display/screen/pi_screen/pi_card/pi_card_render.cc"
+            "display/screen/pi_screen/pi_card/pi_card_host.cc"
             "display/font/font_pi_mono_14.c"
             "display/font/font_pi_mono_17.c"
             "display/font/font_pi_mono_20.c"
@@ -18,7 +23,8 @@ set(SOURCES "display/screen/screen_util.cc"
             "sys_info.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/font" "display/screen" "display/screen/pi_screen")
+set(INCLUDE_DIRS "." "display" "display/font" "display/screen" "display/screen/pi_screen"
+                 "display/screen/pi_screen/pi_card")
 
 idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
