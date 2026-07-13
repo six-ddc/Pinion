@@ -143,9 +143,21 @@ constexpr const char* kCard5 =
     "{\"type\":\"column\",\"children\":[]},"
     "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"以上均应安全渲染,不崩不溢出\"}]}}";
 
-constexpr const char* kCards[] = {kCard0, kCard1, kCard2, kCard3, kCard4, kCard5};
+// 6 对抗/崩溃根因：数值路径 label 误用 %s。真机(newlib-nano)上 lv_label_bind_text 立即
+// 回调 → clib vsnprintf 把 net.rssi(断网=0) 当指针 strlen((char*)0) → Load access fault
+// （即 docs 记录的那次渲染崩溃）。修复后 Validate 在工具期直接拒绝整卡：pi_card_tool_render
+// 返回 (ERROR)，绝不进入渲染。注：本 sim 用 macOS libc，对 %s 套整数比 newlib 宽容、不复现
+// 该崩溃，故此卡在 sim 里只核验「修复=Validate 同步拒绝」这一层（真机崩溃已由 panic 日志确证）。
+constexpr const char* kCardBadFmt =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"畸形 fmt 对抗\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.rssi\",\"fmt\":\"%s\"},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"数值路径误用 %s: 应被拒绝而非崩溃\"}]}}";
 
-// 6 超高卡片（overlay 高度封顶 + 内部滚动的稳定性验证），运行时拼多行。
+constexpr const char* kCards[] = {kCard0, kCard1, kCard2,      kCard3,
+                                  kCard4, kCard5, kCardBadFmt};
+
+// 7 超高卡片（overlay 高度封顶 + 内部滚动的稳定性验证），运行时拼多行。
 std::string BuildTallCard() {
     static const char* icons[] = {"volume", "sun", "battery", "wifi", "gear", "clock", "info", "music"};
     std::string s = "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":[";

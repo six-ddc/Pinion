@@ -65,6 +65,51 @@ bool ParseHex(const char* s, lv_color_t& out) {
     return true;
 }
 
+// LLM 下发的 label fmt 会原样喂给 newlib vsnprintf（本固件 CONFIG_LV_USE_CLIB_SPRINTF=y），
+// 且绑定 label 只带 1 个变参：数值(Int/Bool)路径传 int、字符串(String)路径传 char*。故合法
+// fmt 必须：至多 1 个转换占位符、其类型与路径匹配（数值→d/i/u/o/x/X/c，字符串→s）、禁 %n
+// （写内存原语）、禁 * 动态宽度（会多吃一个不存在的变参）。否则 "%s" 套在 int 上就是
+// strlen((char*)value)，值为 0（如断网时 net.rssi）时读地址 0 崩溃——正是本次渲染崩溃的根因。
+// %% 字面量不计数。校验器与渲染器共用此判定，保证「校验过 → 一定能安全格式化」。
+bool FmtSafeForType(const char* fmt, HubType t, std::string& err) {
+    if (!fmt) return true;  // 无 fmt：字符串直显、数值用默认 %d，均安全
+    int conv = 0;
+    for (const char* p = fmt; *p; ++p) {
+        if (*p != '%') continue;
+        ++p;
+        if (*p == '%') continue;  // 字面 %%
+        // 跳过 flags / 宽度 / 精度 / 长度修饰，停在转换符
+        while (*p && std::strchr("-+ #0123456789.lhLzjt", *p)) ++p;
+        if (*p == '*') {
+            err = "fmt 不支持 * 动态宽度";
+            return false;
+        }
+        const char c = *p;
+        if (c == '\0') {
+            err = "fmt 转换占位符不完整";
+            return false;
+        }
+        if (c == 'n') {
+            err = "fmt 禁止使用 %n";
+            return false;
+        }
+        if (++conv > 1) {
+            err = "fmt 最多只能有一个占位符";
+            return false;
+        }
+        if (t == HubType::String) {
+            if (c != 's') {
+                err = std::string("字符串绑定的 fmt 只能用 %s（收到 %") + c + "）";
+                return false;
+            }
+        } else if (std::strchr("diouxXc", c) == nullptr) {  // Int / Bool
+            err = std::string("数值绑定的 fmt 需用 %d/%x 等，不能用 %") + c + "（如 %s 会崩溃）";
+            return false;
+        }
+    }
+    return true;
+}
+
 // 中文正文用 puhui（按字号），数值/等宽用 pi_mono。
 const lv_font_t* FontFor(int size, bool mono) {
     if (mono) return size >= 20 ? &font_pi_mono_20 : (size >= 17 ? &font_pi_mono_17 : &font_pi_mono_14);
@@ -315,6 +360,13 @@ void ApplyBind(lv_obj_t* obj, const char* type, const char* path, const cJSON* n
         HubType t = HubType::Int;
         hub.TypeOf(path, t);
         const char* fmt = GetStr(node, "fmt", t == HubType::String ? nullptr : "%d");
+        // 兜底网：畸形 fmt 本应被 Validate 挡在工具期，但校验器/渲染器万一不同构时，这里
+        // 回落安全默认，绝不让 %s 套 int 之类崩到 newlib vsnprintf 里（见 FmtSafeForType）。
+        std::string ferr;
+        if (fmt && !FmtSafeForType(fmt, t, ferr)) {
+            ESP_LOGW(TAG, "unsafe label fmt '%s' dropped: %s", fmt, ferr.c_str());
+            fmt = (t == HubType::String) ? nullptr : "%d";
+        }
         // lv_label_bind_text 存的是 fmt 指针（不拷贝），而 fmt 指向即将被 host 的
         // cJSON_Delete 释放的节点树。intern 进 card 的字符串池（地址稳定、随卡片存活）
         // 再绑定，否则后续每次刷新都在读已释放内存 → label 格式化成乱码。
@@ -438,6 +490,13 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         return nullptr;
     }
 
+    // OOM 兜底：当前 LVGL 配置下 lv_*_create 分配失败会先 while(1) 卡死、极少真返回
+    // null，此为廉价的前向防护——失败经既有通路向上冒泡 → host 删 root 整卡回滚。
+    if (!obj) {
+        err = std::string("widget create failed: ") + type;
+        return nullptr;
+    }
+
     ApplyDefaultStyle(obj, type, depth);
     // label/button/icon 的字体与颜色已在各自分支处理。
     ApplyCommonProps(obj, type, node, card);
@@ -541,6 +600,15 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
         if (!DataHub::Instance().Has(path)) {
             err = std::string("unknown bind path: ") + path;
             return false;
+        }
+        // label 的 fmt 必须与绑定值类型相容，否则渲染时 newlib vsnprintf 会解引用坏指针崩溃
+        // （见 FmtSafeForType）。首道也是主道防线：同步把错误回给 LLM 重试。
+        if (std::strcmp(type, "label") == 0) {
+            if (const char* fmt = GetStr(node, "fmt")) {
+                HubType t = HubType::Int;
+                DataHub::Instance().TypeOf(path, t);
+                if (!FmtSafeForType(fmt, t, err)) return false;
+            }
         }
     }
     // 事件动作合法性

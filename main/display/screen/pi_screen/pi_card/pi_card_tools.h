@@ -47,7 +47,9 @@ char *pi_card_tool_close(const cJSON *args, bool *is_error);
     " display.brightness(5-100), display.sleep_s(screen-off seconds, 0=never) via slider; "            \
     "ui.theme(0=dark/1=light), speech.tts(0/1 read-aloud) via switch. READ-ONLY: battery.level, "      \
     "battery.charging, net.type, net.rssi, net.ssid, net.connected. "                                  \
-    "A label with bind shows the live value (fmt like \"%d%%\"; use mono:true for numbers). Events " \
+    "A label with bind shows the live value — fmt MUST match the bound type and hold ONE "           \
+    "placeholder: numbers use \"%d%%\"/\"%d dBm\", strings use \"%s\" (a %s on a number path is "     \
+    "rejected); use mono:true for numbers. Events "                                                   \
     "are action arrays: {do:'close'} | {do:'set',path,value?} | {do:'report',text:'..{v}..'} "       \
     "({v}=this widget's value; report tells you what the user chose — put it on buttons/switches, "  \
     "NOT on hardware-bound sliders). Icon names: volume|mute|sun|battery|charging|wifi|cellular|"    \
