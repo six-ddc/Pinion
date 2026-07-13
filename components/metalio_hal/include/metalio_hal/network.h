@@ -64,8 +64,28 @@ std::string GetIpAddress();
 // —— Wi-Fi 配网 ——
 // 追加一组凭据到 NVS "wifi"（SsidManager），下次 Start 即可用。
 void AddWifiCredential(const std::string& ssid, const std::string& password);
-// 起 softAP + 网页配网（阻塞不返回；用户提交凭据后设备重启）。
+// 起 softAP + 网页配网。非阻塞：起完 AP 即返回，热点由 AP 自身的
+// http/dns/wifi 任务维持存活。若 station 已起（已联网/已初始化），
+// 会先 WifiStation::Stop() 干净拆掉再起 AP，避免 esp_wifi_init 状态冲突。
+// 用户提交凭据成功后 esp-wifi-connect 自行保存并 esp_restart（不返回）；
+// 用户中途离开配网页则调 StopConfigPortal() 收尾。可反复 Start/Stop。
 void StartConfigPortal();
+// 停 softAP + 网页配网（幂等，未起时 no-op）。若存在已存 WiFi 凭据，会
+// 后台起一个任务恢复 station 联网（xTaskCreate，不阻塞调用线程）；无
+// 凭据则保持 wifi 关闭。
+void StopConfigPortal();
+// 配网热点当前是否在跑（Start 未 Stop 之间为 true）。纯读，任意线程可调。
+bool IsConfigPortalActive();
+// 配网中返回热点 SSID（如 "Metalio-A191"），否则返回 ""。纯读，任意线程可调。
+// 用于"重启进配网"后网络页构建时直接取名显示（事件在开机时已发过、页面未开）。
+std::string GetConfigPortalSsid();
+
+// 运行时触发配网的可靠入口：置 NVS wifi/force_ap=1（4G 模式会切回 WiFi）后
+// esp_restart，开机在干净态起 AP。**不返回。** 已联网/已初始化 WiFi 栈时必须
+// 走此路，而非就地 StartConfigPortal —— 后者的 STA→AP 切换在 C5 上会崩溃。
+void RequestConfigPortalReboot();
+// 退出配网、重启回正常联网（force_ap 已在开机清零，普通重启即正常连网）。不返回。
+void RebootToNormal();
 
 // —— 4G 专属（WiFi 模式或 modem 未就绪时返回 ESP_ERR_INVALID_STATE）——
 // 透传 AT 命令（线程安全）。bypass_init_check 见旧 Nt26Board 注释：

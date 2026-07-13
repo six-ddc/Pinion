@@ -24,13 +24,14 @@ cmake --build sim/build -j
 
 | 设备 | 模拟器 |
 |---|---|
-| PWR_KEY 单击 | **F1**（待机→聆听 / 聆听→取消 / chat→聆听或 STOP；息屏时仅唤醒） |
-| PWR_KEY 长按 1.2s | **F2**（快捷面板呼出/收起） |
+| PWR_KEY 按住说话 | **F1 按住**（按住录音 / 松开发送 / 快速轻点无反应；息屏时按下仅唤醒） |
+| PWR_KEY 生成中打断 | 生成中**轻点 F1**（按下即打断） |
 | 状态栏下拉（呼出快捷面板） | 鼠标按住顶部状态栏向下拖 >60px |
 | Chat 右滑回待机（新对话确认 sheet）/ 设置页右滑返回 | 鼠标按住向右拖 >80px |
 | 设置栈（六页 Hub） | 快捷面板「设置」钮进入；主题切换在面板「主题」钮或 设置›显示 |
 | 对着麦克风说话 | 聆听时**直接在窗口里打字**（支持中文输入法、退格） |
-| VAD 静音自动收音 | 停止打字 1 秒自动发送；**回车**立即发送 |
+| 收音发送 | **松开 F1**（真·按住说话，无 VAD 自动收音） |
+| 聆听态波形 | 由合成采集帧驱动真实电平波形（打字时活跃，静默时落回基线） |
 | 触摸 | 鼠标（按住说话、STOP、ZEN/FLOW、TTS 开关、滚动都可用） |
 | TTS 播报 | 控制台打印 `[sim][TTS] …`；`PI_SIM_SAY=1` 时经 macOS `say` 朗读 |
 | NVS（zen_mode/tts_on/ui.theme/ui.sleep_s/bt.last_* 等） | `pi_sim_settings.ini`（`PI_SIM_SETTINGS` 可改路径） |
@@ -44,10 +45,10 @@ cmake --build sim/build -j
 驱动任意交互并截图核对：
 
 ```
-key                 # PWR_KEY 单击
-longkey             # PWR_KEY 长按 1.2s（快捷面板）
+keydown             # PWR_KEY 按下（按住说话开始；配合 keyup）
+keyup               # PWR_KEY 松开（收音发送）；keydown…type…keyup 走完一轮
 type <文本>         # 聆听时"说话"
-enter / backspace   # 立即收音 / 删一个码点
+backspace           # 删一个码点
 click <x> <y>       # 点按（按下 250ms 后自动松开）
 press <x> <y>       # 按下并保持（PTT）
 move <x> <y>        # 按住时移动（手势，如上滑取消）

@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 
 #include "IOExpander.hpp"
+#include "lv_markdown/md_inline.h"
 #include "lv_markdown/md_view.h"
 #include "metalio_hal/audio_pipeline.h"
 #include "metalio_hal/network.h"
@@ -74,6 +75,8 @@ constexpr int32_t kFeedH  = kH - kSbarH - kDockH;   // 552
 // delta）——见下方 "real ASR session engine" 一节；四状态视觉与交互结构不变。
 
 constexpr int32_t kSwipeCancelThreshold = 80;  // up-swipe px to cancel PTT
+// 触屏"按住说话"阈值：按住不足此时长的轻点不进聆听（不再闪一下），与实体键一致。
+constexpr uint32_t kTouchHoldToTalkMs = 240;
 constexpr int32_t kNvsNamespaceMaxTools = 4;   // cached tool cards per turn (ZEN peek)
 
 // ----- per-view state --------------------------------------------------
@@ -122,11 +125,26 @@ int s_net_last_render = -1;
 // listen view widgets
 lv_obj_t* s_wave_row = nullptr;
 lv_obj_t* s_asr_lbl = nullptr;
+// 聆听态"微信式"居中动作浮块：波形正下方的 pill（松开发送 / 上滑取消两态）+
+// 其下一行更小更暗的滑动取消说明。抬到视线中央，不再钉在被手挡住的屏底两角。
+lv_obj_t* s_listen_pill = nullptr;
+lv_obj_t* s_listen_pill_lbl = nullptr;
+lv_obj_t* s_listen_cancel_hint = nullptr;
 lv_obj_t* s_rec_lbl = nullptr;
 lv_timer_t* s_asr_timer = nullptr;  // 70ms：轮询真 ASR 共享态并渲染（AsrTick）
 lv_timer_t* s_rec_timer = nullptr;
 int s_rec_secs = 0;
 std::vector<lv_obj_t*> s_wave_bars;
+lv_timer_t* s_wave_timer = nullptr;  // ~40ms：从真实采集电平渲染对称起伏波形
+
+// 波形环形缓冲：采集任务（on_frame）算每帧电平写入，WaveTick（LVGL 线程）读出
+// 驱动柱高。单写单读，用一把轻量互斥保护（延用 s_asr_mutex 同款 semaphore）。
+constexpr int kWaveBars = 26;                 // 与 BuildListenView 柱数一致
+// 单一"此刻电平"（0..1）：采集任务写、LVGL 线程读。不再存时间序列——所有柱子
+// 由当前电平驱动，波形原地随音量起伏，而不是按时间横向滚动（2026-07 按用户
+// 反馈从环形缓冲改为此刻电平：滚动的录音机观感很怪）。
+float s_wave_level = 0.0f;
+SemaphoreHandle_t s_wave_mutex = nullptr;
 
 // idle/chat sbar model-name labels (filled in from pi_agent_model_name()
 // once the agent is up -- see UpdateModelLabels())
@@ -200,12 +218,30 @@ float s_turn_thinking_secs = 0.0f;
 // PTT gesture tracking
 bool s_ptt_tracking = false;
 int32_t s_ptt_start_y = 0;
-bool s_ptt_via_key = false;  // current Listen was entered via PWR_KEY (no
-                             // physical "release" signal -- see StartListen)
+bool s_ptt_cancel_armed = false;  // 触屏 PTT：已上滑越过阈值、松手即取消（微信式）
+ViewState s_ptt_ret = ViewState::Idle;   // 触屏 PTT 本次按压的返回态（按下时捕获）
+bool s_ptt_listening = false;            // 触屏 PTT：已过按住阈值、StartListen 已触发
+lv_timer_t* s_ptt_hold_timer = nullptr;  // "按住达阈值才进聆听"的一次性计时
+
+// 谁拥有本次聆听（= 谁负责收尾）。触屏与实体键都能进聆听，先按者拥有本次，
+// 后按者的 press/release 变纯 no-op，消除交叉打断与"谁来收尾"的歧义。
+enum class ListenOwner { None, Touch, Key };
+ListenOwner s_listen_owner = ListenOwner::None;
+
+// 实体键"按住说话"护栏（onPress/onLongPress/onRelease 三个 async 分处不同
+// 轮询 tick，靠这两个闩保证语义正确）：
+//   s_key_ignore_until_release —— 本次物理按压整体作废（息屏唤醒/覆盖层打开/
+//     生成中打断三种早退都置位），随后到达的 hold/release async 一律失效。
+//   s_key_finish_pending —— release 的 async 若先于 StartListen 到达（极端调度
+//     下的兜底），标记待收，OnKeyHoldAsync 起聆听后立即消费并发送。
+bool s_key_ignore_until_release = false;
+bool s_key_finish_pending = false;
 
 // ----- P0: 快捷面板 / 新对话确认 sheet / 手势 --------------------------------
 constexpr int32_t kSbarPullThreshold = 60;  // 状态栏下拉呼出快捷面板的位移
-constexpr uint32_t kKeyLongPressMs = 1200;  // PWR_KEY 长按呼出快捷面板
+// PWR_KEY 按住达此时长才进聆听。低于此的快速单击完全无反应（"按住说话"）。
+// 取 260ms：高于 IOExpander 50ms 轮询的 ±50ms 抖动，也避开常见轻点时长。
+constexpr uint32_t kKeyHoldToTalkMs = 260;
 
 // 三个视图各自的状态栏（MakeSbarBase 登记），Create() 末尾统一开 EVENT_BUBBLE，
 // 让 IdBox / mode / TTS 等可点击子件上的按压也能冒泡到 screen 供下拉追踪。
@@ -281,11 +317,6 @@ void StartBreath(lv_obj_t* obj, uint32_t half_period_ms) {
 void StopBreath(lv_obj_t* obj) {
     lv_anim_delete(obj, BreathExecCb);
     lv_obj_set_style_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
-}
-
-void WaveHeightExecCb(void* var, int32_t v) { lv_obj_set_height(static_cast<lv_obj_t*>(var), v); }
-void WaveOpaExecCb(void* var, int32_t v) {
-    lv_obj_set_style_opa(static_cast<lv_obj_t*>(var), static_cast<lv_opa_t>(v), LV_PART_MAIN);
 }
 
 std::string FormatSecs1(float secs) {
@@ -395,7 +426,7 @@ void NewSession();
 void SetZen(bool zen);
 void Go(ViewState s);
 void UpdateDockStat();
-void StartListen(ViewState return_state);
+void StartListen(ViewState return_state, ListenOwner owner);
 void FinishListenSend();
 void RetryLastPrompt();
 void ShowErrorBanner(const char* message);
@@ -532,56 +563,6 @@ void NetTick(lv_timer_t*) {
         RefreshWifiWidgets(dirty);
 }
 
-// CTX gauge: 64x6 track (--bg2) + amber fill, plus the "CTX" label itself
-// (swapped to "CTX --" when the ratio is unknown -- see RenderCtxGauge()).
-// Returns the fill/label obj via out params so callers can update them
-// later.
-lv_obj_t* BuildCtx(lv_obj_t* parent, lv_obj_t** out_fill, lv_obj_t** out_label) {
-    lv_obj_t* box = lv_obj_create(parent);
-    screen_strip_obj_chrome(box);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(box, 8, LV_PART_MAIN);
-
-    lv_obj_t* lbl = lv_label_create(box);
-    lv_label_set_text(lbl, "CTX");
-    SetLabelFont(lbl, &font_pi_mono_17, Tok::Faint);
-    lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
-    *out_label = lbl;
-
-    lv_obj_t* track = lv_obj_create(box);
-    screen_strip_obj_chrome(track);
-    lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(track, 64, 6);
-    lv_obj_set_style_radius(track, 3, LV_PART_MAIN);
-    pi_theme::ApplyBg(track, Tok::Card2);
-    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_clip_corner(track, true, LV_PART_MAIN);
-
-    lv_obj_t* fill = lv_obj_create(track);
-    screen_strip_obj_chrome(fill);
-    lv_obj_remove_flag(fill, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(fill, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(fill, 0, 0);
-    lv_obj_set_size(fill, LV_PCT(100), LV_PCT(100));  // real width set by RenderCtxGauge()
-    pi_theme::ApplyBg(fill, Tok::Accent);
-    lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, LV_PART_MAIN);
-    // Start hidden rather than width=0: a 0-width filled rect is still a
-    // draw op with a degenerate (zero-area) buffer, which on this board's
-    // PPA/cache-sync flush path produced a steady stream of
-    // esp_cache_msync "invalid addr" errors while the screen was up. A
-    // HIDDEN object is skipped by the renderer entirely -- no draw op, no
-    // degenerate buffer. RenderCtxGauge() unhides it once there's a real,
-    // non-zero ratio to show.
-    lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
-    *out_fill = fill;
-    return box;
-}
 
 lv_obj_t* MakeSpacer(lv_obj_t* parent) {
     lv_obj_t* sp = lv_obj_create(parent);
@@ -662,11 +643,9 @@ void BuildIdleView(lv_obj_t* parent) {
     lv_label_set_text(s_idle_model_lbl, "...");  // filled in by UpdateModelLabels() on LOAD
     SetLabelFont(s_idle_model_lbl, &font_pi_mono_20, Tok::Dim);
     MakeSpacer(sbar);
-    lv_obj_t* ctx_fill = nullptr;
-    lv_obj_t* ctx_lbl = nullptr;
-    BuildCtx(sbar, &ctx_fill, &ctx_lbl);
-    s_idle_ctx_fill = ctx_fill;
-    s_idle_ctx_lbl = ctx_lbl;
+    // 待机页同样不放 CTX——它是"本轮对话消耗"，只在聊天页底部坞的一行文本里
+    // 显示（见 UpdateDockStat）。s_idle_ctx_* 保持 null，RenderCtxGauge/SetCtxFill
+    // 均已 null-guard。与聊天页状态栏保持一致的留白。
     BuildWifi(sbar);
 
     lv_obj_t* mid = lv_obj_create(s_idle_view);
@@ -723,8 +702,61 @@ void BuildIdleView(lv_obj_t* parent) {
 }
 
 // ---------------------------------------------------------------------------
-// S1 -- listen view (PTT / fake ASR)
+// S1 -- listen view (PTT + real ASR + real-signal waveform)
 // ---------------------------------------------------------------------------
+
+// —— 波形：真实采集电平驱动 ——
+// 柱高范围（s_wave_row 高 120）与感知映射；增益把语音 RMS（远低于满幅）拉到
+// 可见区间。三者都是现场可调的视觉常量。
+constexpr int32_t kWaveMinH = 8;      // 静默基线高度
+constexpr int32_t kWaveMaxH = 112;    // 满幅高度
+constexpr float kWaveGain = 8.0f;     // RMS→归一化增益
+constexpr float kWaveGamma = 0.6f;    // 感知曲线（<1：小信号更显眼）
+
+// 采集任务上下文：算本帧 RMS、做快起慢落包络、写入环形缓冲。禁阻塞。
+void PushWaveLevel(const int16_t* pcm, size_t n) {
+    if (s_wave_mutex == nullptr || pcm == nullptr || n == 0) return;
+    uint64_t sumsq = 0;
+    for (size_t i = 0; i < n; i++) {
+        int32_t s = pcm[i];
+        sumsq += static_cast<uint64_t>(s * s);
+    }
+    float rms = std::sqrt(static_cast<float>(sumsq) / static_cast<float>(n));  // 0..32767
+    float norm = rms / 32768.0f * kWaveGain;
+    if (norm > 1.0f) norm = 1.0f;
+    // 快起慢落，压抖动（env 属采集任务，单线程安全）。
+    static float env = 0.0f;
+    env = (norm > env) ? (env * 0.4f + norm * 0.6f) : (env * 0.8f + norm * 0.2f);
+    xSemaphoreTake(s_wave_mutex, portMAX_DELAY);
+    s_wave_level = env;
+    xSemaphoreGive(s_wave_mutex);
+}
+
+// LVGL 线程：读"此刻电平"，用固定的"中间高两边低"包络 × 当前电平驱动所有
+// 柱子——原地随音量起伏，不横向滚动。采集已停（收音等 final）时把电平朝 0
+// 衰减，波形自然落回基线。
+void WaveTick(lv_timer_t*) {
+    if (s_wave_bars.empty() || s_wave_mutex == nullptr) return;
+    xSemaphoreTake(s_wave_mutex, portMAX_DELAY);
+    if (!mhal::audio_pipeline::IsCapturing()) s_wave_level *= 0.6f;
+    float level = s_wave_level;
+    xSemaphoreGive(s_wave_mutex);
+    if (level < 0.0f) level = 0.0f;
+
+    const float amp = std::pow(level, kWaveGamma);
+    const float center = (kWaveBars - 1) / 2.0f;
+    for (size_t i = 0; i < s_wave_bars.size() && i < kWaveBars; i++) {
+        float d = std::fabs(static_cast<float>(i) - center) / center;       // 0 中心 .. 1 两端
+        float shape = 1.0f - 0.70f * d;                                     // 中间 1，两端 ~0.30
+        float jitter = 0.80f + static_cast<float>(std::rand() % 40) / 100.0f;  // 0.80..1.19 让它活
+        float a = amp * shape * jitter;
+        if (a > 1.0f) a = 1.0f;
+        int32_t h = kWaveMinH + static_cast<int32_t>(a * (kWaveMaxH - kWaveMinH));
+        lv_obj_set_height(s_wave_bars[i], h);
+        lv_obj_set_style_opa(s_wave_bars[i], static_cast<lv_opa_t>(115 + a * 140), LV_PART_MAIN);
+    }
+}
+
 void UpdateRecTimer(lv_timer_t*) {
     s_rec_secs++;
     if (s_rec_lbl == nullptr) return;
@@ -742,10 +774,6 @@ void UpdateRecTimer(lv_timer_t*) {
 // highlight would be pure overkill). Rendering itself happens in AsrTick
 // (defined with the rest of the real-ASR engine, before StartListen).
 constexpr int kAsrHighlightCodepoints = 6;
-
-// 按键（PWR_KEY）聆听无松手信号，靠 VAD 自动收尾；此为持续噪声/VAD 不回静音
-// 时的最大录音时长兜底（触摸 PTT 有松手信号，不受此限）。
-constexpr int kKeyPttMaxSecs = 30;
 
 void BuildListenView(lv_obj_t* parent) {
     s_listen_view = lv_obj_create(parent);
@@ -788,36 +816,13 @@ void BuildListenView(lv_obj_t* parent) {
     lv_obj_set_flex_align(s_wave_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(s_wave_row, 6, LV_PART_MAIN);
 
-    for (int i = 0; i < 26; i++) {
-        float h = 20.0f + std::round(90.0f * std::fabs(std::sin(i * 0.7f)) *
-                                     (0.4f + 0.6f * std::fabs(std::sin(i * 2.3f))));
-        lv_obj_t* bar = MakeRect(s_wave_row, 8, 12, Tok::Accent);
+    // 柱子只建静态外形；高度/透明度由 WaveTick 从真实采集电平每帧刷新（不再
+    // 用假 sin 无限动画）。初始为静默基线。
+    for (int i = 0; i < kWaveBars; i++) {
+        lv_obj_t* bar = MakeRect(s_wave_row, 8, kWaveMinH, Tok::Accent);
         lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_opa(bar, 115, LV_PART_MAIN);
         s_wave_bars.push_back(bar);
-
-        lv_anim_t ah;
-        lv_anim_init(&ah);
-        lv_anim_set_var(&ah, bar);
-        lv_anim_set_exec_cb(&ah, WaveHeightExecCb);
-        lv_anim_set_values(&ah, 12, static_cast<int32_t>(h));
-        lv_anim_set_duration(&ah, 500);
-        lv_anim_set_reverse_duration(&ah, 500);
-        lv_anim_set_delay(&ah, (i * 67) % 500);
-        lv_anim_set_repeat_count(&ah, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ah, lv_anim_path_ease_in_out);
-        lv_anim_start(&ah);
-
-        lv_anim_t ao;
-        lv_anim_init(&ao);
-        lv_anim_set_var(&ao, bar);
-        lv_anim_set_exec_cb(&ao, WaveOpaExecCb);
-        lv_anim_set_values(&ao, 115, 255);
-        lv_anim_set_duration(&ao, 500);
-        lv_anim_set_reverse_duration(&ao, 500);
-        lv_anim_set_delay(&ao, (i * 67) % 500);
-        lv_anim_set_repeat_count(&ao, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ao, lv_anim_path_ease_in_out);
-        lv_anim_start(&ao);
     }
 
     s_asr_lbl = lv_label_create(mid);
@@ -829,27 +834,50 @@ void BuildListenView(lv_obj_t* parent) {
     SetLabelFont(s_asr_lbl, &font_puhui_30_4, Tok::Tx);
     lv_obj_set_style_text_line_space(s_asr_lbl, 8, LV_PART_MAIN);
 
-    lv_obj_t* hint = lv_obj_create(s_listen_view);
-    screen_strip_obj_chrome(hint);
-    lv_obj_remove_flag(hint, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(hint, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(hint, kW, kHintH);
-    lv_obj_set_pos(hint, 0, kSbarH + kMidH);
-    lv_obj_set_style_bg_opa(hint, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_t* hrule = MakeRect(s_listen_view, kW, 1, Tok::Line);
-    lv_obj_set_pos(hrule, 0, kSbarH + kMidH);
-    lv_obj_set_style_pad_left(hint, 44, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(hint, 44, LV_PART_MAIN);
-    lv_obj_set_flex_flow(hint, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(hint, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
+    // 微信式动作浮块：跟波形/ASR 同在中部 mid 列里居中，抬进视线中央——不再把
+    // "松开发送/上滑取消"钉在屏底被手挡住的两角。pill 默认 amber，上滑越阈值
+    // 由 SetListenCancelState 整体转红成"取消"态。
+    s_listen_pill = lv_obj_create(mid);
+    screen_strip_obj_chrome(s_listen_pill);
+    lv_obj_remove_flag(s_listen_pill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_listen_pill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_listen_pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(s_listen_pill, 24, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_listen_pill, 1, LV_PART_MAIN);
+    pi_theme::ApplyBorder(s_listen_pill, Tok::AccentDim);
+    pi_theme::ApplyBg(s_listen_pill, Tok::Card);
+    lv_obj_set_style_bg_opa(s_listen_pill, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(s_listen_pill, 30, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(s_listen_pill, 14, LV_PART_MAIN);
+    s_listen_pill_lbl = lv_label_create(s_listen_pill);
+    lv_label_set_text(s_listen_pill_lbl, "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81");  // "松开发送"
+    SetLabelFont(s_listen_pill_lbl, &font_puhui_24_4, Tok::Accent);
+    lv_obj_set_style_text_letter_space(s_listen_pill_lbl, 2, LV_PART_MAIN);
 
-    lv_obj_t* cancel_lbl = lv_label_create(hint);
-    lv_label_set_text(cancel_lbl, "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\x96\xe6\xb6\x88");  // "^ 上滑取消"
-    SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Faint);
-    lv_obj_t* go_lbl = lv_label_create(hint);
-    lv_label_set_text(go_lbl, "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81 ->");  // "松开发送 ->"
-    SetLabelFont(go_lbl, &font_puhui_24_4, Tok::Accent);
+    s_listen_cancel_hint = lv_label_create(mid);
+    lv_label_set_text(s_listen_cancel_hint,
+                      "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\xaf\xe5\x8f\x96\xe6\xb6\x88");  // "^ 上滑可取消"
+    SetLabelFont(s_listen_cancel_hint, &font_puhui_20_4, Tok::Faint);
+}
+
+// 松开发送 <-> 上滑取消 两态切换：pill 边框/文案在 amber 与 err 间翻转，下方
+// 说明行同步。物理键聆听（无手指在屏）永远停在"松开发送"态。
+void SetListenCancelState(bool armed) {
+    if (s_listen_pill == nullptr) return;
+    pi_theme::ApplyBorder(s_listen_pill, armed ? Tok::Err : Tok::AccentDim);
+    if (s_listen_pill_lbl != nullptr) {
+        lv_label_set_text(s_listen_pill_lbl,
+                          armed ? "\xe6\x9d\xbe\xe5\xbc\x80\xe6\x89\x8b\xe6\x8c\x87\xef\xbc\x8c\xe5\x8f\x96\xe6\xb6\x88"   // "松开手指，取消"
+                                : "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81");                                     // "松开发送"
+        SetLabelFont(s_listen_pill_lbl, &font_puhui_24_4, armed ? Tok::Err : Tok::Accent);
+        lv_obj_set_style_text_letter_space(s_listen_pill_lbl, 2, LV_PART_MAIN);
+    }
+    if (s_listen_cancel_hint != nullptr) {
+        lv_label_set_text(s_listen_cancel_hint,
+                          armed ? "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x96\xe6\xb6\x88 \xc2\xb7 \xe7\xa7\xbb\xe5\x9b\x9e\xe7\xbb\xa7\xe7\xbb\xad"  // "松开取消 · 移回继续"
+                                : "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\xaf\xe5\x8f\x96\xe6\xb6\x88");                                          // "^ 上滑可取消"
+        SetLabelFont(s_listen_cancel_hint, &font_puhui_20_4, armed ? Tok::Err : Tok::Faint);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -908,12 +936,9 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_label_set_text(s_chat_model_lbl, "...");  // filled in by UpdateModelLabels() on LOAD
     SetLabelFont(s_chat_model_lbl, &font_pi_mono_20, Tok::Dim);
     MakeSpacer(sbar);
-    lv_obj_t* ctx_fill = nullptr;
-    lv_obj_t* ctx_lbl = nullptr;
-    BuildCtx(sbar, &ctx_fill, &ctx_lbl);
-    s_chat_ctx_fill = ctx_fill;
-    s_chat_ctx_lbl = ctx_lbl;
-
+    // CTX 不再占状态栏——它是"本轮消耗"数据，和底部坞的 IN/OUT token 同族，
+    // 统一挪到 dock 的一行文本里（见 UpdateDockStat）。s_chat_ctx_* 保持 null，
+    // RenderCtxGauge/SetCtxFill 均已 null-guard。状态栏腾出的位置刻意留白。
     lv_obj_t* mode_btn = lv_obj_create(sbar);
     screen_strip_obj_chrome(mode_btn);
     lv_obj_remove_flag(mode_btn, LV_OBJ_FLAG_SCROLLABLE);
@@ -987,6 +1012,10 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
 // ---------------------------------------------------------------------------
 // feed rows
 // ---------------------------------------------------------------------------
+// 用户消息：靠右的静默卡片（Tok::Card 底 + 1px Tok::Line2 边 + 圆角），与
+// AI 全宽靠左的 markdown 形成"左右分区 + 有框/无框"的强区分。卡片内容自适应
+// 宽度、超过约 74% 视口宽才换行；短句不顶满。原来的内联"YOU"标签取消，顺带
+// 消掉了它与中文正文基线不齐的老问题。
 void AppendUserRow(const std::string& text) {
     lv_obj_t* row = lv_obj_create(s_feed);
     screen_strip_obj_chrome(row);
@@ -996,19 +1025,30 @@ void AppendUserRow(const std::string& text) {
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
+    // 主轴靠右：卡片贴右边缘，代表"从右侧发出"。
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    lv_obj_t* who = lv_label_create(row);
-    lv_label_set_text(who, "YOU");
-    SetLabelFont(who, &font_pi_mono_17, Tok::Accent);
-    lv_obj_set_style_text_letter_space(who, 2, LV_PART_MAIN);
+    lv_obj_t* card = lv_obj_create(row);
+    screen_strip_obj_chrome(card);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_width(card, LV_SIZE_CONTENT);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(card, (kW - 32 * 2) * 74 / 100, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 14, LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    pi_theme::ApplyBorder(card, Tok::Line2);
+    pi_theme::ApplyBg(card, Tok::Card);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(card, 22, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(card, 14, LV_PART_MAIN);
 
-    lv_obj_t* t = lv_label_create(row);
+    lv_obj_t* t = lv_label_create(card);
     lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
-    lv_obj_set_flex_grow(t, 1);
+    lv_obj_set_width(t, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(t, (kW - 32 * 2) * 74 / 100 - 44, LV_PART_MAIN);
     lv_label_set_text(t, text.c_str());
-    SetLabelFont(t, &font_puhui_30_4, Tok::Dim);
+    SetLabelFont(t, &font_puhui_30_4, Tok::Tx);
 }
 
 // Thin red-line error banner in the chat feed (design: 红色细线横幅) --
@@ -1271,7 +1311,7 @@ void OnPeekClicked(lv_event_t*) {
 // ---------------------------------------------------------------------------
 // dock: token/ttfb stats + STOP (busy) / TALK (idle-in-chat) action
 // ---------------------------------------------------------------------------
-void StartListen(ViewState return_state);
+void StartListen(ViewState return_state, ListenOwner owner);
 void CancelListen();
 void FinishListenSend();
 
@@ -1281,14 +1321,32 @@ void FinishListenSend();
 // Chat); hiding a pressed object (never deleting it) keeps LVGL delivering
 // PRESSING/RELEASED to the same target, so this works unchanged even though
 // StartListen() swaps which view is visible mid-gesture.
+void PttCancelHoldTimer() {
+    if (s_ptt_hold_timer != nullptr) { lv_timer_delete(s_ptt_hold_timer); s_ptt_hold_timer = nullptr; }
+}
+
+// 触屏按住达阈值：此刻才真正进聆听（此前只是 arm，快速轻点不会闪进）。
+void PttHoldFire(lv_timer_t*) {
+    s_ptt_hold_timer = nullptr;  // 一次性 timer：触发后 LVGL 自删，仅清指针
+    if (!s_ptt_tracking) return;  // 已松开/取消
+    StartListen(s_ptt_ret, ListenOwner::Touch);
+    s_ptt_listening = true;
+}
+
 void OnPttPressed(lv_event_t* e) {
-    ViewState ret = static_cast<ViewState>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e)));
-    s_ptt_tracking = true;
+    // 实体键已在聆听（owner=Key）时，触屏按压不抢占，避免交叉打断。
+    if (s_state == ViewState::Listen) return;
+    s_ptt_ret = static_cast<ViewState>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e)));
     lv_indev_t* indev = lv_event_get_indev(e);
     lv_point_t p;
     lv_indev_get_point(indev, &p);
     s_ptt_start_y = p.y;
-    StartListen(ret);
+    s_ptt_tracking = true;
+    s_ptt_listening = false;
+    // 不立即进聆听：按住达 kTouchHoldToTalkMs 才由 PttHoldFire 进（轻点无反应）。
+    PttCancelHoldTimer();
+    s_ptt_hold_timer = lv_timer_create(PttHoldFire, kTouchHoldToTalkMs, nullptr);
+    lv_timer_set_repeat_count(s_ptt_hold_timer, 1);
 }
 
 void OnPttPressing(lv_event_t* e) {
@@ -1297,10 +1355,22 @@ void OnPttPressing(lv_event_t* e) {
     lv_point_t p;
     lv_indev_get_point(indev, &p);
     int32_t dy = p.y - s_ptt_start_y;
-    if (dy < -kSwipeCancelThreshold) {
-        s_ptt_tracking = false;
-        lv_indev_wait_release(indev);
-        CancelListen();
+    bool up = dy < -kSwipeCancelThreshold;
+    if (!s_ptt_listening) {
+        // 还没真正进聆听（按住不足阈值时长）：上滑直接撤销待起的聆听。
+        if (up) {
+            s_ptt_tracking = false;
+            lv_indev_wait_release(indev);
+            PttCancelHoldTimer();
+        }
+        return;
+    }
+    // 已在录音：微信式"预备取消"——上滑越阈值只是 arm（pill 转红提示），松手
+    // 才真正取消；手指移回阈值内则 disarm，回到"松开发送"。不再一越阈值就立刻
+    // 取消，给用户反悔的机会。
+    if (up != s_ptt_cancel_armed) {
+        s_ptt_cancel_armed = up;
+        SetListenCancelState(up);
     }
 }
 
@@ -1308,7 +1378,18 @@ void OnPttReleased(lv_event_t* e) {
     (void)e;
     if (!s_ptt_tracking) return;
     s_ptt_tracking = false;
-    FinishListenSend();
+    if (!s_ptt_listening) {   // 未过阈值：快速轻点 → 无反应
+        PttCancelHoldTimer();
+        return;
+    }
+    s_ptt_listening = false;
+    if (s_listen_owner == ListenOwner::Touch) {
+        if (s_ptt_cancel_armed)
+            CancelListen();      // 上滑预备取消态松手：丢弃
+        else
+            FinishListenSend();  // 常规松手：发送
+    }
+    s_ptt_cancel_armed = false;
 }
 
 void BuildDock(lv_obj_t* parent) {
@@ -1503,6 +1584,97 @@ void EnsureMdView() {
         LV_EVENT_DELETE, s_cur_md);
 }
 
+// ---------------------------------------------------------------------------
+// TTS 朗读文本提取：把流式 markdown 剥成"渲染后纯文本"再按句喂 TTS，使朗读内容
+// == 屏幕显示内容，并根治 ** / # / URL 被读出来。复用渲染 UI 那套解析器
+//（lvmd::StreamParser + lvmd::ParseInline），与显示各持一份、喂同样的 delta、
+// 输出一致。会阻塞的 volc_tts 调用都在 pi_agent_task 的 pump 任务上，这里全非阻塞。
+// ---------------------------------------------------------------------------
+lvmd::StreamParser s_tts_parser;
+std::string s_tts_closed;  // 已闭合块的纯文本（每块后加 '\n' 作软边界），append-only
+size_t s_tts_fed = 0;      // 已喂 TTS 的字节游标（相对 full = s_tts_closed + open block）
+
+// 一个块的朗读纯文本（块级前缀已被 StreamParser 剥掉；行内符号由 ParseInline 剥）。
+// 代码块/分割线/表格行不朗读，返回空串。
+std::string TtsBlockPlain(const lvmd::Block& b) {
+    if (b.type == lvmd::BlockType::kFence || b.type == lvmd::BlockType::kRule ||
+        b.type == lvmd::BlockType::kTableRow) {
+        return std::string();
+    }
+    std::string out;
+    std::string_view t = b.text;
+    size_t start = 0;
+    for (;;) {
+        size_t nl = t.find('\n', start);
+        std::string_view line =
+            (nl == std::string_view::npos) ? t.substr(start) : t.substr(start, nl - start);
+        for (const lvmd::Span& sp : lvmd::ParseInline(line)) out += sp.text;
+        if (nl == std::string_view::npos) break;
+        out += '\n';
+        start = nl + 1;
+    }
+    return out;
+}
+
+// full[from:] 里最后一个句/子句边界之后的字节位置（找不到则返回 from）。边界含中英文
+// 句末标点、分号、换行，以及逗号（逗号作软停顿，降低首句发声延迟）。只喂到边界前的
+// 完整片段，绝不喂尾部——避免把还没闭合的行内标记（如半个 **）当字面读出来。
+size_t TtsLastBoundary(const std::string& full, size_t from) {
+    static const char* const kEnders[] = {"\xe3\x80\x82" /*。*/, "\xef\xbc\x81" /*！*/,
+                                          "\xef\xbc\x9f" /*？*/, "\xef\xbc\x9b" /*；*/,
+                                          "\xef\xbc\x8c" /*，*/, "\xe3\x80\x81" /*、*/,
+                                          "\n", ".", "!", "?", ";", ","};
+    size_t best = from;
+    for (const char* e : kEnders) {
+        size_t pos = full.rfind(e);
+        if (pos == std::string::npos || pos < from) continue;
+        size_t after = pos + std::strlen(e);
+        if (after > best) best = after;
+    }
+    return best;
+}
+
+void TtsExtractReset() {
+    s_tts_parser = lvmd::StreamParser{};
+    s_tts_closed.clear();
+    s_tts_fed = 0;
+}
+
+// 消费已闭合块的纯文本累积到 s_tts_closed（各块后加 '\n' 软边界，使标题/段落各自成句）。
+void TtsDrainClosed(std::vector<lvmd::Block>&& blocks) {
+    for (const lvmd::Block& b : blocks) {
+        std::string p = TtsBlockPlain(b);
+        if (!p.empty()) {
+            s_tts_closed += p;
+            s_tts_closed += '\n';
+        }
+    }
+}
+
+// 喂一段原始 markdown delta：更新解析器，把新形成的完整句喂给 TTS pump。
+void TtsExtractFeed(const char* delta) {
+    if (delta == nullptr || delta[0] == '\0') return;
+    s_tts_parser.Feed(delta);
+    TtsDrainClosed(s_tts_parser.TakeClosed());
+    const lvmd::Block* open = s_tts_parser.Open();
+    std::string full = s_tts_closed;
+    if (open != nullptr) full += TtsBlockPlain(*open);
+    size_t b = TtsLastBoundary(full, s_tts_fed);
+    if (b > s_tts_fed) {
+        pi_agent_task_tts_feed(full.substr(s_tts_fed, b - s_tts_fed).c_str());
+        s_tts_fed = b;
+    }
+}
+
+// 回复结束：强制收尾解析器，把尾部残余（无终止符的最后一句）冲刷出去。
+void TtsExtractFlush() {
+    TtsDrainClosed(s_tts_parser.Finish());
+    if (s_tts_closed.size() > s_tts_fed) {
+        pi_agent_task_tts_feed(s_tts_closed.substr(s_tts_fed).c_str());
+        s_tts_fed = s_tts_closed.size();
+    }
+}
+
 void AppendAssistantText(const char* delta) {
     EnsureMdView();
     s_cur_md->Append(delta);
@@ -1598,25 +1770,27 @@ void ToolRunningTimerTick(lv_timer_t*) {
     lv_label_set_text(s_cur_tool_ret_lbl, buf);
 }
 
-// "^"/"v" stand in for "↑"/"↓" (not in the mono font's ASCII+·°-only
-// subset). ^ only ever shows a real number once DONE has reported real
-// usage.input at least once this turn; before that (and forever, if the
-// bridge never sends it) it shows "--" rather than a fabricated count.
+// 单行消耗簇：IN 输入 token · OUT 输出 token · CTX 上下文占用率。IN 在 DONE
+// 首次上报真实 usage.input 前显示 "--"（不编造）；CTX 在拿到真实占用率前显示
+// "--"。ttfb（首字延迟）是开发指标、对使用无意义，已按用户反馈去掉；CTX 也不
+// 再画进度条，跟 IN/OUT 一样只写数字/百分比（原 "^"/"v" 亦改为直白的 IN/OUT）。
 void UpdateDockStat() {
     if (s_dock_stat_lbl == nullptr) return;
     char stat[80];
-    char in_part[24];
+    char in_part[16];
+    char ctx_part[16];
     if (s_in_tokens_known) {
-        std::snprintf(in_part, sizeof(in_part), "%d tok", s_in_tokens);
+        std::snprintf(in_part, sizeof(in_part), "%d", s_in_tokens);
     } else {
-        std::snprintf(in_part, sizeof(in_part), "-- tok");
+        std::snprintf(in_part, sizeof(in_part), "--");
     }
-    if (s_ttfb_ms >= 0) {
-        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %d tok\nttfb %dms", in_part,
-                      s_out_tokens, static_cast<int>(s_ttfb_ms));
+    if (s_ctx_known && pi_agent_context_window() > 0) {
+        std::snprintf(ctx_part, sizeof(ctx_part), "%d%%", s_ctx_pct);
     } else {
-        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %d tok", in_part, s_out_tokens);
+        std::snprintf(ctx_part, sizeof(ctx_part), "--");
     }
+    std::snprintf(stat, sizeof(stat), "IN %s \xc2\xb7 OUT %d tok \xc2\xb7 CTX %s", in_part,
+                  s_out_tokens, ctx_part);
     lv_label_set_text(s_dock_stat_lbl, stat);
 }
 
@@ -1633,6 +1807,8 @@ void DrainQueueTick(lv_timer_t*) {
             case UI_AGENT_START:
                 s_agent_busy = true;
                 ShowStopBtn();
+                TtsExtractReset();             // 新回复：重置朗读文本提取器
+                pi_agent_task_tts_run_start();  // 开启本 run 的 TTS 缓冲
                 break;
             case UI_THINKING_START:
                 // A card is about to enter the feed: flush pending text into
@@ -1739,7 +1915,11 @@ void DrainQueueTick(lv_timer_t*) {
             }
             case UI_TEXT_DELTA:
                 if (s_ttfb_ms < 0) s_ttfb_ms = static_cast<int32_t>(lv_tick_get() - s_turn_start_ms);
-                if (evt.s1 != nullptr) batched_text += evt.s1;
+                if (evt.s1 != nullptr) {
+                    batched_text += evt.s1;
+                    // 显示不变；另外把 delta 剥成纯文本后按句喂 TTS（仅开 TTS 时）。
+                    if (pi_agent_tts_enabled()) TtsExtractFeed(evt.s1);
+                }
                 // Streaming approximation (per-turn i2 from TEXT_DELTA); DONE
                 // corrects both ^ and v to the real pi_usage_t values. The
                 // dock label itself is refreshed once per tick, after the
@@ -1753,6 +1933,8 @@ void DrainQueueTick(lv_timer_t*) {
                     batched_text.clear();
                 }
                 FinalizeMdView();
+                TtsExtractFlush();            // 冲刷尾句
+                pi_agent_task_tts_run_end();  // pump 排空后 speak_end，余音继续播完
                 s_agent_busy = false;
                 ShowTalkBtn();
                 s_zen_turn_done = true;
@@ -1804,6 +1986,7 @@ void DrainQueueTick(lv_timer_t*) {
                     batched_text.clear();
                 }
                 FinalizeMdView();
+                pi_agent_task_tts_cancel();  // 出错即作废本 run 朗读并停播
                 s_agent_busy = false;
                 ShowTalkBtn();
                 break;
@@ -1834,6 +2017,8 @@ void Go(ViewState s) {
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
             break;
         case ViewState::Listen:
+            s_ptt_cancel_armed = false;
+            SetListenCancelState(false);  // 每次进聆听都从"松开发送"态起
             lv_obj_remove_flag(s_listen_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
             break;
@@ -1927,7 +2112,6 @@ std::string s_asr_error_text;  // guarded by s_asr_mutex
 volatile bool s_asr_final_ready = false;
 volatile bool s_asr_failed = false;
 bool s_asr_waiting_final = false;  // LVGL 线程：已松开，等服务端 final
-bool s_key_heard_speech = false;   // key 进入的聆听：VAD 自动收音的触发臂
 std::string s_asr_rendered;        // 上次渲染的文本（LVGL 线程，去重用）
 
 void AsrLock() { xSemaphoreTake(s_asr_mutex, portMAX_DELAY); }
@@ -1973,7 +2157,9 @@ void VoiceTask(void*) {
         switch (cmd) {
             case VoiceCmd::Start: {
                 if (active) break;
-                volc_tts_stop();  // barge-in：用户开口即打断在播 TTS
+                // barge-in：用户开口即打断在播 TTS。必须走 pi_agent_task_tts_cancel
+                // 而非裸 volc_tts_stop——后者不会作废 TTS pump 缓冲里未播的旧文本。
+                pi_agent_task_tts_cancel();
                 volc_asr_callbacks_t cbs = {};
                 cbs.on_delta = OnAsrDelta;
                 cbs.on_final = OnAsrFinal;
@@ -1984,6 +2170,7 @@ void VoiceTask(void*) {
                     mhal::audio_pipeline::CaptureCallbacks ccb;
                     ccb.on_frame = [](const int16_t* pcm, size_t n) {
                         volc_asr_feed(pcm, n);
+                        PushWaveLevel(pcm, n);  // 顺带算电平驱动真实波形
                     };
                     if (!mhal::audio_pipeline::StartCapture(cfg, ccb)) {
                         volc_asr_abort();
@@ -2022,6 +2209,7 @@ void VoiceTask(void*) {
 void EnsureVoiceInfra() {
     if (s_voice_q != nullptr) return;
     s_asr_mutex = xSemaphoreCreateMutex();
+    s_wave_mutex = xSemaphoreCreateMutex();
     s_voice_q = xQueueCreate(8, sizeof(VoiceCmd));
     xTaskCreate(VoiceTask, "pi_voice", 6144, nullptr, 5, nullptr);
 }
@@ -2034,6 +2222,7 @@ void VoiceSend(VoiceCmd cmd) {
 void StopListenTimers() {
     if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
     if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
+    if (s_wave_timer != nullptr) { lv_timer_delete(s_wave_timer); s_wave_timer = nullptr; }
 }
 
 void HandleAsrFinal() {
@@ -2045,6 +2234,7 @@ void HandleAsrFinal() {
     s_asr_final_ready = false;
     s_asr_failed = false;  // final 已定局，teardown 期间迟到的 error 是噪声
     s_asr_waiting_final = false;
+    s_listen_owner = ListenOwner::None;
     StopListenTimers();
     if (text.empty()) {  // 没说话/没听清：安静回到来处，不发空 prompt
         Go(s_return_state);
@@ -2068,6 +2258,7 @@ void HandleAsrFailure() {
     s_asr_failed = false;
     s_asr_final_ready = false;  // 错误定局后丢弃悬空的 final，防串到下次会话
     s_asr_waiting_final = false;
+    s_listen_owner = ListenOwner::None;
     StopListenTimers();
     VoiceSend(VoiceCmd::Cancel);  // 兜底清理采集/半开会话（无会话时是 no-op）
     Go(ViewState::Chat);          // 错误横幅住在 chat feed 里
@@ -2109,32 +2300,12 @@ void AsrTick(lv_timer_t*) {
         markup += "#";
         lv_label_set_text(s_asr_lbl, markup.c_str());
     }
-
-    // PWR_KEY 进入的聆听没有"松开"信号（原实现是假走带播完自动发送）：改为
-    // VAD 听到过人声、又回到静音（600ms 挂起）后自动收音发送；二次按键仍是
-    // 取消（OnKeyClickAsync 的 Listen 分支不变）。
-    if (s_ptt_via_key && !s_asr_waiting_final) {
-        if (mhal::audio_pipeline::IsVoiceDetected()) {
-            s_key_heard_speech = true;
-        } else if (s_key_heard_speech) {
-            s_ptt_via_key = false;
-            FinishListenSend();
-        }
-        // 兜底：按键聆听没有"松开"信号，靠 VAD 回静音自动收尾。持续噪声下
-        // VAD 可能永不回静音（或从没听到人声），会无限录音/上传。到最大录音
-        // 时长强制收音发送，避免采集/上传永不停止。
-        if (s_ptt_via_key && s_rec_secs >= kKeyPttMaxSecs) {
-            ESP_LOGW("pi_screen", "key PTT hit max %ds, force finish", kKeyPttMaxSecs);
-            s_ptt_via_key = false;
-            FinishListenSend();
-        }
-    }
+    // 键 PTT 现在有真"松开"信号（onRelease），不再需要 VAD 自动收尾/超时兜底。
 }
 
-void StartListen(ViewState return_state) {
+void StartListen(ViewState return_state, ListenOwner owner) {
     s_return_state = return_state;
-    s_ptt_via_key = false;
-    s_key_heard_speech = false;
+    s_listen_owner = owner;
     s_asr_waiting_final = false;
     s_asr_final_ready = false;
     s_asr_failed = false;
@@ -2148,15 +2319,23 @@ void StartListen(ViewState return_state) {
     if (s_asr_lbl != nullptr) lv_label_set_text(s_asr_lbl, "");
     s_rec_secs = 0;
     if (s_rec_lbl != nullptr) lv_label_set_text(s_rec_lbl, "REC 0:00");
+    // 波形电平清零，从静默基线起。
+    if (s_wave_mutex != nullptr) {
+        xSemaphoreTake(s_wave_mutex, portMAX_DELAY);
+        s_wave_level = 0.0f;
+        xSemaphoreGive(s_wave_mutex);
+    }
     Go(ViewState::Listen);
     if (s_asr_timer == nullptr) s_asr_timer = lv_timer_create(AsrTick, 70, nullptr);
     if (s_rec_timer == nullptr) s_rec_timer = lv_timer_create(UpdateRecTimer, 1000, nullptr);
+    if (s_wave_timer == nullptr) s_wave_timer = lv_timer_create(WaveTick, 40, nullptr);
 }
 
 void CancelListen() {
     StopListenTimers();
     s_asr_waiting_final = false;
-    s_ptt_via_key = false;
+    s_listen_owner = ListenOwner::None;
+    s_key_finish_pending = false;
     VoiceSend(VoiceCmd::Cancel);
     Go(s_return_state);
 }
@@ -2164,7 +2343,6 @@ void CancelListen() {
 void FinishListenSend() {
     if (s_asr_waiting_final) return;  // 重复松开/自动发送竞态：只收一次
     s_asr_waiting_final = true;
-    s_ptt_via_key = false;
     // 停采集与等 final 都在 voice 任务里做；listen 视图原地保留（REC 停表），
     // AsrTick 继续轮询，final/失败落地后再切 chat / 出横幅。
     if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
@@ -2458,57 +2636,61 @@ void EnableEventBubbleRecursive(lv_obj_t* obj) {
     }
 }
 
-// PWR_KEY 长按（IOExpander 监视任务线程 -> lv_async_call 回 LVGL 线程）。
-// IOExpander 的 click 判定是"松开时按住时长 <= 500ms"，长按 1.2s 触发时
-// click 永远不会再发，两个手势天然互斥，UI 侧无需抑制。
-void OnKeyLongPressAsync(void*) {
-    // P1 息屏：重置无操作计时；OFF 下长按只唤醒（不呼面板）。DIM 下唤醒后照常。
-    if (pi_sleep::ConsumeKeyWake())
-        return;
-    // 设置栈打开时长按 = 整栈关闭回到进入前视图（选实现最简且与"长按呼出
-    // 面板"不冲突的方案；短按在设置打开期间为 no-op，见 OnKeyClickAsync）。
-    if (pi_settings::IsOpen()) {
-        pi_settings::Close();
-        return;
-    }
-    if (pi_quick_panel::IsOpen()) {
-        pi_quick_panel::Close();  // 再次长按 = 收起
-        return;
-    }
-    if (s_sheet_open) {
-        CloseNewSessionSheet();
-        return;
-    }
-    OpenQuickPanel();
+// PWR_KEY "按住说话"（IOExpander 监视任务线程 -> lv_async_call 回 LVGL 线程）：
+//   onPress   -> OnKeyPressAsync：处理息屏唤醒 / 覆盖层惰性 / 生成中打断；
+//                普通按下不进聆听（快速单击 = 无反应）。
+//   onLongPress(kKeyHoldToTalkMs) -> OnKeyHoldAsync：按住够久才真正进聆听。
+//   onRelease -> OnKeyReleaseAsync：松开即收音发送。
+// 快捷面板不再由实体键呼出（只留状态栏下拉）。护栏见 s_key_ignore_until_release /
+// s_key_finish_pending 的声明处。
+
+// 覆盖层（设置栈/快捷面板/新对话 sheet）打开时，实体键 PTT 一律惰性。
+bool KeyOverlayOpen() {
+    return pi_settings::IsOpen() || pi_quick_panel::IsOpen() || s_sheet_open;
 }
 
-void KeyStartListen(ViewState return_state) {
-    StartListen(return_state);
-    s_ptt_via_key = true;
+void OnKeyPressAsync(void*) {
+    // 每次物理按下先清两个闩（本次按压重新判定）。
+    s_key_ignore_until_release = false;
+    s_key_finish_pending = false;
+    // P1 息屏：重置无操作计时；OFF 下按下只唤醒（返回 true），并作废本次按压
+    // 后续的 hold/release，避免刚唤醒就误进聆听/误发送。DIM 唤醒后照常透传。
+    if (pi_sleep::ConsumeKeyWake()) {
+        s_key_ignore_until_release = true;
+        return;
+    }
+    if (KeyOverlayOpen()) {  // 覆盖层打开：键惰性
+        s_key_ignore_until_release = true;
+        return;
+    }
+    // 生成中按下即打断（轻触，无需按住）；随后的 hold/release 作废。
+    if (s_state == ViewState::Chat && s_stop_btn != nullptr &&
+        !lv_obj_has_flag(s_stop_btn, LV_OBJ_FLAG_HIDDEN)) {
+        pi_agent_task_abort();
+        s_key_ignore_until_release = true;
+        return;
+    }
+    // 其余情况：不在按下时进聆听——等 OnKeyHoldAsync 的按住判定，快速单击无反应。
 }
 
-void OnKeyClickAsync(void*) {
-    // P1 息屏：重置无操作计时（indev 感知不到按键——P1 设置栈遗留问题在此
-    // 一并补上）；OFF 下短按只唤醒（不进聆听）。
-    if (pi_sleep::ConsumeKeyWake())
-        return;
-    if (pi_settings::IsOpen())
-        return;  // 设置打开期间 PTT/聆听入口不响应
-    switch (s_state) {
-        case ViewState::Idle:
-            KeyStartListen(ViewState::Idle);
-            break;
-        case ViewState::Listen:
-            CancelListen();
-            break;
-        case ViewState::Chat:
-            if (s_stop_btn != nullptr && !lv_obj_has_flag(s_stop_btn, LV_OBJ_FLAG_HIDDEN)) {
-                pi_agent_task_abort();
-            } else {
-                KeyStartListen(ViewState::Chat);
-            }
-            break;
+void OnKeyHoldAsync(void*) {
+    if (s_key_ignore_until_release || KeyOverlayOpen()) return;
+    if (s_state == ViewState::Listen) return;  // 触屏已在聆听：防重入
+    StartListen(s_state == ViewState::Chat ? ViewState::Chat : ViewState::Idle, ListenOwner::Key);
+    if (s_key_finish_pending) {  // release 已先到（极端调度兜底）：立即收音发送
+        s_key_finish_pending = false;
+        FinishListenSend();
     }
+}
+
+void OnKeyReleaseAsync(void*) {
+    if (s_state == ViewState::Listen && s_listen_owner == ListenOwner::Key) {
+        FinishListenSend();  // 松开发送（本次聆听是键触发的）
+    } else if (s_listen_owner != ListenOwner::Key && !s_key_ignore_until_release) {
+        // 聆听尚未起来（hold async 还没执行）：标记待收，OnKeyHoldAsync 消费。
+        s_key_finish_pending = true;
+    }
+    s_key_ignore_until_release = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,6 +2724,8 @@ void OnScreenUnloaded(lv_event_t*) {
     if (s_clock_timer != nullptr) { lv_timer_delete(s_clock_timer); s_clock_timer = nullptr; }
     if (s_asr_timer != nullptr) { lv_timer_delete(s_asr_timer); s_asr_timer = nullptr; }
     if (s_rec_timer != nullptr) { lv_timer_delete(s_rec_timer); s_rec_timer = nullptr; }
+    if (s_wave_timer != nullptr) { lv_timer_delete(s_wave_timer); s_wave_timer = nullptr; }
+    if (s_ptt_hold_timer != nullptr) { lv_timer_delete(s_ptt_hold_timer); s_ptt_hold_timer = nullptr; }
     if (s_think_timer != nullptr) { lv_timer_delete(s_think_timer); s_think_timer = nullptr; }
     if (s_tool_running_timer != nullptr) {
         lv_timer_delete(s_tool_running_timer);
@@ -2569,6 +2753,8 @@ void OnScreenUnloaded(lv_event_t*) {
     s_net_last_render = -1;
     s_idle_model_lbl = s_chat_model_lbl = nullptr;
     s_wave_row = s_asr_lbl = s_rec_lbl = nullptr;
+    s_listen_pill = s_listen_pill_lbl = s_listen_cancel_hint = nullptr;
+    s_ptt_cancel_armed = false;
     s_chat_ctx_fill = s_chat_ctx_lbl = nullptr;
     s_mode_icon_flow = s_mode_icon_zen = s_mode_lbl = s_tts_dot = nullptr;
     s_dock_stat_lbl = s_dock_action_box = s_stop_btn = s_talk_btn = nullptr;
@@ -2587,6 +2773,12 @@ void OnScreenUnloaded(lv_event_t*) {
     s_sheet_open = false;
     s_sbars.clear();
     s_sbar_pull_tracking = false;
+    // PTT 所有权 / 实体键护栏：防跨屏残留
+    s_ptt_tracking = false;
+    s_ptt_listening = false;
+    s_listen_owner = ListenOwner::None;
+    s_key_ignore_until_release = false;
+    s_key_finish_pending = false;
     s_agent_busy = false;
 }
 
@@ -2722,11 +2914,15 @@ lv_obj_t* PiScreen::Create() {
                pi_quick_panel::IsOpen() || pi_settings::IsOpen() || s_sheet_open ||  // 浮层
                s_state == ViewState::Listen;                                         // 聆听中
     };
-    sl_hooks.is_chat = []() { return s_state == ViewState::Chat; };
-    sl_hooks.is_idle_view = []() { return s_state == ViewState::Idle; };
-    sl_hooks.chat_timeout = []() { Go(ViewState::Idle); };  // 会话保留，只切视图
     sl_hooks.on_dim = [](bool dim) { ApplySleepDimVisual(dim); };
-    sl_hooks.on_off = [](bool off) { ApplySleepOffVisual(off); };
+    sl_hooks.on_off = [](bool off) {
+        ApplySleepOffVisual(off);
+        // 真正休眠了才回待机：屏已全黑，此时切回 Idle 不打断任何阅读，醒来是
+        // 干净的时钟主界面（会话仍保留，右滑/继续对话可回到 Chat）。亮屏期间
+        // 绝不强制回主界面——这正是"啥也没干却跳回主界面"的根治。
+        if (off && s_state != ViewState::Idle)
+            Go(ViewState::Idle);
+    };
     pi_sleep::Start(scr, sl_hooks);
 
     s_session_turns = 0;
@@ -2749,17 +2945,20 @@ void PiScreen::LifecycleCallback(screen_lifecycle_event_t event) {
         ESP_LOGI(TAG, "load: pi_screen");
         pi_agent_task_start();
         UpdateModelLabels();
-        IOExpander::getInstance().onClick(IOExpander::Pin::PWR_KEY, []() {
-            lv_async_call(OnKeyClickAsync, nullptr);
+        // "按住说话"：按下/按住达阈值/松开三段，见 OnKeyPressAsync 上方注释。
+        IOExpander::getInstance().onPress(IOExpander::Pin::PWR_KEY, []() {
+            lv_async_call(OnKeyPressAsync, nullptr);
         });
-        // 长按 1.2s 呼出/收起快捷面板。click 与 long-press 互斥（click 只在
-        // <=500ms 的松开时发），无需 UI 侧抑制——见 OnKeyLongPressAsync 注释。
-        IOExpander::getInstance().onLongPress(IOExpander::Pin::PWR_KEY, kKeyLongPressMs, []() {
-            lv_async_call(OnKeyLongPressAsync, nullptr);
+        IOExpander::getInstance().onLongPress(IOExpander::Pin::PWR_KEY, kKeyHoldToTalkMs, []() {
+            lv_async_call(OnKeyHoldAsync, nullptr);
+        });
+        IOExpander::getInstance().onRelease(IOExpander::Pin::PWR_KEY, []() {
+            lv_async_call(OnKeyReleaseAsync, nullptr);
         });
     } else {
         ESP_LOGI(TAG, "unload: pi_screen");
-        IOExpander::getInstance().offClick(IOExpander::Pin::PWR_KEY);
+        IOExpander::getInstance().offPress(IOExpander::Pin::PWR_KEY);
         IOExpander::getInstance().offLongPress(IOExpander::Pin::PWR_KEY);
+        IOExpander::getInstance().offRelease(IOExpander::Pin::PWR_KEY);
     }
 }

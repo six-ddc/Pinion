@@ -2,6 +2,7 @@
 
 #include "esp_log.h"
 #include "metalio_hal/backlight.h"
+#include "metalio_hal/network.h"
 #include "screen_util.h"
 #include "settings.h"
 
@@ -12,9 +13,8 @@ constexpr const char* TAG = "PiSleep";
 constexpr int32_t kW = 720;
 constexpr int32_t kH = 720;
 
-constexpr uint32_t kTickMs = 300;                // 唤醒响应粒度（Dim 下触摸恢复亮度的延迟上限）
-constexpr uint32_t kChatTimeoutMs = 120 * 1000;  // Chat 无操作回待机（固定值）
-constexpr uint32_t kDimToOffMs = 60 * 1000;      // Dim 再 60s 熄灭
+constexpr uint32_t kTickMs = 300;            // 唤醒响应粒度（Dim 下触摸恢复亮度的延迟上限）
+constexpr uint32_t kDimToOffMs = 60 * 1000;  // Dim 再 60s 熄灭
 constexpr uint8_t kDimBrightness = 20;
 constexpr uint32_t kConfigRefreshTicks = 16;  // ~5s 重读一次 NVS "ui"/"sleep_s"
 
@@ -104,7 +104,11 @@ void Tick(lv_timer_t*) {
     if (s_ticks % kConfigRefreshTicks == 0)
         LoadConfig();  // 设置页改档兜底（正路是 ReloadConfig()）
 
-    if (s_hooks.is_gated != nullptr && s_hooks.is_gated()) {
+    // 配网热点跑着时不进 Dim/Off、不回待机——与快捷面板/设置栈/sheet 打开
+    // 同级闸门，避免配网中途息屏或被自动回主页打断。
+    bool gated = (s_hooks.is_gated != nullptr && s_hooks.is_gated()) ||
+                 mhal::network::IsConfigPortalActive();
+    if (gated) {
         ResetIdleAnchor();  // 闸门期间计时持续重置
         if (s_state != State::Awake)
             WakeUp(false);  // 保险：闸门中不应停留在 Dim/Off（如息屏中来了 TTS）
@@ -125,18 +129,12 @@ void Tick(lv_timer_t*) {
         return;
     }
 
-    // Chat 无操作 120s -> 回待机（会话保留；之后 Dim 计时从零起算）
-    if (s_hooks.is_chat != nullptr && s_hooks.is_chat() && idle >= kChatTimeoutMs) {
-        ESP_LOGI(TAG, "chat idle %us -> back to idle view", kChatTimeoutMs / 1000);
-        if (s_hooks.chat_timeout != nullptr)
-            s_hooks.chat_timeout();
-        ResetIdleAnchor();
-        return;
-    }
-
-    // 只有 Idle 视图进 Dim；sleep_s=0（永不）直接不进
-    if (s_sleep_s > 0 && s_hooks.is_idle_view != nullptr && s_hooks.is_idle_view() &&
-        idle >= static_cast<uint32_t>(s_sleep_s) * 1000) {
+    // Dim/Off 由用户设置的 sleep_s 统一驱动，Idle 与 Chat 同等对待——不再有
+    // "Chat 无操作 120s 强制回待机"那条独立计时（亮屏读长回复时会莫名跳回主
+    // 界面，2026-07 按用户反馈移除）。真正休眠（进 Off）时才由 on_off 顺带回
+    // Idle，亮屏期间绝不打断阅读。Listen/生成中/TTS/浮层等已被 is_gated 挡在
+    // 上面，不会误进 Dim。sleep_s=0（永不）直接不进。
+    if (s_sleep_s > 0 && idle >= static_cast<uint32_t>(s_sleep_s) * 1000) {
         EnterDim();
     }
 }

@@ -128,9 +128,14 @@ lv_obj_move_to_index(s_act_line, lv_obj_get_child_count(s_feed) - 1);
   - ZEN:thinking/工具卡**根本不创建**(省 RAM 和重绘),只更新 `s_act_line`
     一行文字;"查看过程"点击后才从 `s_tool_cache`/`s_turn_had_thinking`
     临时重建卡片(`OnPeekClicked`),再点收起即删除临时容器。
-- 实体键(PWR_KEY)只有单击语义(唤醒/开始录音、生成中打断),不依赖双击或
-  1500ms 长按(那个长按已被 home_screen 全局占用做关机对话框)。所有富交互
-  (PTT 按住、上滑取消、状态栏切模式)走触屏。
+- 实体键(PWR_KEY)是**按住说话**:按住录音、松开发送、快速轻点无反应;息屏时
+  按下仅唤醒;生成中按下即打断。语义靠 IOExpander 的 onPress/onLongPress(按住
+  阈值 kKeyHoldToTalkMs)/onRelease 三段边沿实现,配 s_listen_owner(触屏/实体键
+  谁拥有本次聆听)与 s_key_ignore_until_release/s_key_finish_pending 两个护栏。
+  快捷面板不再由实体键呼出(只留状态栏下拉)。上滑取消、状态栏切模式仍走触屏。
+- 触屏 PTT(`s_ptt_layer`/dock TALK 钮)同样是**按住说话**:按下不立即进聆听,按住达
+  kTouchHoldToTalkMs(一次性 timer)才进,快速轻点不再"闪一下"进说话界面;松开发送、
+  上滑取消。触屏与实体键靠 s_listen_owner 互不抢占。
 
 ## 6. pi_ai 事件 → UI 映射
 

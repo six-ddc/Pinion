@@ -80,7 +80,8 @@ lv_obj_t* s_net_v[3] = {};
 lv_obj_t* s_net_portal_state = nullptr;
 lv_obj_t* s_net_portal_btn = nullptr;
 lv_obj_t* s_net_confirm_root = nullptr;  // 切网确认 sheet（网络页存续期间常驻）
-bool s_portal_started = false;           // 本次开机内已起配网热点（不可逆）
+bool s_portal_started = false;           // 本页停留期间配网是否进行中
+std::string s_portal_info;               // 最近一次 WifiConfigPortal 的 "ssid|url"（离开页时清）
 
 // 蓝牙页（两档：音箱 RX / 发射 TX。BT 模组硬件始终处于某个音频模式，
 // 无"关闭"AT 指令，故不设关闭档——与官方 Claw4 固件的模式语义一致。）
@@ -815,10 +816,18 @@ void OnNetSegClicked(lv_event_t* e) {
 void SetPortalActiveVisual(const char* info) {
     if (s_net_portal_state == nullptr)
         return;
+    // 名字来源优先级：事件传入 info → mhal 权威 SSID（重启进配网后页面构建时
+    // 事件已发过、这里直接取）→ 本页缓存 s_portal_info。任一非空即显示。
+    std::string shown = (info != nullptr && info[0] != '\0') ? std::string(info) : std::string();
+    if (shown.empty())
+        shown = mhal::network::GetConfigPortalSsid();
+    if (shown.empty())
+        shown = s_portal_info;
     char buf[128];
-    if (info != nullptr && info[0] != '\0') {
+    if (!shown.empty()) {
         // "配网中 · <ssid|url>"
-        std::snprintf(buf, sizeof(buf), "\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad \xc2\xb7 %s", info);
+        std::snprintf(buf, sizeof(buf), "\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad \xc2\xb7 %s",
+                      shown.c_str());
     } else {
         // "配网中 (热点已开启)"
         std::snprintf(buf, sizeof(buf),
@@ -827,28 +836,44 @@ void SetPortalActiveVisual(const char* info) {
     }
     lv_label_set_text(s_net_portal_state, buf);
     lv_obj_remove_flag(s_net_portal_state, LV_OBJ_FLAG_HIDDEN);
-    if (s_net_portal_btn != nullptr) {
-        lv_obj_remove_flag(s_net_portal_btn, LV_OBJ_FLAG_CLICKABLE);
-        pi_theme::ApplyBorder(s_net_portal_btn, Tok::Line);
-        lv_obj_t* lbl = lv_obj_get_child(s_net_portal_btn, 0);
-        if (lbl != nullptr)
-            pi_theme::ApplyText(lbl, Tok::Faint);
-    }
+    // 不动按钮：配网态下按钮是可点的"退出配网"，其可点性/文案由 BuildNetworkPage
+    // 与 OnPortalClicked 管理。
 }
 
+// "开始配网"：运行时（多为已联网）触发配网一律走"置 force_ap + 重启"，进入
+// 干净态起 AP（真机可靠）；绝不就地 StartConfigPortal——STA→AP 切换在 C5 上会崩。
 void OnPortalClicked(lv_event_t*) {
-    if (s_portal_started)
+    if (s_portal_started || mhal::network::IsConfigPortalActive())
         return;
     s_portal_started = true;
-    // StartConfigPortal 阻塞不返回（softAP + 网页配网，提交后设备重启）——
-    // 丢进专用任务，UI 立即切"配网中"态；热点名经 WifiConfigPortal 事件回填。
+    if (s_net_portal_state != nullptr) {
+        // "即将重启进入配网…"
+        lv_label_set_text(s_net_portal_state,
+                          "\xe5\x8d\xb3\xe5\xb0\x86\xe9\x87\x8d\xe5\x90\xaf\xe8\xbf\x9b\xe5\x85\xa5"
+                          "\xe9\x85\x8d\xe7\xbd\x91\xe2\x80\xa6");
+        lv_obj_remove_flag(s_net_portal_state, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_net_portal_btn != nullptr)
+        lv_obj_remove_flag(s_net_portal_btn, LV_OBJ_FLAG_CLICKABLE);
+    // 延迟一拍让上面的提示先绘出，再重启（RequestConfigPortalReboot 内部 esp_restart）。
     xTaskCreate(
         [](void*) {
-            mhal::network::StartConfigPortal();
-            vTaskDelete(nullptr);  // 正常不会到达
+            vTaskDelay(pdMS_TO_TICKS(700));
+            mhal::network::RequestConfigPortalReboot();  // 不返回
+            vTaskDelete(nullptr);
         },
-        "cfg_portal", 6144, nullptr, 4, nullptr);
-    SetPortalActiveVisual(nullptr);
+        "cfg_reboot", 4096, nullptr, 5, nullptr);
+}
+
+// "退出配网"：设备正处于（重启进入的）配网态时，点此重启回正常联网。
+void OnPortalExitClicked(lv_event_t*) {
+    xTaskCreate(
+        [](void*) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            mhal::network::RebootToNormal();  // 不返回
+            vTaskDelete(nullptr);
+        },
+        "cfg_exit", 4096, nullptr, 5, nullptr);
 }
 
 void BuildNetworkPage(lv_obj_t** out_page) {
@@ -889,13 +914,17 @@ void BuildNetworkPage(lv_obj_t** out_page) {
     lv_label_set_text(s_net_portal_state, "");
     SetLabelFont(s_net_portal_state, &font_puhui_20_4, Tok::Accent);
     lv_obj_add_flag(s_net_portal_state, LV_OBJ_FLAG_HIDDEN);
-    // "开始配网"（"⌁" 不在字体子集，省略图标）
-    s_net_portal_btn =
-        MakeActionBtn(portal, "\xe5\xbc\x80\xe5\xa7\x8b\xe9\x85\x8d\xe7\xbd\x91", OnPortalClicked);
+    // 配网态（含重启进入的）显示"退出配网"，否则"开始配网"（"⌁" 不在字体子集）。
+    bool portal_on = mhal::network::IsConfigPortalActive();
+    s_net_portal_btn = MakeActionBtn(
+        portal,
+        portal_on ? "\xe9\x80\x80\xe5\x87\xba\xe9\x85\x8d\xe7\xbd\x91"       // "退出配网"
+                  : "\xe5\xbc\x80\xe5\xa7\x8b\xe9\x85\x8d\xe7\xbd\x91",     // "开始配网"
+        portal_on ? OnPortalExitClicked : OnPortalClicked);
 
     BuildNetConfirmSheet();
-    if (s_portal_started)
-        SetPortalActiveVisual(nullptr);
+    if (portal_on)
+        SetPortalActiveVisual(nullptr);  // 名字取 GetConfigPortalSsid()
     RefreshNetworkPage();
 }
 
@@ -1563,6 +1592,11 @@ void BuildAboutPage(lv_obj_t** out_page) {
 void PageWillClose(PageId id) {
     switch (id) {
         case PageId::Network:
+            // 配网现为"重启进入的设备级模式"（见 OnPortalClicked）：离开网络页
+            // 不停配网——热点由开机干净态起，运行时用 StopConfigPortal 的
+            // esp_wifi_deinit 就地拆除在 C5 上有崩溃风险，且会中断正配网的用户。
+            // 热点持续到"配网成功自动重启"或用户点"退出配网"。这里只清 UI 指针。
+            s_portal_info.clear();
             s_net_cap = nullptr;
             s_net_portal_state = nullptr;
             s_net_portal_btn = nullptr;
@@ -1731,7 +1765,9 @@ void OnRootReleased(lv_event_t*) { s_swipe_tracking = false; }
 void TickCb(lv_timer_t*) {
     s_ticks++;
 
-    if (lv_display_get_inactive_time(nullptr) > kAutoCloseMs) {
+    // 配网进行中冻结 30s 自动退栈：中途被关掉会把用户正在用的热点弄没。
+    if (!mhal::network::IsConfigPortalActive() &&
+        lv_display_get_inactive_time(nullptr) > kAutoCloseMs) {
         CloseAll();
         return;
     }
@@ -1750,8 +1786,10 @@ void TickCb(lv_timer_t*) {
             }
         }
         if (dirty) {
-            if (portal)
+            if (portal) {
+                s_portal_info = info;  // 持久化到本页存续期间，防重进页面丢热点名
                 SetPortalActiveVisual(info.c_str());
+            }
             RefreshNetworkPage();
             RefreshHub();
         }

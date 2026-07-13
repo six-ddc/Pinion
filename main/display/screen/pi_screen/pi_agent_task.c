@@ -135,13 +135,37 @@ static char g_pending_prompt[512];
 static volatile bool g_running = false; /* true while pi_agent_prompt() is on the stack */
 
 /* ---------- TTS（火山 volc_tts，text_delta 流式喂入） ----------
- * 会话状态（g_tts_session_open/g_tts_failed_this_run）只在 agent worker 任务
- * 上下文读写（on_event 同步跑在 worker 栈上）；g_tts_enabled 跨线程只读写
- * bool，无需锁。mock 走带下 speak_begin 无网络会失败一次并静默降级——文本
- * 事件流不受影响，mock 流程不破坏。 */
+ * 关键约束：LLM 的 SSE 读循环（pi_agent_prompt）与 on_event 同跑在 worker 栈
+ * 上，而 volc_tts_speak_begin/feed_text 都是会阻塞数秒~数十秒的调用（首字 WSS
+ * 握手、以及被音频实时播放背压节流的 WS send）。若在 on_event 里同步喂，读循环
+ * 就被拖住不读 LLM socket，连接被长时间占用→ DeepSeek 侧空闲/写超时→
+ * "transport error(connect/read failed)"，且文本越长越明显。
+ *
+ * 因此这里把所有会阻塞的 volc_tts 调用挪到独立的 tts_pump 任务：喂入方只把
+ * 朗读文本追加进一段内存缓冲（g_tts_pending）并唤醒 pump（全程非阻塞），读
+ * 循环得以全速读完 LLM 流并尽快释放连接；pump 按音频自己的节奏消费缓冲。
+ *
+ * 文本来源：由 UI 侧（pi_screen）驱动而非 on_event —— UI 侧持有 markdown 解析
+ * 上下文，把回复剥成纯文本（去掉加粗/标题/URL 等 markdown）再经 pi_agent_task_tts_feed 喂进来，
+ * 使朗读内容 == 屏幕显示内容。run_start/feed/run_end 由 UI 在 AGENT_START/文本
+ * delta/DONE 时调；cancel 由打断/新会话/关开关/出错触发。
+ *
+ * 并发：g_tts_pending / g_tts_run_gen / g_tts_run_ended 由 g_tts_lock 保护
+ *（worker 与 LVGL/VoiceTask 的 cancel 会并发）。g_tts_run_gen 是"代次"：每个新
+ * run（AGENT_START）与每次 cancel 都 ++，pump 据此丢弃过期文本、放弃被打断的
+ * 旧会话。g_tts_enabled 跨线程只读写 bool，无需锁。 */
+#define PI_TTS_PENDING_MAX (64 * 1024) /* 累积上限：音频跟不上时丢多余文本而非无界增长 */
+
 static volatile bool g_tts_enabled = true; /* 真值由 pi_screen 从 NVS 灌入 */
-static bool g_tts_session_open = false;
-static bool g_tts_failed_this_run = false;
+
+static SemaphoreHandle_t g_tts_lock;   /* 保护下面这组共享态 */
+static SemaphoreHandle_t g_tts_signal; /* binary：唤醒 pump */
+static char *g_tts_pending = NULL;      /* 当前 run 尚未喂给 TTS 的文本 */
+static size_t g_tts_pending_len = 0;
+static size_t g_tts_pending_cap = 0;
+static uint32_t g_tts_run_gen = 0;      /* 每个新 run 与每次 cancel 都 ++ */
+static bool g_tts_run_ended = false;    /* 当前 gen 是否已 AGENT_END */
+static bool g_tts_overflow_warned = false; /* 每 run 只告警一次溢出 */
 
 static void tts_on_error(int code, const char *msg, void *ctx) {
     (void)ctx;
@@ -155,36 +179,174 @@ static const volc_tts_callbacks_t TTS_CBS = {.on_audio_start = NULL,
 
 /* volc_tts_stop() 打断在播会话时最坏阻塞 ~2s（等服务端 SessionCanceled），
  * 而它的调用点（STOP 按钮/状态栏开关/新会话）都在 LVGL 线程——丢进一次性
- * 小任务执行，扬声器静音本身在 stop 内部第一步就发生，感知不到延迟。 */
+ * 小任务执行，扬声器静音本身在 stop 内部第一步就发生，感知不到延迟。
+ *
+ * 代次戳：cancel 派生的异步 stop 若在运行时已被更新的 run 顶掉（g_tts_run_gen
+ * 变了），说明它是过期的——直接跳过，避免误停后开的新会话（新会话遗留的旧会话
+ * 由 pump 的 speak_begin INVALID_STATE 重试清理）。没有这个守卫时，一次打断的
+ * 异步 stop 可能延迟落在紧接着的新回复播报中途，把它掐断。 */
 static void tts_stop_worker(void *arg) {
-    (void)arg;
-    volc_tts_stop();
+    uint32_t my_gen = (uint32_t)(uintptr_t)arg;
+    bool stale = false;
+    if (g_tts_lock) {
+        xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+        stale = (g_tts_run_gen != my_gen);
+        xSemaphoreGive(g_tts_lock);
+    }
+    if (!stale) volc_tts_stop();
     vTaskDelete(NULL);
 }
 
-static void tts_stop_async(void) {
-    if (xTaskCreate(tts_stop_worker, "tts_stop", 4096, NULL, 4, NULL) != pdPASS) {
+static void tts_stop_async(uint32_t gen) {
+    if (xTaskCreate(tts_stop_worker, "tts_stop", 4096, (void *)(uintptr_t)gen, 4, NULL) != pdPASS) {
         volc_tts_stop(); /* 退化为同步（内存紧张时）*/
     }
 }
 
-/* worker 任务上下文：确保会话开启并追加一段文本 */
-static void tts_feed_delta(const char *delta) {
-    if (!g_tts_enabled || g_tts_failed_this_run || !delta || !delta[0]) return;
-    if (!g_tts_session_open) {
-        esp_err_t err = volc_tts_speak_begin(&TTS_CBS);
-        if (err == ESP_ERR_INVALID_STATE) { /* 上一场还在排空：打断后重试一次 */
-            volc_tts_stop();
-            err = volc_tts_speak_begin(&TTS_CBS);
+static inline void tts_signal(void) {
+    if (g_tts_signal) xSemaphoreGive(g_tts_signal); /* binary：重复 give 合并成一次唤醒 */
+}
+
+/* 需持有 g_tts_lock。清空待发送文本（保留 cap 复用，不 free）。 */
+static void tts_pending_reset_locked(void) {
+    g_tts_pending_len = 0;
+    g_tts_overflow_warned = false;
+}
+
+/* 新 run 开始 —— 作废旧缓冲、翻代次。非阻塞。由 UI 侧(pi_screen)在收到
+ * UI_AGENT_START 时调用（TTS 文本生命周期改由 UI 驱动：UI 侧才有 markdown
+ * 解析上下文，能把朗读文本剥成纯文本再喂进来）。 */
+void pi_agent_task_tts_run_start(void) {
+    if (!g_tts_lock) return;
+    xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+    tts_pending_reset_locked();
+    g_tts_run_gen++;
+    g_tts_run_ended = false;
+    xSemaphoreGive(g_tts_lock);
+    tts_signal();
+}
+
+/* 追加一段（已剥离 markdown 的）朗读文本进缓冲并唤醒 pump —— 非阻塞。 */
+void pi_agent_task_tts_feed(const char *plain_utf8) {
+    if (!g_tts_enabled || !g_tts_lock || !plain_utf8 || !plain_utf8[0]) return;
+    const char *delta = plain_utf8;
+    size_t add = strlen(delta);
+    xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+    if (g_tts_pending_len + add > PI_TTS_PENDING_MAX) {
+        if (!g_tts_overflow_warned) {
+            ESP_LOGW(TAG, "tts pending full (%d B), dropping further speech text this run",
+                     (int)PI_TTS_PENDING_MAX);
+            g_tts_overflow_warned = true;
         }
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "tts speak_begin failed (%d), muted for this run", (int)err);
-            g_tts_failed_this_run = true;
+        xSemaphoreGive(g_tts_lock);
+        return; /* 文本 UI 不受影响，仅本 run 后续不再喂 TTS */
+    }
+    if (g_tts_pending_len + add + 1 > g_tts_pending_cap) {
+        size_t newcap = g_tts_pending_cap ? g_tts_pending_cap : 512;
+        while (newcap < g_tts_pending_len + add + 1) newcap *= 2;
+        char *grown = (char *)realloc(g_tts_pending, newcap);
+        if (!grown) {
+            xSemaphoreGive(g_tts_lock);
+            ESP_LOGW(TAG, "tts pending realloc failed, dropping delta");
             return;
         }
-        g_tts_session_open = true;
+        g_tts_pending = grown;
+        g_tts_pending_cap = newcap;
     }
-    volc_tts_feed_text(delta);
+    memcpy(g_tts_pending + g_tts_pending_len, delta, add);
+    g_tts_pending_len += add;
+    g_tts_pending[g_tts_pending_len] = '\0';
+    xSemaphoreGive(g_tts_lock);
+    tts_signal();
+}
+
+/* 本 run 文本已完 —— pump 排空缓冲后 speak_end。非阻塞。由 UI 侧在 UI_DONE 调。 */
+void pi_agent_task_tts_run_end(void) {
+    if (!g_tts_lock) return;
+    xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+    g_tts_run_ended = true;
+    xSemaphoreGive(g_tts_lock);
+    tts_signal();
+}
+
+/* 打断/新会话/关闭/出错：作废当前 run 未播文本（翻代次让 pump 放弃旧会话），
+ * 并异步停播在播音频。可从任意任务调用，不阻塞调用线程。 */
+static void tts_cancel_run(void) {
+    uint32_t gen = 0;
+    if (g_tts_lock) {
+        xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+        tts_pending_reset_locked();
+        gen = ++g_tts_run_gen;
+        g_tts_run_ended = false;
+        xSemaphoreGive(g_tts_lock);
+    }
+    tts_stop_async(gen); /* 代次戳：过期 stop 自动跳过，不误伤新会话 */
+    tts_signal();
+}
+
+/* TTS pump 任务：唯一调用会阻塞的 volc_tts_speak_begin/feed_text/speak_end 的
+ * 地方，与 SSE 读循环彻底解耦。session_open/failed/pump_gen 为本任务私有态。 */
+static void tts_pump(void *arg) {
+    (void)arg;
+    uint32_t pump_gen = 0;
+    bool session_open = false;
+    bool failed = false;
+    for (;;) {
+        xSemaphoreTake(g_tts_signal, portMAX_DELAY);
+
+        /* 快照代次/收尾标志，并整段夺走待发送缓冲（留空缓冲给 worker 继续写）*/
+        xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+        uint32_t gen = g_tts_run_gen;
+        char *chunk = NULL;
+        if (g_tts_pending_len > 0) {
+            chunk = g_tts_pending;
+            g_tts_pending = NULL;
+            g_tts_pending_cap = 0;
+            g_tts_pending_len = 0;
+        }
+        xSemaphoreGive(g_tts_lock);
+
+        /* 代次变化（新 run 或被 cancel）：放弃旧会话本地态；旧会话由 cancel 的
+         * volc_tts_stop 负责收尾，这里不调 speak_end。 */
+        if (gen != pump_gen) {
+            pump_gen = gen;
+            session_open = false;
+            failed = false;
+        }
+
+        if (!g_tts_enabled) { /* 中途关闭：丢弃并回收 */
+            free(chunk);
+            continue;
+        }
+
+        if (chunk && !failed) {
+            if (!session_open) {
+                esp_err_t err = volc_tts_speak_begin(&TTS_CBS);
+                if (err == ESP_ERR_INVALID_STATE) { /* 上一场还在排空：打断后重试一次 */
+                    volc_tts_stop();
+                    err = volc_tts_speak_begin(&TTS_CBS);
+                }
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "tts speak_begin failed (%d), muted for this run", (int)err);
+                    failed = true;
+                } else {
+                    session_open = true;
+                }
+            }
+            if (session_open) volc_tts_feed_text(chunk); /* 阻塞点落在 pump，不碰读循环 */
+        }
+        free(chunk);
+
+        /* 收尾：本 run 已结束且缓冲排空、代次未变 → FinishSession，余音继续播完。
+         * 在锁下复查（feed_text 阻塞期间可能又来了新 delta 或发生了 cancel）。 */
+        xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+        bool drained = (gen == g_tts_run_gen) && g_tts_run_ended && g_tts_pending_len == 0;
+        xSemaphoreGive(g_tts_lock);
+        if (drained && session_open) {
+            volc_tts_speak_end();
+            session_open = false;
+        }
+    }
 }
 
 /* ---------- calc tool (real execution: mul(37,89)=3293, host_chat/main.c parity) ---------- */
@@ -280,7 +442,8 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         s_text_delta_seq = 0;
         s_last_usage_input = 0;
         s_last_usage_output = 0;
-        g_tts_failed_this_run = false;
+        /* TTS run 生命周期由 UI 侧驱动（pi_screen 收到 UI_AGENT_START 时调
+         * pi_agent_task_tts_run_start），这里只入 UI 队列。 */
         enqueue(UI_AGENT_START, NULL, NULL, 0, 0);
         break;
 
@@ -323,7 +486,8 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         case PI_AI_EV_TEXT_DELTA:
             if (ai->delta) {
                 enqueue(UI_TEXT_DELTA, strdup(ai->delta), NULL, 0, ++s_text_delta_seq);
-                tts_feed_delta(ai->delta); /* 边出字边播（worker 栈上同步喂） */
+                /* TTS 不在此喂：UI 侧从 UI_TEXT_DELTA 剥出纯文本后调
+                 * pi_agent_task_tts_feed（见 pi_screen DrainQueueTick）。 */
             }
             break;
         default:
@@ -359,10 +523,7 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         if (ev->message && ev->message->stop_reason == PI_STOP_ERROR) {
             const char *msg = ev->message->error_message ? ev->message->error_message : "error";
             enqueue(UI_ERROR, strdup(msg), NULL, 0, 0);
-            if (g_tts_session_open) { /* 出错即打断播报，不给用户读错误还在放音 */
-                g_tts_session_open = false;
-                volc_tts_stop();
-            }
+            /* 出错停播由 UI 侧在 UI_ERROR 里调 pi_agent_task_tts_cancel。 */
         }
         /* capture real usage off every assistant message; the last one seen
          * before AGENT_END is this run's final turn (usage.input/.output are
@@ -374,10 +535,7 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         break;
 
     case PI_AG_EV_AGENT_END:
-        if (g_tts_session_open) { /* 文本收尾：FinishSession，余下音频继续播完 */
-            g_tts_session_open = false;
-            volc_tts_speak_end();
-        }
+        /* TTS 收尾由 UI 侧在 UI_DONE 里调 pi_agent_task_tts_run_end。 */
         enqueue(UI_DONE, NULL, NULL, (int)s_last_usage_input, (int)s_last_usage_output);
         break;
 
@@ -455,6 +613,8 @@ void pi_agent_task_start(void) {
 
     pi_ui_queue();
     g_prompt_sem = xSemaphoreCreateBinary();
+    g_tts_lock = xSemaphoreCreateMutex();
+    g_tts_signal = xSemaphoreCreateBinary();
     ensure_env();
     g_agent = create_agent();
     if (!g_agent) {
@@ -464,6 +624,11 @@ void pi_agent_task_start(void) {
     if (xTaskCreatePinnedToCore(worker, "pi_agent", PI_AGENT_TASK_STACK, NULL, PI_AGENT_TASK_PRIO,
                                 &g_worker_task, PI_AGENT_TASK_CORE) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreatePinnedToCore(pi_agent) failed");
+    }
+    /* TTS pump：独立任务承接所有会阻塞的 volc_tts 调用，与 SSE 读循环解耦。栈 6KB
+     * 覆盖 cJSON 构造 TTS 请求 + WS send + WSS 握手等待。常驻、跨会话复用。 */
+    if (xTaskCreate(tts_pump, "tts_pump", 6144, NULL, PI_AGENT_TASK_PRIO, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(tts_pump) failed");
     }
 }
 
@@ -477,13 +642,15 @@ void pi_agent_task_send_prompt(const char *preset) {
 }
 
 void pi_agent_task_abort(void) {
-    tts_stop_async(); /* STOP/打断：文字流与播报一起停 */
+    tts_cancel_run(); /* STOP/打断：作废本 run 未播文本 + 异步停播 */
     if (g_agent) pi_agent_abort(g_agent);
 }
 
+void pi_agent_task_tts_cancel(void) { tts_cancel_run(); }
+
 void pi_agent_task_new_session(void) {
     if (!g_agent) return;
-    tts_stop_async();
+    tts_cancel_run();
     pi_agent_abort(g_agent);
     /* pi_agent_destroy() is UB while a run is in progress (pi_agent.h contract,
      * blueprint R9): wait for worker()'s pi_agent_prompt() call to return
@@ -528,5 +695,5 @@ bool pi_agent_tts_enabled(void) { return g_tts_enabled; }
 
 void pi_agent_tts_set_enabled(bool enable) {
     g_tts_enabled = enable;
-    if (!enable) tts_stop_async();
+    if (!enable) tts_cancel_run();
 }

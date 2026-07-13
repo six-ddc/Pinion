@@ -5,8 +5,6 @@
 // ~2s 后置 g_connected 并发 Connected——状态栏"连接中呼吸 → 按 RSSI/CSQ
 // 亮格"的整条链路在 sim 里可见。IsConnected/GetWifiSsid/GetWifiRssi 等
 // 快照接口在 connected 之前返回未连接语义。
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -24,6 +22,7 @@ std::mutex g_mu;
 EventCallback g_cb;
 std::atomic<bool> g_connected{false};
 std::atomic<bool> g_boot_thread_started{false};
+std::atomic<bool> g_portal_active{false};
 
 // sim 默认 WiFi（设备默认 4G；这里要演示"WiFi 已连接"的六页视觉）
 Type LoadType() {
@@ -120,10 +119,40 @@ void AddWifiCredential(const std::string& ssid, const std::string&) {
 
 void StartConfigPortal() {
     std::fprintf(stderr, "[sim][net] StartConfigPortal — softAP up (fake)\n");
-    Emit(Event::WifiConfigPortal, "Metalio-3F2A|http://192.168.4.1");
-    for (;;)
-        sleep(10);  // 设备语义：阻塞不返回（配网提交后重启）
+    g_portal_active = true;
+    Emit(Event::WifiConfigPortal, "Metalio-SIM|http://192.168.4.1");
+    // 非阻塞：设备上 AP 有自己的 http/dns/wifi 任务，这里立即返回即可模拟。
 }
+
+// 设备上会重启进配网；sim 无重启，直接进入配网态模拟"重启后的干净 AP"。
+void RequestConfigPortalReboot() {
+    std::fprintf(stderr, "[sim][net] RequestConfigPortalReboot — (no reboot in sim) enter portal\n");
+    StartConfigPortal();
+}
+
+// 设备上重启回正常；sim 直接清配网态、模拟恢复联网。
+void RebootToNormal() {
+    std::fprintf(stderr, "[sim][net] RebootToNormal — exit portal, resume wifi\n");
+    if (g_portal_active.exchange(false) && g_connected) {
+        Emit(Event::WifiConnected, "MetalioHome");
+    }
+}
+
+std::string GetConfigPortalSsid() {
+    return g_portal_active.load() ? std::string("Metalio-SIM") : std::string();
+}
+
+void StopConfigPortal() {
+    if (!g_portal_active.exchange(false))
+        return;
+    std::fprintf(stderr, "[sim][net] StopConfigPortal — softAP down (fake)\n");
+    if (g_connected) {
+        std::fprintf(stderr, "[sim][net] StopConfigPortal — resuming WifiConnected(MetalioHome)\n");
+        Emit(Event::WifiConnected, "MetalioHome");
+    }
+}
+
+bool IsConfigPortalActive() { return g_portal_active.load(); }
 
 esp_err_t SendAtCommand(const std::string&, std::string& response, uint32_t, bool) {
     response = "OK";

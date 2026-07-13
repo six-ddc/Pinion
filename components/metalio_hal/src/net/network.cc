@@ -31,6 +31,9 @@ constexpr int32_t kDefaultNetType = 1;
 
 EventCallback s_event_cb;
 std::atomic<bool> s_cellular_connected{false};
+std::atomic<bool> s_wifi_started{false};   // WifiStation::Start() 已成功调用且未 Stop
+std::atomic<bool> s_portal_active{false};  // WifiConfigurationAp 正在跑
+std::string s_portal_ssid;                 // 配网热点 SSID（s_portal_active 为 true 期间有效）
 Nt26Modem* s_modem = nullptr;
 
 void Emit(Event e, const std::string& data = "") {
@@ -68,6 +71,26 @@ void StartSntpOnce() {
     }
 }
 
+// 起 WifiStation 并等待联通（要求已有已存凭据）；成功置 s_wifi_started。
+// 供 StartWifi() 正常路径与 StopConfigPortal() 后台重连复用。
+bool StartWifiStationAndWait() {
+    auto& wifi_station = WifiStation::GetInstance();
+    wifi_station.OnScanBegin([]() { Emit(Event::WifiScanning); });
+    wifi_station.OnConnect([](const std::string& ssid) { Emit(Event::WifiConnecting, ssid); });
+    wifi_station.OnConnected([](const std::string& ssid) { Emit(Event::WifiConnected, ssid); });
+    wifi_station.Start();
+    s_wifi_started = true;
+
+    if (!wifi_station.WaitForConnected(60 * 1000)) {
+        wifi_station.Stop();
+        s_wifi_started = false;
+        Emit(Event::WifiConnectFailed);
+        return false;
+    }
+    StartSntpOnce();
+    return true;
+}
+
 bool StartWifi() {
     {
         // 网页配网入口旗标（旧 WifiBoard::ResetWifiConfiguration 语义）：
@@ -76,7 +99,8 @@ bool StartWifi() {
         if (settings.GetInt("force_ap") == 1) {
             ESP_LOGI(TAG, "force_ap is set to 1, reset to 0");
             settings.SetInt("force_ap", 0);
-            StartConfigPortal();  // 不返回
+            StartConfigPortal();  // 非阻塞：起完 AP 即返回
+            return true;          // AP 已起（不代表已联网），语义到此为止
         }
     }
 
@@ -89,19 +113,7 @@ bool StartWifi() {
         return false;
     }
 
-    auto& wifi_station = WifiStation::GetInstance();
-    wifi_station.OnScanBegin([]() { Emit(Event::WifiScanning); });
-    wifi_station.OnConnect([](const std::string& ssid) { Emit(Event::WifiConnecting, ssid); });
-    wifi_station.OnConnected([](const std::string& ssid) { Emit(Event::WifiConnected, ssid); });
-    wifi_station.Start();
-
-    if (!wifi_station.WaitForConnected(60 * 1000)) {
-        wifi_station.Stop();
-        Emit(Event::WifiConnectFailed);
-        return false;
-    }
-    StartSntpOnce();
-    return true;
+    return StartWifiStationAndWait();
 }
 
 bool StartCellular() {
@@ -197,6 +209,15 @@ void AddWifiCredential(const std::string& ssid, const std::string& password) {
 }
 
 void StartConfigPortal() {
+    // 只在 WiFi 栈干净（station 未起）时调用——正常只在开机 force_ap 路径触发，
+    // 此时真机 ESP-Hosted/C5 上起 AP 100% 可靠。运行时（已联网）改由
+    // RequestConfigPortalReboot() 走"置 force_ap + 重启"进来，绝不就地
+    // STA→AP 切换（真机实测会崩）。此处保留 station 拆除仅作防御，正常不触发。
+    if (s_wifi_started) {
+        WifiStation::GetInstance().Stop();
+        s_wifi_started = false;
+    }
+
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage("zh-CN");
     wifi_ap.SetSsidPrefix("Metalio");
@@ -204,13 +225,63 @@ void StartConfigPortal() {
 
     ESP_LOGI(TAG, "WiFi config AP started: %s (%s)", wifi_ap.GetSsid().c_str(),
              wifi_ap.GetWebServerUrl().c_str());
+    s_portal_ssid = wifi_ap.GetSsid();
+    s_portal_active = true;
     Emit(Event::WifiConfigPortal, wifi_ap.GetSsid() + "|" + wifi_ap.GetWebServerUrl());
 
-    // 配网页提交凭据后由 esp-wifi-connect 自行重启设备；这里等待即可。
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
+    // 非阻塞：AP 有自己的 http/dns/wifi 任务，本函数返回后热点继续存活。
+    // 提交凭据成功后 esp-wifi-connect 自行保存并 esp_restart（不返回，
+    // 无需我们处理）。
 }
+
+// 运行时触发配网的可靠入口：置 NVS wifi/force_ap=1（若当前是 4G 则切回
+// WiFi，否则开机不会跑 WiFi 栈也就进不了配网），随后 esp_restart。开机
+// StartWifi() 见 force_ap 即在"station 未起的干净态"下起 AP——这是真机
+// 验证过的可靠路径，规避就地 STA→AP 切换在 C5 上的崩溃。不返回。
+void RequestConfigPortalReboot() {
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("force_ap", 1);
+    }
+    if (CachedType() != Type::WiFi) {
+        SaveType(Type::WiFi);
+    }
+    ESP_LOGI(TAG, "config portal requested -> restart into clean AP mode");
+    vTaskDelay(pdMS_TO_TICKS(400));
+    esp_restart();
+}
+
+// 退出配网并回正常联网：force_ap 已在开机时清零，直接重启即可正常连网。
+void RebootToNormal() {
+    ESP_LOGI(TAG, "exit config portal -> restart to normal");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+}
+
+std::string GetConfigPortalSsid() { return s_portal_active ? s_portal_ssid : std::string(); }
+
+void StopConfigPortal() {
+    if (!s_portal_active) {
+        return;
+    }
+    WifiConfigurationAp::GetInstance().Stop();
+    s_portal_active = false;
+    ESP_LOGI(TAG, "WiFi config AP stopped");
+
+    // 离开配网页时若原来有已存凭据，后台恢复联网；无凭据则保持 wifi 关闭。
+    auto ssid_list = SsidManager::GetInstance().GetSsidList();
+    if (ssid_list.empty()) {
+        return;
+    }
+    xTaskCreate(
+        [](void*) {
+            StartWifiStationAndWait();
+            vTaskDelete(nullptr);
+        },
+        "net_reconn", 8192, nullptr, 4, nullptr);
+}
+
+bool IsConfigPortalActive() { return s_portal_active; }
 
 esp_err_t SendAtCommand(const std::string& cmd, std::string& response, uint32_t timeout_ms,
                         bool bypass_init_check) {

@@ -479,6 +479,39 @@ public:
     }
 
     // ----------------------------------------------------------------------
+    // Raw press / release edge detection
+    //
+    // Unlike onClick (fires on release, gated by hold duration) and
+    // onLongPress (fires while held), these fire on the *bare* edges:
+    //   - onPress   -> the instant the line enters the pressed state
+    //                  (released -> pressed transition).
+    //   - onRelease -> the instant it leaves the pressed state
+    //                  (pressed -> released transition).
+    // Together they let a caller implement true press-and-hold (start on
+    // press, commit on release) that onClick/onLongPress alone cannot express.
+    //
+    // Semantics / threading / error codes mirror onClick & onLongPress: each
+    // registration is one independent edge-tracked row, callbacks run on the
+    // monitor task after the mutex is released, and pressed_level selects the
+    // active level (default false = active-low). Multiple registrations per
+    // pin are allowed.
+    // ----------------------------------------------------------------------
+    using EdgeCallback = std::function<void()>;
+
+    esp_err_t onPress(Pin pin, EdgeCallback callback, bool pressed_level = false) {
+        return registerEdge(pin, /*want_press*/true, std::move(callback), pressed_level, "onPress");
+    }
+
+    esp_err_t onRelease(Pin pin, EdgeCallback callback, bool pressed_level = false) {
+        return registerEdge(pin, /*want_press*/false, std::move(callback), pressed_level, "onRelease");
+    }
+
+    // Remove all press-edge handlers for `pin` (symmetric teardown to onPress).
+    esp_err_t offPress(Pin pin) { return removeEdge(pin, /*want_press*/true, "offPress"); }
+    // Remove all release-edge handlers for `pin`.
+    esp_err_t offRelease(Pin pin) { return removeEdge(pin, /*want_press*/false, "offRelease"); }
+
+    // ----------------------------------------------------------------------
     // Direction / mapping introspection.
     // ----------------------------------------------------------------------
     bool isMapped(Pin pin) const { return lookupSlot(pin) != nullptr; }
@@ -686,6 +719,68 @@ private:
         bool              fired;
     };
 
+    struct EdgeHandler {
+        Pin          pin;
+        bool         pressed_level;
+        bool         want_press;   // true = fire on press edge, false = release
+        EdgeCallback callback;
+        // mutable per-handler state, owned by the monitor task
+        bool         was_pressed;
+        bool         primed;       // seen at least one poll (skip synthetic first edge)
+    };
+
+    // Shared registration path for onPress / onRelease.
+    esp_err_t registerEdge(Pin pin, bool want_press, EdgeCallback callback,
+                           bool pressed_level, const char* who) {
+        if (!callback) {
+            ESP_LOGE(TAG, "%s: callback is empty", who);
+            return ESP_ERR_INVALID_ARG;
+        }
+        const PinSlot* slot = lookupSlot(pin);
+        if (slot == nullptr) {
+            ESP_LOGE(TAG, "%s: pin '%s' is not in pin map", who, PinName(pin));
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (slot->direction != Direction::kInput) {
+            ESP_LOGE(TAG,
+                     "%s: pin '%s' is not configured as input "
+                     "(reading an output reads back the latched value, "
+                     "not a real button state)",
+                     who, PinName(pin));
+            return ESP_ERR_INVALID_STATE;
+        }
+        {
+            std::lock_guard<std::mutex> lock(handlers_mutex_);
+            edge_handlers_.push_back(EdgeHandler{
+                pin,
+                pressed_level,
+                want_press,
+                std::move(callback),
+                /*was_pressed*/false,
+                /*primed*/false,
+            });
+            ensureMonitorTaskStartedLocked();
+        }
+        ESP_LOGI(TAG, "%s: armed pin '%s' (active=%s)", who, PinName(pin),
+                 pressed_level ? "high" : "low");
+        return ESP_OK;
+    }
+
+    esp_err_t removeEdge(Pin pin, bool want_press, const char* who) {
+        std::lock_guard<std::mutex> lock(handlers_mutex_);
+        const auto before = edge_handlers_.size();
+        edge_handlers_.erase(
+            std::remove_if(edge_handlers_.begin(), edge_handlers_.end(),
+                           [pin, want_press](const EdgeHandler& h) {
+                               return h.pin == pin && h.want_press == want_press;
+                           }),
+            edge_handlers_.end());
+        if (edge_handlers_.size() < before) {
+            ESP_LOGI(TAG, "%s: removed handlers for pin '%s'", who, PinName(pin));
+        }
+        return ESP_OK;
+    }
+
     // Caller must hold handlers_mutex_.
     void ensureMonitorTaskStartedLocked() {
         if (monitor_task_handle_ != nullptr) return;
@@ -760,6 +855,24 @@ private:
                     // re-arms the timer naturally.
                     h.was_pressed = is_pressed;
                 }
+                for (auto& h : edge_handlers_) {
+                    bool level = false;
+                    if (readLevel(h.pin, &level) != ESP_OK) {
+                        continue;  // I2C transient: skip tick, don't touch state
+                    }
+                    const bool is_pressed = (level == h.pressed_level);
+                    if (!h.primed) {
+                        // First observation: seed state without emitting a
+                        // synthetic edge (e.g. button already held at arm time).
+                        h.was_pressed = is_pressed;
+                        h.primed = true;
+                    } else if (is_pressed && !h.was_pressed) {
+                        if (h.want_press) pending.push_back(h.callback);
+                    } else if (!is_pressed && h.was_pressed) {
+                        if (!h.want_press) pending.push_back(h.callback);
+                    }
+                    h.was_pressed = is_pressed;
+                }
             }
 
             for (auto& cb : pending) {
@@ -777,6 +890,7 @@ private:
     std::mutex                    handlers_mutex_;
     std::vector<ClickHandler>     click_handlers_;
     std::vector<LongPressHandler> handlers_;
+    std::vector<EdgeHandler>      edge_handlers_;
     TaskHandle_t                  monitor_task_handle_ = nullptr;
 };
 

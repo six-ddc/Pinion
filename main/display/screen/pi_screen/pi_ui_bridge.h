@@ -62,6 +62,21 @@ uint32_t pi_agent_context_window(void); /* model.context_window（deepseek=10000
 bool pi_agent_tts_enabled(void);
 void pi_agent_tts_set_enabled(bool enable);
 
+/* 打断当前播报并作废本次回答尚未播出的文本缓冲（barge-in / 用户开口 / STOP）。
+   内部异步停播、不阻塞调用线程，可从任意任务调用。UI 侧 barge-in 必须走它而非
+   裸 volc_tts_stop()——否则 TTS pump 会继续念缓冲里的旧文本。 */
+void pi_agent_task_tts_cancel(void);
+
+/* TTS 朗读文本的生命周期由 UI 侧驱动（UI 侧才有 markdown 解析上下文，能把回复剥
+   成纯文本再喂，使朗读内容 == 屏幕显示内容）。三者都非阻塞（会阻塞的 volc_tts
+   调用在内部 pump 任务上执行），从 LVGL 线程调用即可：
+   - run_start：新回复开始（收到 UI_AGENT_START 时）——重置本 run 的朗读缓冲；
+   - feed：追加一段已剥离 markdown 的纯文本（加粗/标题/URL 等符号已去掉）；
+   - run_end：本回复文本结束（收到 UI_DONE 时）——pump 排空后收尾，余音播完。 */
+void pi_agent_task_tts_run_start(void);
+void pi_agent_task_tts_feed(const char *plain_utf8);
+void pi_agent_task_tts_run_end(void);
+
 #ifdef __cplusplus
 }
 #endif

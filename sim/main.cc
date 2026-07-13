@@ -6,13 +6,12 @@
 // pi_agent_task.c + pi-c POSIX port (libcurl) → real DeepSeek API.
 //
 // Controls:
-//   F1               PWR_KEY click (idle→listen, listen→cancel, chat→listen/stop)
-//   F2               PWR_KEY long-press 1.2s (quick panel open/close)
-//   typing           speech while listening (pause 1s = VAD silence → auto-send)
-//   Enter            end of speech immediately
+//   F1 (hold)        PWR_KEY 按住说话 — hold to record, release to send; a
+//                    quick tap does nothing; tap during generation = interrupt
+//   typing           speech while listening (types the "utterance")
 //   Backspace        delete last codepoint of the "utterance"
 //   F12              screenshot (BMP, path from PI_SIM_SHOT or pi_sim_shot.bmp)
-//   mouse            touch
+//   mouse            touch (drag down from the status bar = quick panel)
 //
 // Env knobs: PI_SIM_SAY=1 (speak TTS via macOS `say`), PI_SIM_AUTODEMO=<text>
 // (scripted demo: press key, type text, send), PI_SIM_SHOT / PI_SIM_SHOT_MS /
@@ -45,8 +44,7 @@
 namespace {
 
 std::atomic<bool> g_quit{false};
-std::atomic<bool> g_pwr_key_pending{false};
-std::atomic<bool> g_pwr_key_long_pending{false};
+std::atomic<bool> g_pwr_key_held{false};  // F1 held = PWR_KEY pressed (press-and-hold)
 std::atomic<bool> g_shot_pending{false};
 
 uint32_t TickCb() { return SDL_GetTicks(); }
@@ -60,15 +58,15 @@ int EventWatch(void*, SDL_Event* ev) {
             break;
         case SDL_KEYDOWN:
             if (ev->key.keysym.sym == SDLK_F1) {
-                g_pwr_key_pending = true;
-            } else if (ev->key.keysym.sym == SDLK_F2) {
-                g_pwr_key_long_pending = true;
+                g_pwr_key_held = true;  // PWR_KEY 按下（按住说话）
             } else if (ev->key.keysym.sym == SDLK_F12) {
                 g_shot_pending = true;
             } else if (sim_asr_session_active()) {
                 if (ev->key.keysym.sym == SDLK_BACKSPACE) sim_asr_backspace();
-                if (ev->key.keysym.sym == SDLK_RETURN) sim_asr_end_of_speech();
             }
+            break;
+        case SDL_KEYUP:
+            if (ev->key.keysym.sym == SDLK_F1) g_pwr_key_held = false;  // 松开发送
             break;
         case SDL_TEXTINPUT:
             if (sim_asr_session_active()) sim_asr_type(ev->text.text);
@@ -169,19 +167,18 @@ void VirtTouchRead(lv_indev_t*, lv_indev_data_t* data) {
     }
 }
 
-// One command per line: key | longkey | type <text> | enter | backspace |
+// One command per line: keydown | keyup | type <text> | backspace |
 // click <x> <y> | press <x> <y> | move <x> <y> | release | shot <path> | quit
+// (PWR_KEY is press-and-hold: keydown ... type ... keyup to record+send.)
 void ExecCmd(const std::string& line) {
     std::fprintf(stderr, "[sim][cmd] %s\n", line.c_str());
     std::istringstream ss(line);
     std::string cmd;
     ss >> cmd;
-    if (cmd == "key") {
-        g_pwr_key_pending = true;
-    } else if (cmd == "longkey") {
-        g_pwr_key_long_pending = true;
-    } else if (cmd == "enter") {
-        sim_asr_end_of_speech();
+    if (cmd == "keydown") {
+        g_pwr_key_held = true;
+    } else if (cmd == "keyup") {
+        g_pwr_key_held = false;
     } else if (cmd == "backspace") {
         sim_asr_backspace();
     } else if (cmd == "type") {
@@ -249,27 +246,26 @@ void Pump() {
 
     PollCmdFile(now);
 
+    // AUTODEMO: press-and-hold F1 (keydown), type while holding, release to send.
     if (demo_text != nullptr && demo_text[0] != '\0') {
         if (demo_phase == 0 && now > 1500) {
-            g_pwr_key_pending = true;
+            g_pwr_key_held = true;  // 按住
             demo_phase = 1;
         } else if (demo_phase == 1 && now > 2600 && sim_asr_session_active()) {
             sim_asr_type(demo_text);
             demo_phase = 2;
-        } else if (demo_phase == 2 && now > 3100) {
-            sim_asr_end_of_speech();
+        } else if (demo_phase == 2 && now > 3400) {
+            g_pwr_key_held = false;  // 松开发送
             demo_phase = 3;
         }
     }
 
-    if (g_pwr_key_pending.exchange(false)) {
+    // Mirror the physical PWR_KEY held state and run the edge state machines
+    // (press / hold-to-talk / release) every iteration, under the LVGL lock.
+    {
         lv_lock();
-        IOExpander::getInstance().simTriggerClick(IOExpander::Pin::PWR_KEY);
-        lv_unlock();
-    }
-    if (g_pwr_key_long_pending.exchange(false)) {
-        lv_lock();
-        IOExpander::getInstance().simTriggerLongPress(IOExpander::Pin::PWR_KEY);
+        IOExpander::getInstance().simSetPressed(IOExpander::Pin::PWR_KEY, g_pwr_key_held.load());
+        IOExpander::getInstance().simPoll(now);
         lv_unlock();
     }
     if (g_shot_pending.exchange(false)) TakeScreenshot(ShotPath());
@@ -294,11 +290,10 @@ int main() {
 
     std::fprintf(stderr,
                  "pi_sim — Metalio Claw pi_screen simulator (LVGL %d.%d SDL2)\n"
-                 "  F1        = PWR_KEY(待机->聆听 / 聆听->取消 / chat->聆听|STOP)\n"
-                 "  F2        = PWR_KEY 长按 1.2s(快捷面板呼出/收起)\n"
-                 "  打字      = 聆听时说话(停顿1秒自动发送; 回车立即; 退格删字)\n"
+                 "  F1 按住   = PWR_KEY 按住说话(按住录音/松开发送; 轻点无反应; 生成中点按打断)\n"
+                 "  打字      = 聆听时说话(退格删字)\n"
                  "  F12       = 截图 BMP\n"
-                 "  鼠标      = 触摸\n",
+                 "  鼠标      = 触摸(状态栏下拉 = 快捷面板)\n",
                  LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR);
 
     lv_init();
