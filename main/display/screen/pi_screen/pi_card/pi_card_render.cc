@@ -215,7 +215,7 @@ void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_
 void ApplyDefaultStyle(lv_obj_t* obj, const char* type, int depth) {
     if (std::strcmp(type, "slider") == 0) {
         lv_obj_set_height(obj, 6);
-        pi_theme::ApplyBg(obj, Tok::Card2);
+        pi_theme::ApplyBg(obj, Tok::Line);  // 底轨（整盒宽、可见）—— 把手边缘贴齐它的端点
         lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         pi_theme::ApplyBg(obj, Tok::Accent, LV_PART_INDICATOR);
         lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
@@ -228,12 +228,19 @@ void ApplyDefaultStyle(lv_obj_t* obj, const char* type, int depth) {
         lv_obj_set_style_shadow_color(obj, lv_color_hex(0x000000), LV_PART_KNOB);
         lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_KNOB);
         lv_obj_set_ext_click_area(obj, 20);
+        // 把手超出轨道两端各约 13px（26px 直径）。给 MAIN 加水平 padding 把轨道向内缩，
+        // 使 0%/100% 端点的把手停在滑块自己的盒子内、不外伸吃穿行 gap 顶到相邻图标/label。
+        // padding 是盒内内缩，不改变 flex 占位——故 label 不会被挤出裁切（margin 会）。
+        lv_obj_set_style_pad_hor(obj, 13, LV_PART_MAIN);
     } else if (std::strcmp(type, "bar") == 0) {
         lv_obj_set_height(obj, 6);
-        pi_theme::ApplyBg(obj, Tok::Card2);
+        pi_theme::ApplyBg(obj, Tok::Line);  // 底轨可见，与 slider 一致
         lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         pi_theme::ApplyBg(obj, Tok::Accent, LV_PART_INDICATOR);
         lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+        // 与 slider 同款水平内缩，让同列的 slider 轨道与 bar 轨道左右端对齐（bar 无把手
+        // 本不需内缩，但为跨行视觉对齐须一致）。
+        lv_obj_set_style_pad_hor(obj, 13, LV_PART_MAIN);
     } else if (std::strcmp(type, "switch") == 0) {
         pi_theme::ApplyBg(obj, Tok::Card2);
         pi_theme::ApplyBg(obj, Tok::Accent,
@@ -299,15 +306,26 @@ void ApplyBind(lv_obj_t* obj, const char* type, const char* path, const cJSON* n
     card->hub_paths.push_back(path);
     bool writable = hub.Writable(path);
 
+    // 绑定到有量程的数据源时，用 DataHub 量程强制收口控件区间——盖过 JSON 里的
+    // min/max，让「亮度滑条拖不到 5% 以下」「音量拖不出 0–100」不依赖 LLM 自觉。
+    int lo = 0, hi = 0;
+    const bool has_range = hub.RangeOf(path, lo, hi);
+
     if (std::strcmp(type, "label") == 0) {
         HubType t = HubType::Int;
         hub.TypeOf(path, t);
         const char* fmt = GetStr(node, "fmt", t == HubType::String ? nullptr : "%d");
+        // lv_label_bind_text 存的是 fmt 指针（不拷贝），而 fmt 指向即将被 host 的
+        // cJSON_Delete 释放的节点树。intern 进 card 的字符串池（地址稳定、随卡片存活）
+        // 再绑定，否则后续每次刷新都在读已释放内存 → label 格式化成乱码。
+        if (fmt) fmt = card->str_pool.emplace_back(fmt).c_str();
         lv_label_bind_text(obj, subj, fmt);
     } else if (std::strcmp(type, "slider") == 0) {
+        if (has_range) lv_slider_set_range(obj, lo, hi);
         lv_slider_bind_value(obj, subj);
         if (writable) AttachWriteback(obj, type, path);
     } else if (std::strcmp(type, "bar") == 0) {
+        if (has_range) lv_bar_set_range(obj, lo, hi);
         lv_subject_add_observer_obj(subj, BarObserverCb, obj, nullptr);
         lv_bar_set_value(obj, lv_subject_get_int(subj), LV_ANIM_OFF);
     } else if (std::strcmp(type, "switch") == 0) {
@@ -432,6 +450,21 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     AttachEvent(obj, LV_EVENT_CLICKED, card, GetItem(node, "on_click"));
     AttachEvent(obj, LV_EVENT_VALUE_CHANGED, card, GetItem(node, "on_change"));
     AttachEvent(obj, LV_EVENT_RELEASED, card, GetItem(node, "on_release"));
+
+    // 死控件兜底：switch/slider 若既没绑到「可写」路径、也没挂 on_change/on_release，
+    // 拨/拖它不会有任何效果（不控硬件、不回报 LLM）——做成只读展示（去交互 + 视觉降级），
+    // 杜绝「看着能设其实是摆设」的假开关/假滑条（如演示卡里那个装饰性网络开关）。绑到
+    // 只读路径的控件也落这里 → 纯状态显示，值仍随 observer 实时刷新。
+    if (std::strcmp(type, "switch") == 0 || std::strcmp(type, "slider") == 0) {
+        const char* bind = GetStr(node, "bind");
+        const bool live = (bind && DataHub::Instance().Writable(bind)) ||
+                          GetItem(node, "on_change") != nullptr ||
+                          GetItem(node, "on_release") != nullptr;
+        if (!live) {
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);       // 不可交互
+            lv_obj_set_style_opa(obj, LV_OPA_60, LV_PART_MAIN);   // 视觉降级 = 只读态
+        }
+    }
 
     // 递归子节点（把本容器的 flow 传给子级做自适应尺寸）
     if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {

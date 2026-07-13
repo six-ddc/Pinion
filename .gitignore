@@ -33,3 +33,7 @@ volc_keys.h
 # sim 运行产物（从仓库根目录运行 ./sim/build/pi_sim 时生成于 CWD）
 /pi_sim_settings.ini
 /pi_sim_sd/
+
+# 串口采集日志（tools/serial_cap.py 的 OUT= 产物）与 python 缓存
+serial*.log
+__pycache__/

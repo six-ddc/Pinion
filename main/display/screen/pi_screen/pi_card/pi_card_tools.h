@@ -33,7 +33,8 @@ char *pi_card_tool_close(const cJSON *args, bool *is_error);
     "auto-closes). Node={\"type\":..}. Types: column|row{children:[]}, label{text,role?,bind?,fmt?}, "\
     "button{text,variant?,on_click}, slider{min,max,value,bind?,on_change?,on_release?}, "            \
     "switch{checked,bind?,on_change?}, bar{min,max,value,bind?}, icon{icon:'name',size?}, divider, "  \
-    "spacer. DESIGN — lean on these, don't hand-style: label role sets a designed type ramp "         \
+    "spacer. Keep overlays to a few at once (a small cap applies); over-cap renders are reported "     \
+    "back as an async error. DESIGN — lean on these, don't hand-style: label role sets a designed type ramp " \
     "(eyebrow=tiny spaced mono kicker, section=group label, title, heading, label=secondary, "        \
     "value=mono number, caption). button variant: primary(the ONE amber call-to-action) | "           \
     "ghost(outlined, for secondary/cancel) | plain(text-only). Give a card a header (eyebrow + "      \
@@ -41,9 +42,11 @@ char *pi_card_tool_close(const cJSON *args, bool *is_error);
     "puts it on slider fills and the on-switch, so DON'T also color titles/most buttons amber; keep " \
     "text tx/dim. Common props: id,w,h,grow,pad,gap,tone,fill,hidden. tone(text) and fill(bg) take a " \
     "SEMANTIC token that auto-adapts to light/dark — PREFER over raw #hex: accent|ok|err|tx|dim|"     \
-    "faint|card|card2|line. Two-way bind paths: "                                                     \
-    "audio.volume, display.brightness (writable — a slider bound to one controls the hardware "      \
-    "directly, no action needed); battery.level, battery.charging, net.type, net.rssi (read-only). " \
+    "faint|card|card2|line. Two-way bind paths — WRITABLE (bind a slider/switch to control hardware " \
+    "directly, no action needed; values are clamped to each path's valid range): audio.volume(0-100),"\
+    " display.brightness(5-100), display.sleep_s(screen-off seconds, 0=never) via slider; "            \
+    "ui.theme(0=dark/1=light), speech.tts(0/1 read-aloud) via switch. READ-ONLY: battery.level, "      \
+    "battery.charging, net.type, net.rssi, net.ssid, net.connected. "                                  \
     "A label with bind shows the live value (fmt like \"%d%%\"; use mono:true for numbers). Events " \
     "are action arrays: {do:'close'} | {do:'set',path,value?} | {do:'report',text:'..{v}..'} "       \
     "({v}=this widget's value; report tells you what the user chose — put it on buttons/switches, "  \
@@ -62,7 +65,8 @@ char *pi_card_tool_close(const cJSON *args, bool *is_error);
 #define PI_CARD_UPDATE_DESC                                                                          \
     "Patch a node inside a rendered card. Args {card?:'' (latest), id:'node-id', "                   \
     "props:{text?,value?,checked?,hidden?,tone?}}. The node must have been given an \"id\" at "      \
-    "render time. Throws if the card was cleared (a new conversation clears cards)."
+    "render time. If the card or node is gone (closed, TTL-expired, or a new conversation cleared "  \
+    "all cards) the failure is reported back to you asynchronously, not via this call's return."
 
 #define PI_CARD_UPDATE_SCHEMA                                                                        \
     "{\"type\":\"object\",\"properties\":{\"card\":{\"type\":\"string\"},"                            \

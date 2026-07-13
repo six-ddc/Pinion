@@ -28,27 +28,6 @@ SwipeState s_swipe;
 // want here.
 constexpr lv_obj_flag_t kSwipeBackIgnoreFlag = LV_OBJ_FLAG_USER_1;
 
-// Walk from `from` up to `top` (exclusive) and return true if any ancestor
-// (including `from`) is one of the widget types that intrinsically eat
-// horizontal touch drags -- LVGL's built-in slider/arc/roller -- or has
-// been explicitly marked by screen_swipe_back_ignore().  The screen-level
-// swipe handler must treat these the same: the drag is the widget's, not
-// ours.
-bool event_originates_in_drag_owner(lv_obj_t* from, lv_obj_t* top) {
-    for (lv_obj_t* obj = from; obj != nullptr && obj != top;
-         obj = lv_obj_get_parent(obj)) {
-        if (lv_obj_has_flag(obj, kSwipeBackIgnoreFlag)) {
-            return true;
-        }
-        if (lv_obj_check_type(obj, &lv_slider_class) ||
-            lv_obj_check_type(obj, &lv_arc_class) ||
-            lv_obj_check_type(obj, &lv_roller_class)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void swipe_back_event_cb(lv_event_t* e) {
     auto on_back = reinterpret_cast<screen_swipe_back_cb_t>(
         lv_event_get_user_data(e));
@@ -69,7 +48,7 @@ void swipe_back_event_cb(lv_event_t* e) {
     // into the next gesture.
     lv_obj_t* scr_obj = lv_event_get_current_target_obj(e);
     lv_obj_t* press_target = lv_event_get_target_obj(e);
-    if (event_originates_in_drag_owner(press_target, scr_obj)) {
+    if (screen_event_in_drag_owner(press_target, scr_obj)) {
         s_swipe.tracking = false;
         return;
     }
@@ -171,6 +150,26 @@ void screen_strip_obj_chrome(lv_obj_t* obj) {
     lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+}
+
+// Walk from `from` up to `top` (exclusive) and return true if any ancestor
+// (including `from`) is one of the widget types that intrinsically eat
+// horizontal touch drags -- LVGL's built-in slider/arc/roller -- or has been
+// explicitly marked by screen_swipe_back_ignore().  Every screen-level swipe
+// handler must treat these the same: the drag is the widget's, not ours.
+bool screen_event_in_drag_owner(lv_obj_t* from, lv_obj_t* top) {
+    for (lv_obj_t* obj = from; obj != nullptr && obj != top;
+         obj = lv_obj_get_parent(obj)) {
+        if (lv_obj_has_flag(obj, kSwipeBackIgnoreFlag)) {
+            return true;
+        }
+        if (lv_obj_check_type(obj, &lv_slider_class) ||
+            lv_obj_check_type(obj, &lv_arc_class) ||
+            lv_obj_check_type(obj, &lv_roller_class)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void screen_swipe_back_ignore(lv_obj_t* obj, bool recursive) {

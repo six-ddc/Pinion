@@ -9,9 +9,19 @@
 #include "metalio_hal/network.h"
 #include "metalio_hal/power.h"
 
+#include "pi_theme.h"  // ui.theme 路径直接接 pi_theme（同 UI 层，无循环依赖）
+
 #define TAG "pi_card_data"
 
 namespace pi_card {
+
+namespace {
+// 把 v 钳入声明的有效量程（无量程则原样返回）。集中在此，Seed/Write 共用。
+int ClampRange(int v, bool has_range, int lo, int hi) {
+    if (!has_range) return v;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+}  // namespace
 
 DataHub& DataHub::Instance() {
     static DataHub instance;
@@ -42,12 +52,22 @@ bool DataHub::Writable(const std::string& path) const {
     return e && static_cast<bool>(e->setter);
 }
 
+bool DataHub::RangeOf(const std::string& path, int& lo, int& hi) const {
+    const Entry* e = Find(path);
+    if (!e || !e->has_range) return false;
+    lo = e->vmin;
+    hi = e->vmax;
+    return true;
+}
+
 void DataHub::Seed(Entry* e) {
     if (!e->getter) return;
     HubValue v = e->getter();
     switch (e->type) {
         case HubType::Int:
-            lv_subject_set_int(&e->subject, std::get<int>(v));
+            // 硬件读回来的种子也钳一遍——防越界快照污染绑定控件的初值。
+            lv_subject_set_int(&e->subject,
+                               ClampRange(std::get<int>(v), e->has_range, e->vmin, e->vmax));
             break;
         case HubType::Bool:
             lv_subject_set_int(&e->subject, std::get<bool>(v) ? 1 : 0);
@@ -81,8 +101,32 @@ void DataHub::Write(const std::string& path, int value) {
             e->setter(HubValue(value != 0));
             break;
         default:
-            e->setter(HubValue(value));
+            // 收口有效量程后再落硬件：set 动作的显式越界值、滑条越界拖拽都在此兜住，
+            // 保证「设成 -5 反成最亮」「音量 999 灌进编解码器」这类越界一律不发生。
+            e->setter(HubValue(ClampRange(value, e->has_range, e->vmin, e->vmax)));
             break;
+    }
+}
+
+// lo>hi 表示无量程（如 net.rssi）。Int 可写路径务必给量程，让写入与绑定控件都被收口到
+// 硬件真实区间。幂等：路径已存在则忽略。
+void DataHub::Register(const std::string& path, HubType type, std::function<HubValue()> getter,
+                       std::function<void(const HubValue&)> setter, int lo, int hi) {
+    auto [it, ok] = entries_.try_emplace(path);
+    if (!ok) return;
+    Entry& e = it->second;
+    e.type = type;
+    e.getter = std::move(getter);
+    e.setter = std::move(setter);
+    if (lo <= hi) {
+        e.has_range = true;
+        e.vmin = lo;
+        e.vmax = hi;
+    }
+    if (type == HubType::String) {
+        lv_subject_init_string(&e.subject, e.str_buf, e.str_prev, sizeof(e.str_buf), "");
+    } else {
+        lv_subject_init_int(&e.subject, 0);
     }
 }
 
@@ -90,69 +134,76 @@ void DataHub::RegisterBuiltins() {
     if (inited_) return;
     inited_ = true;
 
-    auto make = [this](const std::string& path, HubType type, std::function<HubValue()> getter,
-                       std::function<void(const HubValue&)> setter) {
-        auto [it, ok] = entries_.try_emplace(path);
-        if (!ok) return;
-        Entry& e = it->second;
-        e.type = type;
-        e.getter = std::move(getter);
-        e.setter = std::move(setter);
-        if (type == HubType::String) {
-            lv_subject_init_string(&e.subject, e.str_buf, e.str_prev, sizeof(e.str_buf), "");
-        } else {
-            lv_subject_init_int(&e.subject, 0);
-        }
-    };
-
     // ---- audio.volume（可读写；纯内存缓存读，SetVolume 内部恒持久化 NVS）----
-    make("audio.volume", HubType::Int,
-         []() -> HubValue { return mhal::audio::GetVolume(); },
-         [](const HubValue& v) { mhal::audio::SetVolume(std::get<int>(v), true); });
+    // 量程 0–100：SetOutputVolume 本身不钳，越界值会直灌编解码器，故在此收口。
+    Register("audio.volume", HubType::Int,
+             []() -> HubValue { return mhal::audio::GetVolume(); },
+             [](const HubValue& v) { mhal::audio::SetVolume(std::get<int>(v), true); }, 0, 100);
 
     // ---- display.brightness（可读写；持久化）----
-    make("display.brightness", HubType::Int,
-         []() -> HubValue { return static_cast<int>(mhal::backlight::GetBrightness()); },
-         [](const HubValue& v) {
-             mhal::backlight::SetBrightness(static_cast<uint8_t>(std::get<int>(v)), true);
-         });
+    // 量程 5–100：与 backlight::Restore 的下限、quick_panel BRT 滑条(min=5) 一致，
+    // 绝不让屏幕被拉到全黑（0 只有开机 Restore 才会被抬回 5，运行时不可自救）。
+    Register("display.brightness", HubType::Int,
+             []() -> HubValue { return static_cast<int>(mhal::backlight::GetBrightness()); },
+             [](const HubValue& v) {
+                 mhal::backlight::SetBrightness(static_cast<uint8_t>(std::get<int>(v)), true);
+             },
+             5, 100);
 
     // ---- battery.level（只读；Acquire 时读一次，走阻塞 I2C）----
-    make("battery.level", HubType::Int,
-         []() -> HubValue {
-             int level = 0;
-             bool chg = false, dis = false;
-             mhal::power::GetBatteryLevel(level, chg, dis);
-             return level;
-         },
-         nullptr);
+    Register("battery.level", HubType::Int,
+             []() -> HubValue {
+                 int level = 0;
+                 bool chg = false, dis = false;
+                 mhal::power::GetBatteryLevel(level, chg, dis);
+                 return level;
+             },
+             nullptr, 0, 100);
 
     // ---- battery.charging（只读）----
-    make("battery.charging", HubType::Bool,
-         []() -> HubValue {
-             int level = 0;
-             bool chg = false, dis = false;
-             mhal::power::GetBatteryLevel(level, chg, dis);
-             return chg;
-         },
-         nullptr);
+    Register("battery.charging", HubType::Bool,
+             []() -> HubValue {
+                 int level = 0;
+                 bool chg = false, dis = false;
+                 mhal::power::GetBatteryLevel(level, chg, dis);
+                 return chg;
+             },
+             nullptr);
 
     // ---- net.type（只读；wifi / 4g）----
-    make("net.type", HubType::String,
-         []() -> HubValue {
-             return std::string(mhal::network::GetType() == mhal::network::Type::WiFi ? "wifi"
-                                                                                      : "4g");
-         },
-         nullptr);
+    // 红线：网络类型切换在 pi_settings 里是「持久化 NVS + esp_restart」且带二次确认
+    // 弹窗（「切换网络通道将重启设备」）。这里刻意只读——绝不能给它加 setter 把重启
+    // 类操作变成 LLM 一句话的静默副作用。将来若要放开，必须复用 settings 的确认+重启
+    // 路径，而非在 DataHub 里挂 setter。
+    Register("net.type", HubType::String,
+             []() -> HubValue {
+                 bool wifi = mhal::network::GetType() == mhal::network::Type::WiFi;
+                 return std::string(wifi ? "wifi" : "4g");
+             },
+             nullptr);
 
     // ---- net.rssi（只读；WiFi=dBm，4G=CSQ）----
-    make("net.rssi", HubType::Int,
-         []() -> HubValue {
-             return mhal::network::GetType() == mhal::network::Type::WiFi
-                        ? mhal::network::GetWifiRssi()
-                        : mhal::network::GetSignalStrength();
-         },
-         nullptr);
+    Register("net.rssi", HubType::Int,
+             []() -> HubValue {
+                 bool wifi = mhal::network::GetType() == mhal::network::Type::WiFi;
+                 return wifi ? mhal::network::GetWifiRssi() : mhal::network::GetSignalStrength();
+             },
+             nullptr);
+
+    // ---- net.ssid（只读；当前 WiFi 名，4G 时为空）----
+    Register("net.ssid", HubType::String,
+             []() -> HubValue { return mhal::network::GetWifiSsid(); }, nullptr);
+
+    // ---- net.connected（只读；是否已联网）----
+    Register("net.connected", HubType::Bool,
+             []() -> HubValue { return mhal::network::IsConnected(); }, nullptr);
+
+    // ---- ui.theme（可读写；0=深 1=浅；Set 内部立即全 UI 翻转 + NVS 持久化）----
+    // 无重启、无破坏性，纯样式开关——可安全交给 LLM（"帮我切浅色"）。pi_theme 是 pi_card
+    // 可直接依赖的同层模块，故这里直接内置，无需上层注册。
+    Register("ui.theme", HubType::Bool,
+             []() -> HubValue { return pi_theme::IsLight(); },
+             [](const HubValue& v) { pi_theme::Set(std::get<bool>(v)); });
 
     ESP_LOGI(TAG, "registered %d builtin data paths", static_cast<int>(entries_.size()));
 }

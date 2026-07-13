@@ -46,10 +46,22 @@ class DataHub {
     // 幂等：重复调用只在首次生效。LVGL 线程。
     void RegisterBuiltins();
 
+    // 运行时注册一个自定义数据路径。UI 侧路径（主题/TTS/息屏等）由 pi_screen 在
+    // Create() 时注册——DataHub 不能反向依赖 pi_screen，故 getter/setter 由上层传入。
+    // 幂等：路径已存在则忽略。LVGL 线程，须在 agent 首次跑工具（校验器查 bind 路径）
+    // 之前完成。lo>hi 表示无量程；setter 为空则只读。
+    void Register(const std::string& path, HubType type, std::function<HubValue()> getter,
+                  std::function<void(const HubValue&)> setter, int lo = 0, int hi = -1);
+
     // 元数据查询（校验器用；任意线程安全，结构在 Register 后稳定）。
     bool Has(const std::string& path) const;
     bool TypeOf(const std::string& path, HubType& out) const;
     bool Writable(const std::string& path) const;  // 有 setter 即可双向 bind
+
+    // 有效值域（Int 路径）。返回 true 时 [lo,hi] 为该路径的合法量程；渲染器据此
+    // 收口绑定滑条/条的量程，DataHub::Write 据此钳制写入——保证「不管 LLM 或用户
+    // 拖到什么值，落到硬件的永远在量程内」（如亮度下限 5%，音量 0–100）。
+    bool RangeOf(const std::string& path, int& lo, int& hi) const;
 
     // 渲染器绑定时调用（LVGL 线程）。refcount 0→1 时读一次 getter 种子写 subject。
     // 找不到返回 nullptr。
@@ -75,6 +87,9 @@ class DataHub {
         char str_buf[64] = {0};
         char str_prev[64] = {0};
         int refcount = 0;
+        bool has_range = false;  // Int 路径是否声明了有效量程
+        int vmin = 0;            // has_range 时的下限（含）
+        int vmax = 0;            // has_range 时的上限（含）
     };
 
     const Entry* Find(const std::string& path) const;

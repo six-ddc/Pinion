@@ -205,11 +205,29 @@ void PlaybackTask(void*) {
     bool prebuffering = true;
     bool output_on = false;
     uint32_t idle_ms = 0;
+    // 诊断
+    TickType_t dbg_last = xTaskGetTickCount();
+    uint32_t dbg_played = 0, dbg_underrun = 0, dbg_prebuf = 0, dbg_prebuf_ms = 0;
 
     while (true) {
+        // 诊断：每秒打印播放队列水位 / 本秒播放量 / 欠载(排空)次数 / 预缓冲停顿
+        TickType_t dbg_now = xTaskGetTickCount();
+        if ((dbg_now - dbg_last) * portTICK_PERIOD_MS >= 1000) {
+            if (dbg_played > 0 || dbg_underrun > 0) {
+                ESP_LOGI(TAG,
+                         "play: rb=%uB played=%uB/s underrun=%u prebuf=%u(%ums)",
+                         (unsigned)PlaybackFilled(), (unsigned)dbg_played,
+                         (unsigned)dbg_underrun, (unsigned)dbg_prebuf,
+                         (unsigned)dbg_prebuf_ms);
+            }
+            dbg_played = dbg_underrun = dbg_prebuf = dbg_prebuf_ms = 0;
+            dbg_last = dbg_now;
+        }
+
         // 低水位预启动：空转后首批数据到达时，先积累 prestart_ms 再开播，
         // 避免流式下行初期欠载卡顿；积累超时（3x）则不再等。
         if (prebuffering && PlaybackFilled() > 0 && !s_play.flushing) {
+            dbg_prebuf++;
             const size_t prestart_bytes =
                 (size_t)s_play.cfg.prestart_ms * SampleRate() * 2 / 1000;
             for (uint32_t waited = 0;
@@ -217,6 +235,7 @@ void PlaybackTask(void*) {
                  waited < s_play.cfg.prestart_ms * 3 && !s_play.flushing;
                  waited += 10) {
                 vTaskDelay(pdMS_TO_TICKS(10));
+                dbg_prebuf_ms += 10;
             }
             prebuffering = false;
         }
@@ -235,6 +254,7 @@ void PlaybackTask(void*) {
                 s_play.had_data = true;
                 mhal::audio::WritePcm((const int16_t*)item, got / 2);
                 s_play.writing = false;
+                dbg_played += got;
             }
             vRingbufferReturnItem(s_play.rb, item);
             continue;
@@ -244,6 +264,7 @@ void PlaybackTask(void*) {
         if (s_play.had_data) {
             s_play.had_data = false;
             prebuffering = true;
+            dbg_underrun++;
             FireDrainedCb();
         }
         idle_ms += 50;

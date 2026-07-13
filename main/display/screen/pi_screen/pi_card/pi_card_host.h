@@ -11,12 +11,13 @@
 //     新会话 / 屏卸载 / close 动作 / ttl），都走 OnRootDeleted → Release 掉所有
 //     DataHub 路径 + 出注册表。
 //
-// 与 pi-c 的接线（见 pi_card_tools.h）：LLM 调 ui.render/update/close 工具，工具
+// 与 pi-c 的接线（见 pi_card_tools.h）：LLM 调 ui_render/update/close 工具，工具
 // execute 在 agent worker 线程**同步校验**（不碰 LVGL，错误同步回给 LLM 重试），
 // 通过再把 spec 入 pi_ui_queue()；由 pi_screen 的 DrainQueueTick（LVGL 线程）按
 // 流式顺序调下面的 On*Event 真正建控件——与既有 tool card 同一条渲染通路。
 // ---------------------------------------------------------------------------
 
+#include <list>
 #include <map>
 #include <string>
 #include <vector>
@@ -34,6 +35,10 @@ struct UiCard {
     Display display = Display::Chat;
     std::map<std::string, lv_obj_t*> nodes;   // node id -> widget，供 update
     std::vector<std::string> hub_paths;       // 已 Acquire 的 DataHub 路径，供 Release
+    // lv_label_bind_text 只借用 fmt 指针不拷贝，而渲染完 cJSON 树立即被 cJSON_Delete
+    // 释放。把 fmt 存进这个地址稳定（list 不搬迁元素）、随卡片存活的池里再传给绑定，
+    // 覆盖 observer 的整个存活期，杜绝读悬垂 fmt 把后续刷新格式化成乱码。
+    std::list<std::string> str_pool;
     lv_timer_t* ttl_timer = nullptr;          // overlay 自动关闭（一次性）
 };
 

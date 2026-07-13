@@ -286,6 +286,18 @@ struct VirtTouch {
 VirtTouch g_touch;
 std::mutex g_touch_mu;
 
+// Smooth fling: interpolate the virtual touch (x0,y0)->(x1,y1) over dur_ms on the
+// sim's own clock, emitting an intermediate point every Pump iteration. Coarse
+// cmdfile `move` steps (>=100ms apart) can't reproduce a continuous fast swipe, so
+// they race screen gestures against short press-and-hold timers (hold-to-talk).
+// This delivers real fling-like motion for deterministic gesture tests.
+struct Swipe {
+    bool active = false;
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint32_t start_ms = 0, dur_ms = 0;
+};
+Swipe g_swipe;
+
 void VirtTouchRead(lv_indev_t*, lv_indev_data_t* data) {
     static bool last_reported = false;
     static uint32_t reads = 0, last_ms = 0;
@@ -347,6 +359,18 @@ void ExecCmd(const std::string& line) {
         std::lock_guard<std::mutex> lk(g_touch_mu);
         g_touch.pressed = false;
         g_touch.release_at = 0;
+    } else if (cmd == "swipe") {  // swipe <x0> <y0> <x1> <y1> [dur_ms=180]
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0, ms = 180;
+        ss >> x0 >> y0 >> x1 >> y1 >> ms;
+        g_swipe.x0 = x0; g_swipe.y0 = y0; g_swipe.x1 = x1; g_swipe.y1 = y1;
+        g_swipe.dur_ms = (ms > 0) ? (uint32_t)ms : 180;
+        g_swipe.start_ms = SDL_GetTicks();
+        g_swipe.active = true;
+        std::lock_guard<std::mutex> lk(g_touch_mu);
+        g_touch.pressed = true;
+        g_touch.x = x0;
+        g_touch.y = y0;
+        g_touch.release_at = 0;
     } else if (cmd == "shot") {
         std::string p;
         ss >> p;
@@ -392,6 +416,23 @@ void Pump() {
     if (card_ms > 0 && !card_done && now > card_ms) {
         card_done = true;
         RenderDemoCard();
+    }
+
+    // Advance an in-flight smooth swipe (continuous motion, sim-clock paced).
+    if (g_swipe.active) {
+        uint32_t el = now - g_swipe.start_ms;
+        std::lock_guard<std::mutex> lk(g_touch_mu);
+        if (el >= g_swipe.dur_ms) {
+            g_touch.x = g_swipe.x1;
+            g_touch.y = g_swipe.y1;
+            g_touch.pressed = false;  // fling ends in a release
+            g_swipe.active = false;
+        } else {
+            float t = (float)el / (float)g_swipe.dur_ms;
+            g_touch.x = g_swipe.x0 + (int32_t)((g_swipe.x1 - g_swipe.x0) * t);
+            g_touch.y = g_swipe.y0 + (int32_t)((g_swipe.y1 - g_swipe.y0) * t);
+            g_touch.pressed = true;
+        }
     }
 
     PollCmdFile(now);

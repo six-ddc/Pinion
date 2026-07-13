@@ -47,6 +47,13 @@ idf.py build                   # sdkconfig is pre-set; NEVER run idf.py set-targ
 idf.py -p /dev/ttyACM0 flash monitor   # P4 port = "USB JTAG/serial debug unit"; quit monitor with Ctrl+]
 ```
 
+- **烧录后默认自动采集串口日志（别让设备裸奔）** —— 很多问题要运行一段时间才复现
+  （如 TTS 播到一定时长掉声、内存缓慢泄漏），所以 `idf.py flash` 之后应立即起采集：
+  `uv run tools/serial_cap.py`。该脚本用 uv 按 PEP 723 内联声明自动装 `pyserial`，且
+  **断链/设备重启会自动重连、只有 Ctrl-C 才停**，因此可以在烧录前就起好、跨烧录连续
+  抓取。写文件：`OUT=serial.log uv run tools/serial_cap.py`（`serial*.log` 已 gitignore，
+  日志每行带相对时间戳 `[+SS.mmm]` 便于对齐复现时刻）。它与 `idf.py monitor` 抢同一个
+  P4 串口，二选一——要**连续采集**就用 `idf.py flash`（不带 `monitor`）+ serial_cap.py。
 - **Local env setup (`.idf-env.sh`)** — this repo uses a **project-local ESP-IDF** so it doesn't
   depend on a wrong-version global install. Both `.esp-idf/` and `.idf-env.sh` are git-ignored (via
   `.git/info/exclude`), so activation is one command: `source ./.idf-env.sh`. If they don't exist yet

@@ -6,10 +6,12 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -31,7 +33,17 @@ static const char* TAG = "volc_tts";
 #define TTS_SAMPLE_RATE 16000  // mhal::audio 板载 codec 固定 16kHz，免重采样
 #define TTS_CONNECT_TIMEOUT_MS 10000
 #define TTS_SEND_TIMEOUT_MS 5000
-#define TTS_FEED_TIMEOUT_MS 10000  // 抖动队列满时对 WS 任务的最大背压时长
+#define TTS_FEED_TIMEOUT_MS 10000  // 抖动队列满时对搬运任务的最大背压时长
+// 下行音频中间缓冲：WS 接收任务把服务端音频帧非阻塞入队到这里，独立搬运任务
+// 再阻塞喂给播放管线。绝不能在 WS 接收任务里为播放阻塞——那会冻结这条连接的
+// 收/发/keepalive，长消息尾部被服务端当慢消费者掐断（见组件根因分析）。
+//
+// 火山下发裸 PCM，以约 2.5x 实时速率倾泻，而播放只能 1x 实时消费，差额全压在
+// 本缓冲：峰值积压 ≈ 19.2KB × 语音秒数。512KB 只够约 27s 语音就溢出丢帧（表现
+// 为播到十几秒后持续卡顿）。4MB ≈ 208s 语音，覆盖任何正常回复。PSRAM。
+// 根治之道是让火山改发压缩格式(opus/mp3)+端上解码把带宽降 10 倍（另议）。
+#define TTS_AUDIO_RB_BYTES (4 * 1024 * 1024)
+#define TTS_AUDIO_CHUNK 4096  // 单次搬运块上限（128ms），与播放管线对齐
 
 #define BIT_WS_CONNECTED BIT0
 #define BIT_CONN_STARTED BIT1
@@ -39,7 +51,8 @@ static const char* TAG = "volc_tts";
 #define BIT_SESS_FINISHED BIT3
 #define BIT_SESS_CANCELED BIT4
 #define BIT_FAILED BIT5
-#define BIT_DONE BIT6  // 本次播报彻底结束（播完/打断/失败）
+#define BIT_DONE BIT6           // 本次播报彻底结束（播完/打断/失败）
+#define BIT_CONN_FINISHED BIT7  // 服务端 ConnectionFinished（连接级干净收尾）
 
 struct TtsState {
     esp_websocket_client_handle_t ws;
@@ -53,6 +66,15 @@ struct TtsState {
     volatile bool pending_finish;  // SessionFinished 已到，待播放队列排空
     volatile bool discard_audio;   // 打断后丢弃迟到的下行音频
     volatile bool audio_started;
+    // 下行音频解耦：WS 接收任务非阻塞入队 → 搬运任务阻塞喂播放管线
+    RingbufHandle_t audio_rb;
+    TaskHandle_t pump_task;
+    volatile bool pump_run;             // 搬运任务运行标志（shutdown 置 false）
+    volatile bool pump_alive;           // 搬运任务是否在运行（shutdown join 用）
+    volatile bool pump_finish_pending;  // SessionFinished 已到，待 audio_rb 排空后挂排空回调
+    uint8_t audio_carry;                // 16bit 对齐用的半字节余数
+    volatile bool audio_carry_valid;
+    size_t audio_rb_free_empty;         // 空 audio_rb 的空闲字节（判空基线）
     // WS 消息重组
     uint8_t* rx;
     size_t rx_cap;
@@ -72,18 +94,48 @@ static void tts_emit_error(TtsState* s, int code, const char* msg,
     if (s->cbs.on_error) s->cbs.on_error(code, buf, s->cbs.ctx);
     s->session_active = false;
     s->pending_finish = false;
+    s->discard_audio = true;         // 会话失败：丢弃迟到/残留音频
+    s->pump_finish_pending = false;  // 取消待触发的排空
     xEventGroupSetBits(s->eg, BIT_FAILED | BIT_DONE);
 }
 
+// 非阻塞入队到中间缓冲；满则短超时兜底，绝不长阻塞 WS 接收任务
+static void tts_audio_rb_send(TtsState* s, const uint8_t* buf, size_t n) {
+    if (n == 0) return;
+    if (xRingbufferSend(s->audio_rb, buf, n, 0) != pdTRUE) {
+        // 满（极端超长消息，搬运/播放严重滞后）：短超时兜底，仍不长阻塞 WS 任务
+        if (xRingbufferSend(s->audio_rb, buf, n, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "audio_rb full, dropping %u B", (unsigned)n);
+        }
+    }
+}
+
+// 本函数运行在 WS 接收任务上下文（esp_websocket 无独立 event task，handler
+// 同步派发）。绝不能在这里为播放阻塞——只做非阻塞入队，立刻让 WS 任务回去读
+// socket + 发 keepalive；实际的播放背压由 tts_audio_pump_task 承担。
 static void tts_enqueue_audio(TtsState* s, const uint8_t* pcm, size_t len) {
-    if (len < 2 || s->discard_audio) return;
+    if (len < 1 || s->discard_audio || !s->audio_rb) return;
     if (!s->audio_started) {
         s->audio_started = true;
         if (s->cbs.on_audio_start) s->cbs.on_audio_start(s->cbs.ctx);
     }
-    // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓）；打断时管线立即丢弃
-    mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, len / 2,
-                                       TTS_FEED_TIMEOUT_MS);
+    // 中间缓冲是字节流：若某帧字节数为奇数，直接拼接会让后续 16bit 样本永久
+    // 错位（听感为失真/一顿一顿）。用 1 字节 carry 保证送入的字节流始终对齐。
+    const uint8_t* src = pcm;
+    size_t n = len;
+    if (s->audio_carry_valid) {
+        uint8_t pair[2] = {s->audio_carry, src[0]};
+        tts_audio_rb_send(s, pair, 2);
+        src += 1;
+        n -= 1;
+        s->audio_carry_valid = false;
+    }
+    size_t even = n & ~(size_t)1;
+    if (even) tts_audio_rb_send(s, src, even);
+    if (n & 1) {
+        s->audio_carry = src[even];
+        s->audio_carry_valid = true;
+    }
 }
 
 // SessionFinished 后由播放管线在队列排空时触发（打断路径上被
@@ -94,6 +146,66 @@ static void tts_on_drained(TtsState* s) {
     ESP_LOGI(TAG, "playback drained");
     if (s->cbs.on_finished) s->cbs.on_finished(s->cbs.ctx);
     xEventGroupSetBits(s->eg, BIT_DONE);
+}
+
+// 等搬运任务把中间缓冲丢弃排空（barge-in / 会话切换）。audio_rb 是 BYTEBUF，
+// ESP-IDF 只允许它有一个读者，故这里绝不能自己 Receive（会与搬运任务并发读、
+// 命中 ringbuf 的 configASSERT 崩溃）——只做只读的空闲查询，靠 discard_audio
+// 让搬运任务把残帧丢掉。调用前须已置 discard_audio=true。
+static void tts_wait_audio_rb_empty(TtsState* s) {
+    if (!s->audio_rb) return;
+    s->audio_carry_valid = false;  // 半字节余数一并丢弃
+    // 搬运任务在 discard 下不走 FeedPlayback（无阻塞），排空极快；~600ms 上限兜底
+    for (int i = 0; i < 60; i++) {
+        if (xRingbufferGetCurFreeSize(s->audio_rb) >= s->audio_rb_free_empty) return;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGW(TAG, "audio_rb not drained in time");
+}
+
+// 下行音频搬运任务：从中间缓冲取音频、阻塞喂播放管线（背压落在本任务，与 WS
+// 接收任务彻底解耦）。audio_rb 排空且上游 SessionFinished 已到时，挂
+// OnPlaybackDrained——等 s_play.rb 也排空后才触发 on_finished（两级都空 = 播完）。
+static void tts_audio_pump_task(void* arg) {
+    auto* s = static_cast<TtsState*>(arg);
+    TickType_t dbg_last = xTaskGetTickCount();
+    uint32_t dbg_moved = 0, dbg_block_ms = 0, dbg_recv = 0;
+    while (s->pump_run) {
+        size_t got = 0;
+        auto* item = (uint8_t*)xRingbufferReceiveUpTo(
+            s->audio_rb, &got, pdMS_TO_TICKS(50), TTS_AUDIO_CHUNK);
+        if (item) {
+            dbg_recv++;
+            if (!s->discard_audio && got >= 2) {
+                TickType_t t0 = xTaskGetTickCount();
+                mhal::audio_pipeline::FeedPlayback((const int16_t*)item, got / 2,
+                                                   TTS_FEED_TIMEOUT_MS);
+                dbg_block_ms += (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+                dbg_moved += got;
+            }
+            vRingbufferReturnItem(s->audio_rb, item);
+        } else if (s->pump_finish_pending) {
+            // 中间缓冲已排空
+            s->pump_finish_pending = false;
+            mhal::audio_pipeline::OnPlaybackDrained([s]() { tts_on_drained(s); });
+        }
+        // 诊断：每秒打印中间缓冲水位 / 本秒搬运量 / 下游背压(FeedPlayback)阻塞时长
+        TickType_t now = xTaskGetTickCount();
+        if ((now - dbg_last) * portTICK_PERIOD_MS >= 1000) {
+            size_t used =
+                TTS_AUDIO_RB_BYTES - xRingbufferGetCurFreeSize(s->audio_rb);
+            if (dbg_moved > 0 || used > 512) {
+                ESP_LOGI(TAG,
+                         "pump: audio_rb=%uKB moved=%uB/s feedblock=%ums/s recv=%u",
+                         (unsigned)(used / 1024), (unsigned)dbg_moved,
+                         (unsigned)dbg_block_ms, (unsigned)dbg_recv);
+            }
+            dbg_moved = dbg_block_ms = dbg_recv = 0;
+            dbg_last = now;
+        }
+    }
+    s->pump_alive = false;
+    vTaskDelete(nullptr);
 }
 
 static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
@@ -129,10 +241,10 @@ static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
             s->session_active = false;
             s->pending_finish = true;
             xEventGroupSetBits(s->eg, BIT_SESS_FINISHED);
-            // 服务端音频帧先于本事件到达（同一 socket 顺序保证），此刻
-            // 队列里已是完整音频；排空（或已空）即整场播完。
-            mhal::audio_pipeline::OnPlaybackDrained(
-                [s]() { tts_on_drained(s); });
+            // 音频帧先于本事件到达（同一 socket 顺序），此刻 audio_rb 里才是
+            // 完整音频。交给搬运任务在 audio_rb 排空后再挂 OnPlaybackDrained，
+            // 避免中间缓冲还没搬完就过早触发 on_finished。
+            s->pump_finish_pending = true;
             break;
         case VOLC_EVT_SESSION_CANCELED:
             s->session_active = false;
@@ -140,6 +252,10 @@ static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
             break;
         case VOLC_EVT_SESSION_FAILED:
             tts_emit_error(s, -ESP_FAIL, (const char*)f.payload, f.payload_len);
+            break;
+        case VOLC_EVT_CONNECTION_FINISHED:
+            ESP_LOGI(TAG, "connection finished");
+            xEventGroupSetBits(s->eg, BIT_CONN_FINISHED);
             break;
         default:  // TTSSentenceStart/End、UsageResponse 等：忽略
             break;
@@ -200,8 +316,22 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
     }
 }
 
+static esp_err_t tts_send_event(TtsState* s, int event, const char* session_id,
+                                const char* json);
+
 static void tts_teardown_connection(TtsState* s) {
     if (!s->ws) return;
+    // 协议级干净收尾：连接仍活时先发 FinishConnection，等服务端 ConnectionFinished
+    // 回收连接槽。否则服务端累积「设备以为关了、服务端以为还活着」的僵尸连接，
+    // 占满 app-key 的 TTS bidirection 并发额度 → 之后新连接一律被秒关（永久失效）。
+    if (s->conn_started && esp_websocket_client_is_connected(s->ws)) {
+        xEventGroupClearBits(s->eg, BIT_CONN_FINISHED);
+        if (tts_send_event(s, VOLC_EVT_FINISH_CONNECTION, nullptr, "{}") ==
+            ESP_OK) {
+            xEventGroupWaitBits(s->eg, BIT_CONN_FINISHED, pdFALSE, pdFALSE,
+                                pdMS_TO_TICKS(1500));
+        }
+    }
     esp_websocket_client_close(s->ws, pdMS_TO_TICKS(2000));
     esp_websocket_client_destroy(s->ws);
     s->ws = nullptr;
@@ -315,12 +445,31 @@ static TtsState* tts_get_state(void) {
     if (!s) return nullptr;
     s->eg = xEventGroupCreate();
     s->api_lock = xSemaphoreCreateMutex();
-    if (!s->eg || !s->api_lock) {
+    s->audio_rb = xRingbufferCreateWithCaps(TTS_AUDIO_RB_BYTES,
+                                            RINGBUF_TYPE_BYTEBUF,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s->eg || !s->api_lock || !s->audio_rb) {
         if (s->eg) vEventGroupDelete(s->eg);
         if (s->api_lock) vSemaphoreDelete(s->api_lock);
+        if (s->audio_rb) vRingbufferDeleteWithCaps(s->audio_rb);
         free(s);
         return nullptr;
     }
+    // 记录空 audio_rb 的空闲字节，作为 tts_wait_audio_rb_empty 的判空基线
+    s->audio_rb_free_empty = xRingbufferGetCurFreeSize(s->audio_rb);
+    s->pump_run = true;
+    s->pump_alive = true;  // 先于建任务置位，避免 shutdown 在任务首行前误判已退出
+    // 优先级对齐播放任务（4）；栈 3KB：只做 ringbuf 搬运 + FeedPlayback
+    if (xTaskCreate(tts_audio_pump_task, "tts_audio", 3072, s, 4,
+                    &s->pump_task) != pdPASS) {
+        vEventGroupDelete(s->eg);
+        vSemaphoreDelete(s->api_lock);
+        vRingbufferDeleteWithCaps(s->audio_rb);
+        free(s);
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "tts audio_rb ready: %u KB (PSRAM)",
+             (unsigned)(TTS_AUDIO_RB_BYTES / 1024));
     s_tts = s;
     return s;
 }
@@ -342,9 +491,12 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
 
     if (err == ESP_OK) {
         s->cbs = *cbs;
-        s->discard_audio = false;
+        s->discard_audio = true;  // 让搬运任务丢弃上一场残帧
+        s->pump_finish_pending = false;
+        tts_wait_audio_rb_empty(s);  // 等中间缓冲排空（含清 carry），从干净起播
         s->audio_started = false;
         s->pending_finish = false;
+        s->discard_audio = false;
         volc_gen_uuid(s->session_id);
         xEventGroupClearBits(s->eg, BIT_SESS_STARTED | BIT_SESS_FINISHED |
                                         BIT_SESS_CANCELED | BIT_FAILED |
@@ -430,9 +582,10 @@ void volc_tts_stop(void) {
     TtsState* s = s_tts;
     if (!s) return;
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
-    s->discard_audio = true;    // 迟到的下行音频直接丢
+    s->discard_audio = true;    // 迟到音频直接丢；搬运任务据此把 audio_rb 残帧丢弃排空
     s->pending_finish = false;  // 短路排空回调，不再触发 on_finished
-    mhal::audio_pipeline::FlushPlayback();
+    s->pump_finish_pending = false;  // 取消待触发的排空
+    mhal::audio_pipeline::FlushPlayback();  // 立即静音（清播放队列；audio_rb 由搬运任务丢弃）
     if (s->session_active) {
         s->session_active = false;
         if (tts_send_event(s, VOLC_EVT_CANCEL_SESSION, s->session_id, "{}") ==
@@ -466,8 +619,14 @@ void volc_tts_shutdown(void) {
     tts_teardown_connection(s);
     s_tts = nullptr;
     xSemaphoreGive(s->api_lock);
+    // 停搬运任务并等它退出——它持有 s 指针，必须先于 free 结束。stop 已置
+    // discard_audio + FlushPlayback，搬运任务不会再长阻塞在 FeedPlayback。
+    s->pump_run = false;
+    vTaskDelay(pdMS_TO_TICKS(60));  // 确保搬运任务已启动并观察到 pump_run
+    for (int i = 0; i < 100 && s->pump_alive; i++) vTaskDelay(pdMS_TO_TICKS(10));
     vSemaphoreDelete(s->api_lock);
     vEventGroupDelete(s->eg);
+    vRingbufferDeleteWithCaps(s->audio_rb);
     free(s->rx);
     free(s);
     ESP_LOGI(TAG, "shutdown");

@@ -18,6 +18,7 @@
 #include "IOExpander.hpp"
 #include "lv_markdown/md_inline.h"
 #include "lv_markdown/md_view.h"
+#include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "metalio_hal/audio_pipeline.h"
 #include "metalio_hal/network.h"
@@ -76,6 +77,9 @@ constexpr int32_t kFeedH  = kH - kSbarH - kDockH;   // 552
 // delta）——见下方 "real ASR session engine" 一节；四状态视觉与交互结构不变。
 
 constexpr int32_t kSwipeCancelThreshold = 80;  // up-swipe px to cancel PTT
+// 待起聆听阶段（按住未达阈值时长）里，水平位移越过此值且横向占优 => 判定为"滑动"
+// 而非"按住说话"：撤销待起的聆听、放行屏幕手势（Idle 左滑回对话 / 生成后 Chat 右滑）。
+constexpr int32_t kHSwipeDisarmPx = 40;
 // 触屏"按住说话"阈值：按住不足此时长的轻点不进聆听（不再闪一下），与实体键一致。
 constexpr uint32_t kTouchHoldToTalkMs = 240;
 constexpr int32_t kNvsNamespaceMaxTools = 4;   // cached tool cards per turn (ZEN peek)
@@ -219,6 +223,7 @@ float s_turn_thinking_secs = 0.0f;
 // PTT gesture tracking
 bool s_ptt_tracking = false;
 int32_t s_ptt_start_y = 0;
+int32_t s_ptt_start_x = 0;  // 按下 x，用于待起阶段的水平滑动判定（放行屏幕左/右滑手势）
 bool s_ptt_cancel_armed = false;  // 触屏 PTT：已上滑越过阈值、松手即取消（微信式）
 ViewState s_ptt_ret = ViewState::Idle;   // 触屏 PTT 本次按压的返回态（按下时捕获）
 bool s_ptt_listening = false;            // 触屏 PTT：已过按住阈值、StartListen 已触发
@@ -1342,6 +1347,7 @@ void OnPttPressed(lv_event_t* e) {
     lv_point_t p;
     lv_indev_get_point(indev, &p);
     s_ptt_start_y = p.y;
+    s_ptt_start_x = p.x;
     s_ptt_tracking = true;
     s_ptt_listening = false;
     // 不立即进聆听：按住达 kTouchHoldToTalkMs 才由 PttHoldFire 进（轻点无反应）。
@@ -1356,12 +1362,22 @@ void OnPttPressing(lv_event_t* e) {
     lv_point_t p;
     lv_indev_get_point(indev, &p);
     int32_t dy = p.y - s_ptt_start_y;
+    int32_t dx = p.x - s_ptt_start_x;
     bool up = dy < -kSwipeCancelThreshold;
     if (!s_ptt_listening) {
         // 还没真正进聆听（按住不足阈值时长）：上滑直接撤销待起的聆听。
         if (up) {
             s_ptt_tracking = false;
             lv_indev_wait_release(indev);
+            PttCancelHoldTimer();
+            return;
+        }
+        // 横向占优且越过阈值：这是一次滑动（Idle 左滑回对话 / Chat 右滑回待机），
+        // 不是按住说话。撤销待起的聆听但**不** wait_release——否则会把随后要冒泡到
+        // screen 的 LV_EVENT_GESTURE 一并吞掉，导致左/右滑失效。松手时 OnPttReleased
+        // 因 s_ptt_tracking=false 而不发送，手势交给 OnScrGesture 处理。
+        if (LV_ABS(dx) > kHSwipeDisarmPx && LV_ABS(dx) > LV_ABS(dy)) {
+            s_ptt_tracking = false;
             PttCancelHoldTimer();
         }
         return;
@@ -2645,14 +2661,30 @@ void OnScrPressing(lv_event_t* e) {
 
 void OnScrReleased(lv_event_t*) { s_sbar_pull_tracking = false; }
 
-// Chat 态右滑 -> 回待机（会话保留，Go(Idle) 而非卸载 screen）。聆听中、
-// 生成中（STOP 可见）、Idle、面板/sheet 打开时都不响应。LV_EVENT_GESTURE
-// 默认从按压对象一路 GESTURE_BUBBLE 到 screen，无需逐子件挂标志。
+// Chat 态右滑 -> 回待机、Idle 态左滑 -> 回对话（两向都只切视图、绝不销毁会话，
+// 与 Go() 的隐藏/显示模型一致）。右滑在聆听中、生成中（STOP 可见）、面板/sheet
+// 打开时不响应；左滑要求本会话已有轮次（s_session_turns>0），否则无历史可回、忽略。
+// LV_EVENT_GESTURE 默认从按压对象一路 GESTURE_BUBBLE 到 screen，无需逐子件挂标志。
 void OnScrGesture(lv_event_t* e) {
     lv_indev_t* indev = lv_event_get_indev(e);
     if (indev == nullptr)
         return;
-    if (lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT)
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+
+    // Idle 态左滑：回到隐藏着的对话。气泡与 agent 上下文从未销毁，Go(Chat) 直接
+    // 复用，且保留原滚动位置＝"最小化/还原"语义（回到离开时看的那一屏）。刚开机 /
+    // 刚新建时 s_session_turns==0，无历史可回，左滑忽略。是右滑退出的镜像入口。
+    if (dir == LV_DIR_LEFT) {
+        if (s_state != ViewState::Idle || s_session_turns <= 0)
+            return;
+        if (pi_quick_panel::IsOpen() || s_sheet_open || pi_settings::IsOpen())
+            return;
+        lv_indev_wait_release(indev);
+        Go(ViewState::Chat);
+        return;
+    }
+
+    if (dir != LV_DIR_RIGHT)
         return;
     if (s_state != ViewState::Chat)
         return;
@@ -2660,6 +2692,16 @@ void OnScrGesture(lv_event_t* e) {
     if (pi_quick_panel::IsOpen() || s_sheet_open || pi_settings::IsOpen())
         return;
     if (IsGenerating())
+        return;
+    // 按压对象落在滑块/arc/roller 或标了 screen_swipe_back_ignore 的控件（pi_card
+    // 卡片、overlay scrim…）里时，这一横拖是控件自己的语义，不当作右滑返回——否则
+    // 拖动卡片里的亮度/音量滑条会误触 Chat→Idle。注意：LV_EVENT_GESTURE 的 target
+    // 是 LVGL 沿 GESTURE_BUBBLE 链上溯的 gesture_obj，并非按压的滑块；必须用
+    // lv_indev_get_active_obj()（指针捕获下恒为真正按压的控件）来判定归属。
+    lv_obj_t* scr = lv_event_get_current_target_obj(e);
+    lv_obj_t* pressed = lv_indev_get_active_obj();
+    if (pressed == nullptr) pressed = lv_event_get_target_obj(e);
+    if (screen_event_in_drag_owner(pressed, scr))
         return;
     lv_indev_wait_release(indev);
     Go(ViewState::Idle);
@@ -2974,6 +3016,25 @@ lv_obj_t* PiScreen::Create() {
     // agent 首次跑工具（校验器查 bind 路径）之前就绪；这里在 Create 早于任何
     // prompt，满足。
     pi_card::Init();
+    // UI 侧可控路径注册进 DataHub（它不反向依赖 pi_screen，故由此处注入 getter/setter）：
+    // TTS 播报开关 + 息屏时长档位——都无重启、纯 NVS/内存开关，可安全交给 LLM。
+    {
+        auto& hub = pi_card::DataHub::Instance();
+        hub.Register("speech.tts", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue { return s_tts_on; },
+                     [](const pi_card::HubValue& v) { SetTtsOn(std::get<bool>(v)); });
+        hub.Register("display.sleep_s", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         Settings ui("ui", false);
+                         return ui.GetInt("sleep_s", 0);
+                     },
+                     [](const pi_card::HubValue& v) {
+                         Settings ui("ui", true);
+                         ui.SetInt("sleep_s", std::get<int>(v));
+                         pi_sleep::ReloadConfig();  // 立即重读，别等 ~5s tick
+                     },
+                     0, 3600);
+    }
     pi_card::FeedHooks card_hooks;
     card_hooks.begin_row = CardBeginRow;
     card_hooks.end_row = CardEndRow;

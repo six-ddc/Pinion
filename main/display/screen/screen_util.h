@@ -29,6 +29,16 @@ void screen_attach_swipe_back(lv_obj_t* scr, screen_swipe_back_cb_t on_back);
 // the typical caller is "the whole slider widget including its knob".
 void screen_swipe_back_ignore(lv_obj_t* obj, bool recursive = true);
 
+// True if `from` or any ancestor up to (but excluding) `top` owns horizontal
+// drag semantics -- a built-in slider / arc / roller, or anything tagged via
+// screen_swipe_back_ignore(). Any screen-level right-swipe handler (whether it
+// uses screen_attach_swipe_back() or rolls its own LV_EVENT_GESTURE callback)
+// must consult this before treating a rightward drag as a back gesture, so
+// that dragging a slider knob isn't misread as swipe-back. Pass the gesture's
+// origin widget (lv_event_get_target_obj) as `from` and the screen
+// (lv_event_get_current_target_obj) as `top`.
+bool screen_event_in_drag_owner(lv_obj_t* from, lv_obj_t* top);
+
 // ---------------------------------------------------------------------------
 // Screen lifecycle hooks
 //

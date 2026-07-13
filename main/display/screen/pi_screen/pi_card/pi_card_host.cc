@@ -28,7 +28,15 @@ std::atomic<int> s_next_id{1};
 int s_overlay_count = 0;
 FeedHooks s_feed{};
 
-std::string AllocId() { return std::string("c") + std::to_string(s_next_id.fetch_add(1)); }
+// overlay 护栏：浮层会阻止息屏（见 pi_screen 的 sleep 门控），无 ttl 的浮层若被 LLM
+// 忘关会让屏幕永不熄灭、持续耗电，故每个 overlay 都有一个保底最大存活期；同时封顶
+// 同屏叠加的浮层数，防失控刷屏把 scrim 层层堆满。
+constexpr int kOverlayMaxTtlMs = 5 * 60 * 1000;  // 5min，与最长息屏档呼应
+constexpr int kMaxOverlays = 3;
+
+// 自增内部 id 用 "c." 前缀，与 LLM 惯用的 "c1"/"card1" 命名空间隔开，避免 LLM 显式传入
+// 的 id 与将来自增出的 id 撞车（撞车会触发 OnRenderEvent 的删旧卡替换）。
+std::string AllocId() { return std::string("c.") + std::to_string(s_next_id.fetch_add(1)); }
 
 UiCard* FindCard(const std::string& id) {
     const std::string& key = id.empty() ? s_last_id : id;
@@ -37,8 +45,9 @@ UiCard* FindCard(const std::string& id) {
     return it == s_cards.end() ? nullptr : it->second.get();
 }
 
-// worker 线程：构造并入队一个 pi_ui_evt_t（strdup 的串由 drain 侧 free）。
-void Enqueue(pi_ui_kind_t kind, char* s1, char* s2, char* s3, int i1, int i2) {
+// worker 线程：构造并入队一个 pi_ui_evt_t（strdup 的串由 drain 侧 free）。返回是否
+// 入队成功——队列满是 worker 线程唯一能同步得知的执行期错误，据此回传给 LLM。
+bool Enqueue(pi_ui_kind_t kind, char* s1, char* s2, char* s3, int i1, int i2) {
     pi_ui_evt_t evt;
     evt.kind = kind;
     evt.s1 = s1;
@@ -51,10 +60,21 @@ void Enqueue(pi_ui_kind_t kind, char* s1, char* s2, char* s3, int i1, int i2) {
         free(s1);
         free(s2);
         free(s3);
+        return false;
     }
+    return true;
 }
 
 char* Dup(const std::string& s) { return strdup(s.c_str()); }
+
+// drain（LVGL 线程）阶段的执行失败无法走工具返回值回传——工具早已在 worker 线程
+// 同步返回。这里把失败作为一条系统提示异步注入回 LLM（与交互事件 report 同一通路），
+// 让助手知道「以为成功的操作其实失败了」，可据此纠正、重试或转告用户。
+void ReportAsyncError(const std::string& msg) {
+    std::string tagged = "「卡片错误」" + msg;
+    pi_agent_task_inject(tagged.c_str());
+    ESP_LOGW(TAG, "async error -> %s", msg.c_str());
+}
 
 // ------------------------------ overlay 骨架 -------------------------------
 void OnRootDeleted(lv_event_t* e);
@@ -148,6 +168,12 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         return;
     }
     const bool overlay = display_mode != 0;
+    if (overlay && s_overlay_count >= kMaxOverlays) {
+        ESP_LOGW(TAG, "overlay cap reached (%d), dropping card render", s_overlay_count);
+        ReportAsyncError("同屏浮层已达上限，本次渲染被丢弃；请先 ui_close 旧卡再重试");
+        cJSON_Delete(root);
+        return;
+    }
     std::string id = (card_id && card_id[0]) ? card_id : AllocId();
 
     // 显式 id 撞车：先同步删旧卡（触发其 OnRootDeleted 清理），避免覆盖注册表
@@ -169,12 +195,14 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
     } else {
         if (!s_feed.begin_row) {
             ESP_LOGW(TAG, "render: no feed hooks");
+            ReportAsyncError("聊天内联卡片当前不可用（feed 未就绪）");
             cJSON_Delete(root);
             return;
         }
         delete_root = s_feed.begin_row();
         render_parent = delete_root;
         if (!delete_root) {
+            ReportAsyncError("聊天内联卡片当前不可用（feed 未就绪）");
             cJSON_Delete(root);
             return;
         }
@@ -190,6 +218,9 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
     cJSON_Delete(root);
     if (!tree) {
         ESP_LOGW(TAG, "render failed: %s", rerr.c_str());
+        // 干跑校验已在 worker 侧过一遍，drain 再失败属渲染器/校验器不同构的意外——回传
+        // 让 LLM 换个更简单的卡重试，别拿着一个其实没渲出来的 card id 继续。
+        ReportAsyncError(std::string("卡片渲染失败：") + rerr);
         lv_obj_delete(delete_root);  // 触发 OnRootDeleted → Release（未入表，erase 无副作用）
         return;
     }
@@ -209,10 +240,11 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         lv_obj_set_scrollbar_mode(tree, LV_SCROLLBAR_MODE_AUTO);
         screen_swipe_back_ignore(tree, true);  // 内部竖滑归卡片，不误触屏级手势
         AddOverlayCloseButton(wrapper, card.get());
-        if (ttl_ms > 0) {
-            card->ttl_timer = lv_timer_create(OverlayTtlCb, ttl_ms, card.get());
-            lv_timer_set_repeat_count(card->ttl_timer, 1);
-        }
+        // 保底 TTL：无 ttl（0）或 LLM 给的超长 ttl 一律封顶到 kOverlayMaxTtlMs，避免浮层
+        // 永久阻止息屏。显式 ttl 在封顶内则照用。
+        int ttl = (ttl_ms > 0 && ttl_ms < kOverlayMaxTtlMs) ? ttl_ms : kOverlayMaxTtlMs;
+        card->ttl_timer = lv_timer_create(OverlayTtlCb, ttl, card.get());
+        lv_timer_set_repeat_count(card->ttl_timer, 1);
         s_overlay_count++;
     } else {
         if (s_feed.end_row) s_feed.end_row();
@@ -228,11 +260,15 @@ void OnUpdateEvent(const char* card_id, const char* node_id, const char* props_j
     UiCard* card = FindCard(card_id ? card_id : "");
     if (!card) {
         ESP_LOGW(TAG, "update: card not found");
+        ReportAsyncError(std::string("ui_update 失败：卡片 '") + (card_id ? card_id : "(latest)") +
+                         "' 不存在（可能已关闭，或新会话已清空全部卡片）");
         return;
     }
     auto it = card->nodes.find(node_id ? node_id : "");
     if (it == card->nodes.end()) {
         ESP_LOGW(TAG, "update: node '%s' not found", node_id ? node_id : "");
+        ReportAsyncError(std::string("ui_update 失败：节点 '") + (node_id ? node_id : "") +
+                         "' 不存在（渲染时须给该节点一个 id 才能后续 update）");
         return;
     }
     cJSON* props = cJSON_Parse(props_json ? props_json : "");
@@ -279,7 +315,10 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         *is_error = true;
         return Dup("out of memory");
     }
-    Enqueue(UI_CARD_RENDER, root_json, Dup(id), nullptr, mode, ttl_ms);
+    if (!Enqueue(UI_CARD_RENDER, root_json, Dup(id), nullptr, mode, ttl_ms)) {
+        *is_error = true;
+        return Dup("UI busy (event queue full), retry shortly");
+    }
     return Dup(std::string("{\"card\":\"") + id + "\"}");
 }
 
@@ -298,7 +337,10 @@ extern "C" char* pi_card_tool_update(const cJSON* args, bool* is_error) {
         *is_error = true;
         return Dup("out of memory");
     }
-    Enqueue(UI_CARD_UPDATE, Dup(card), Dup(idj->valuestring), props_json, 0, 0);
+    if (!Enqueue(UI_CARD_UPDATE, Dup(card), Dup(idj->valuestring), props_json, 0, 0)) {
+        *is_error = true;
+        return Dup("UI busy (event queue full), retry shortly");
+    }
     return Dup("ok");
 }
 
@@ -306,7 +348,10 @@ extern "C" char* pi_card_tool_close(const cJSON* args, bool* is_error) {
     *is_error = false;
     const cJSON* cardj = cJSON_GetObjectItem(args, "card");
     std::string card = cJSON_IsString(cardj) ? cardj->valuestring : "";
-    Enqueue(UI_CARD_CLOSE, Dup(card), nullptr, nullptr, 0, 0);
+    if (!Enqueue(UI_CARD_CLOSE, Dup(card), nullptr, nullptr, 0, 0)) {
+        *is_error = true;
+        return Dup("UI busy (event queue full), retry shortly");
+    }
     return Dup("ok");
 }
 

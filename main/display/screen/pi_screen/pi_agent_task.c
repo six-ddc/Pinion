@@ -393,7 +393,9 @@ static int calc_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
     return PI_OK;
 }
 
-/* ---------- pi_card 声明式 UI 工具（ui.render / ui.update / ui.close） ----------
+/* ---------- pi_card 声明式 UI 工具（ui_render / ui_update / ui_close） ----------
+ * 工具名只能匹配 ^[a-zA-Z0-9_-]+$（OpenAI/DeepSeek 兼容 API 的 function.name 约束）——
+ * 不能含点号，否则请求被拒 "invalid tools[N].function.name not match pattern"。故用下划线。
  * execute 在 worker 线程调 pi_card_tool_*（校验 + 入 pi_ui_queue，不碰 LVGL），
  * 秒回，绝不在 SSE 读循环上做重活。真正建控件在 pi_screen 的 DrainQueueTick。 */
 static int card_tool_run(char *(*fn)(const cJSON *, bool *), const pi_alloc_t *alloc,
@@ -432,19 +434,19 @@ static const pi_agent_tool_t TOOLS[] = {
         .execute = calc_exec,
     },
     {
-        .def = {.name = "ui.render",
+        .def = {.name = "ui_render",
                 .description = PI_CARD_RENDER_DESC,
                 .parameters_schema_json = PI_CARD_RENDER_SCHEMA},
         .execute = ui_render_exec,
     },
     {
-        .def = {.name = "ui.update",
+        .def = {.name = "ui_update",
                 .description = PI_CARD_UPDATE_DESC,
                 .parameters_schema_json = PI_CARD_UPDATE_SCHEMA},
         .execute = ui_update_exec,
     },
     {
-        .def = {.name = "ui.close",
+        .def = {.name = "ui_close",
                 .description = PI_CARD_CLOSE_DESC,
                 .parameters_schema_json = PI_CARD_CLOSE_SCHEMA},
         .execute = ui_close_exec,
