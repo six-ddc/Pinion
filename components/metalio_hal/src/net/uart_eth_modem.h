@@ -24,22 +24,23 @@
 #include "iot_eth_netif_glue.h"
 
 /**
-* @brief UART Ethernet Modem driver for 4G modules (EC801E, NT26K, etc.)
-*
-* This class encapsulates the UART-based Ethernet communication with 4G modules,
-* providing a simple interface for network connectivity. It handles:
-* - UART communication with frame protocol
-* - AT command processing
-* - Network state management
-* - Integration with ESP-IDF's iot_eth and esp_netif
-*
-* MRDY/SRDY Protocol:
-*   - MRDY (Master Busy): AP -> Modem, low = busy/working, high = idle/can sleep
-*   - SRDY (Slave Busy): Modem -> AP, low = busy/has data, high = idle/can sleep
-*   - After sending a frame, wait for receiver's 50us high pulse as ACK
-*   - Idle timeout triggers PendingIdle state, then Idle when both are high
-*
-*/
+ * @brief UART Ethernet Modem driver for 4G modules (EC801E, NT26K, etc.)
+ *
+ * This class encapsulates the UART-based Ethernet communication with 4G modules,
+ * providing a simple interface for network connectivity. It handles:
+ * - UART communication with frame protocol
+ * - AT command processing
+ * - Network state management
+ * - Integration with ESP-IDF's iot_eth and esp_netif
+ *
+ * MRDY/SRDY Protocol:
+ *   - MRDY (Master Busy): AP -> Modem, low = busy/working, high = idle/can sleep
+ *   - SRDY (Slave Busy): Modem -> AP, low = busy/has data, high = idle/can sleep
+ *   - After sending a frame, any SRDY edge activity is treated as the receiver's ACK
+ *     (the ISR sets the activity bit regardless of level; not strictly a 50us high pulse)
+ *   - Idle timeout triggers PendingIdle state, then Idle when both are high
+ *
+ */
 class UartEthModem {
 public:
     // Working state machine for low-power management
@@ -278,12 +279,20 @@ private:
 
     static_assert(sizeof(FrameHeader) == 4, "FrameHeader must be 4 bytes");
 
+    // 同步 SendFrame 用的完成量，堆分配、发送方与 TX 任务共享。用引用计数
+    // 而非裸信号量：调用方超时返回时不删对象，最后释放引用的一方才回收，
+    // 避免 TX 任务稍后写入已回收的栈/句柄（UAF）。
+    struct TxCompletion {
+        SemaphoreHandle_t sem;
+        esp_err_t result;
+        std::atomic<int> refs;
+    };
+
     // TX frame structure (for queue)
     struct TxFrame {
-        uint8_t* data;               // Header + payload, allocated with malloc
-        size_t length;               // Total length including header
-        SemaphoreHandle_t done_sem;  // Optional: signaled when transmission completes (for sync send)
-        esp_err_t* result;           // Optional: pointer to store result (for sync send)
+        uint8_t* data;             // Header + payload, allocated with malloc
+        size_t length;             // Total length including header
+        TxCompletion* completion;  // Optional: 非空即同步 SendFrame（以太帧路径传 null）
     };
 
     // Initialization and cleanup
@@ -318,6 +327,8 @@ private:
 
     // Frame processing
     esp_err_t SendFrame(const uint8_t* data, size_t length, FrameType type);
+    // 释放一份 TxCompletion 引用；最后一方删除信号量与对象（可传 null）。
+    static void ReleaseTxCompletion(TxCompletion* completion);
     esp_err_t EnqueueTxFrame(const uint8_t* buf, size_t len);
     void ProcessReceivedFrame(uint8_t* data, size_t size);
     void HandleEthFrame(uint8_t* data, size_t length);
@@ -397,6 +408,8 @@ private:
     std::atomic<uint8_t> seq_no_{0};
     std::atomic<bool> debug_enabled_{false};
     bool flight_mode_{false};  // Flight mode: only query modem info, no network registration
+    bool no_sim_{false};  // 无 SIM：保留 CFUN=1 的 AT 通道，跳过 InitIotEth（同 flight mode）。
+                          // 已知限制：换卡后需重新 Start 走一遍 init，无热插拔重注册路径。
 
     // Working state machine
     std::atomic<WorkingState> working_state_{WorkingState::Idle};
@@ -405,6 +418,7 @@ private:
     static constexpr int64_t kIdleTimeoutMs = 500;
     static constexpr int64_t kAckTimeoutMs = 100;
     static constexpr int64_t kAckPulseUs = 50;
+    std::atomic<uint32_t> ack_timeout_count_{0};  // 累计 ACK 等待超时次数（仅诊断，不改行为）
 
     // Modem information (cached)
     std::string imei_;
@@ -441,7 +455,8 @@ private:
     static constexpr uint32_t kEventAtResponse = (1 << 4);
     static constexpr uint32_t kEventInitDone = (1 << 5);
     static constexpr uint32_t kEventNetworkEventChanged = (1 << 6);
-    static constexpr uint32_t kEventSrdyHigh = (1 << 7);
+    // SRDY 任意沿活动（ISR 不分高低电平置位）即视作对端 ACK / 状态变化。
+    static constexpr uint32_t kEventSrdyActivity = (1 << 7);
     static constexpr uint32_t kEventActiveState = (1 << 11);  // Set when entered active state with DMA ready
 
     static constexpr uint32_t kEventMainTaskDone = (1 << 8);
@@ -457,7 +472,8 @@ private:
 
     // SRDY interrupt configuration constants
     static constexpr bool kSrdyInterruptForWakeup = true;   // Low level trigger for light sleep wakeup
-    static constexpr bool kSrdyInterruptForAck = false;    // Edge detection for SRDY high (ACK)
+    static constexpr bool kSrdyInterruptForAck =
+        false;  // Any-edge detection: SRDY 任意沿活动即视作 ACK
 
     // Handshake magic bytes
     static constexpr uint8_t kHandshakeRequest[] = {

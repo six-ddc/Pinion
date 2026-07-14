@@ -131,8 +131,17 @@ static bool load_model_catalog(void) {
 
 static TaskHandle_t g_worker_task;
 static SemaphoreHandle_t g_prompt_sem;
-static char g_pending_prompt[512];
-static volatile bool g_running = false; /* true while pi_agent_prompt() is on the stack */
+static SemaphoreHandle_t g_prompt_mutex; /* 保护 g_pending_prompt 指针 */
+static SemaphoreHandle_t
+    g_agent_mutex; /* 串行化 g_agent 的 abort 与 destroy/create（重建在 worker 线程） */
+static char* g_pending_prompt = NULL;           /* 动态分配，消费后 free：消除旧 512B 截断 */
+static volatile bool g_running = false;         /* true while pi_agent_prompt() is on the stack */
+static volatile bool g_rebuild_pending = false; /* new_session 请求，由 worker 消费做重建 */
+/* 会话代次：new_session（LVGL 线程）自增；worker 每轮开跑前快照到 g_active_gen，
+ * 打进它 enqueue 的每个事件；DrainQueueTick 丢弃 gen 与当前不符的旧会话残余事件。
+ * 32 位对齐读写在目标架构上原子，且只有 new_session 单线程写，volatile 够用。 */
+static volatile uint32_t g_session_gen = 0;
+static uint32_t g_active_gen = 0; /* 当前 run 所属代次，仅 worker 任务读写 */
 
 /* ---------- TTS（火山 volc_tts，text_delta 流式喂入） ----------
  * 会话状态（g_tts_session_open/g_tts_failed_this_run）只在 agent worker 任务
@@ -143,9 +152,15 @@ static volatile bool g_tts_enabled = true; /* 真值由 pi_screen 从 NVS 灌入
 static bool g_tts_session_open = false;
 static bool g_tts_failed_this_run = false;
 
+static void tts_stop_async(void);
+
 static void tts_on_error(int code, const char *msg, void *ctx) {
     (void)ctx;
     ESP_LOGW(TAG, "tts error %d: %s", code, msg);
+    /* 出错立即异步 stop：volc 层的 flush 已挪到持 api_lock 的收尾路径
+     * （emit_error 不再在 WS 回调里 FlushPlayback），不调 stop 的话已缓冲的
+     * 几秒音频会一直播到下一次 speak_begin 才被清。 */
+    tts_stop_async();
 }
 
 static const volc_tts_callbacks_t TTS_CBS = {.on_audio_start = NULL,
@@ -248,11 +263,70 @@ static void enqueue(pi_ui_kind_t kind, char *s1, char *s2, int i1, int i2) {
     evt.s2 = s2;
     evt.i1 = i1;
     evt.i2 = i2;
+    evt.gen = g_active_gen;
     QueueHandle_t q = pi_ui_queue();
     if (xQueueSend(q, &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "pi_ui_queue full, dropping evt kind=%d", (int)kind);
         free(s1);
         free(s2);
+    }
+}
+
+/* ---------- TEXT_DELTA 溢出缓冲（队列满时正文不丢）----------
+ * UI 事件队列（深 32）满时，enqueue 对非 TEXT_DELTA 事件丢弃可接受，但 TEXT_DELTA
+ * 一丢屏上就缺字。这里把入队失败的正文暂存到一个 malloc 增长的缓冲，下一次
+ * TEXT_DELTA（或 AGENT_END 冲洗）时 prepend 合并回流，保持字序。只在 worker 任务
+ * （on_event 同步跑在 worker 栈上）读写，无需锁；每轮 AGENT_START 清空以配合会话代次。 */
+static char* g_text_overflow = NULL;
+static size_t g_text_overflow_len = 0;
+
+static void text_overflow_clear(void) {
+    free(g_text_overflow);
+    g_text_overflow = NULL;
+    g_text_overflow_len = 0;
+}
+
+static void text_overflow_append(const char* s, size_t n) {
+    if (!s || n == 0)
+        return;
+    char* grown = (char*)realloc(g_text_overflow, g_text_overflow_len + n + 1);
+    if (!grown)
+        return; /* OOM：这段确实丢了，但已尽力，不崩 */
+    memcpy(grown + g_text_overflow_len, s, n);
+    g_text_overflow_len += n;
+    grown[g_text_overflow_len] = '\0';
+    g_text_overflow = grown;
+}
+
+/* TEXT_DELTA 专用入队：先把溢出缓冲与本次 delta 合并成一个事件再入队，入队失败
+ * 则整段（含合并进来的历史）退回溢出缓冲，绝不丢字。delta 传 NULL/空时仅冲洗
+ * 残留溢出（AGENT_END 收尾用）。 */
+static void enqueue_text_delta(const char* delta) {
+    size_t ol = g_text_overflow_len;
+    size_t dl = delta ? strlen(delta) : 0;
+    if (ol == 0 && dl == 0)
+        return;
+    char* merged = (char*)malloc(ol + dl + 1);
+    if (!merged) { /* 合并分配失败：溢出缓冲原样保留，把新 delta 也并进去，下次再试 */
+        text_overflow_append(delta, dl);
+        return;
+    }
+    if (ol)
+        memcpy(merged, g_text_overflow, ol);
+    if (dl)
+        memcpy(merged + ol, delta, dl);
+    merged[ol + dl] = '\0';
+    text_overflow_clear(); /* 历史溢出已转移进 merged */
+    pi_ui_evt_t evt;
+    evt.kind = UI_TEXT_DELTA;
+    evt.s1 = merged;
+    evt.s2 = NULL;
+    evt.i1 = 0;
+    evt.i2 = 0; /* 诚实化：流式期间不发序号，输出量以 DONE 的 usage 为准 */
+    evt.gen = g_active_gen;
+    if (xQueueSend(pi_ui_queue(), &evt, 0) != pdTRUE) {
+        text_overflow_append(merged, ol + dl); /* 队列仍满：退回溢出，下段再回流 */
+        free(merged);
     }
 }
 
@@ -264,7 +338,6 @@ static uint64_t now_ms(void) {
 /* per-run cursors (single in-flight prompt at a time, reset at AGENT_START) */
 static bool s_thinking_open = false;
 static uint64_t s_tool_start_ms = 0;
-static int s_text_delta_seq = 0;
 /* latest assistant message's real usage (pi_usage_t), refreshed at every
  * MESSAGE_END so by AGENT_END it holds this run's final-turn numbers — the
  * AGENT_END event itself carries no message pointer (emit_simple zeroes it),
@@ -277,10 +350,10 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
     switch (ev->kind) {
     case PI_AG_EV_AGENT_START:
         s_thinking_open = false;
-        s_text_delta_seq = 0;
         s_last_usage_input = 0;
         s_last_usage_output = 0;
         g_tts_failed_this_run = false;
+        text_overflow_clear(); /* 新一轮：清掉上一轮/被打断轮残留的溢出正文 */
         enqueue(UI_AGENT_START, NULL, NULL, 0, 0);
         break;
 
@@ -322,8 +395,8 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
             break;
         case PI_AI_EV_TEXT_DELTA:
             if (ai->delta) {
-                enqueue(UI_TEXT_DELTA, strdup(ai->delta), NULL, 0, ++s_text_delta_seq);
-                tts_feed_delta(ai->delta); /* 边出字边播（worker 栈上同步喂） */
+                enqueue_text_delta(ai->delta); /* 队列满不丢字：并溢出缓冲后入队 */
+                tts_feed_delta(ai->delta);     /* 边出字边播（worker 栈上同步喂） */
             }
             break;
         default:
@@ -378,6 +451,7 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
             g_tts_session_open = false;
             volc_tts_speak_end();
         }
+        enqueue_text_delta(NULL); /* 冲掉结尾残留溢出正文，避免收尾缺字 */
         enqueue(UI_DONE, NULL, NULL, (int)s_last_usage_input, (int)s_last_usage_output);
         break;
 
@@ -428,14 +502,60 @@ static pi_agent_t *create_agent(void) {
     return pi_agent_create(&cfg);
 }
 
+/* worker 任务上下文重建 agent：new_session 请求下由 worker 自己做。此刻
+ * pi_agent_prompt() 一定已返回（下方 worker 循环里 destroy 只在 g_running=false 段
+ * 调），满足 pi_agent_destroy 的"run 结束后才能销毁"契约（pi_agent.h / 蓝图 R9），
+ * 无需 LVGL 线程自旋等待。销毁/重建窗口内 LVGL 线程仍可能调 pi_agent_task_abort
+ * （屏幕卸载路径不受 UI 状态门控），g_agent_mutex 把 abort 与 destroy/create 串行化。 */
+static void rebuild_agent(void) {
+    xSemaphoreTake(g_agent_mutex, portMAX_DELAY);
+    if (g_agent)
+        pi_agent_destroy(g_agent);
+#if PI_AGENT_TASK_USE_MOCK
+    pi_mock_deinit(&g_mock);
+    pi_mock_init(&g_mock, g_responses, 2, 24); /* resets mock.next -> replay from turn 1 */
+    g_env.transport = pi_mock_transport(&g_mock);
+#endif
+    /* models.json/catalog is not reloaded: it's an immutable embedded blob for
+     * the firmware's whole run, so a new session only needs a fresh agent. */
+    g_agent = create_agent();
+    xSemaphoreGive(g_agent_mutex);
+    if (!g_agent)
+        ESP_LOGE(TAG, "rebuild_agent: pi_agent_create failed");
+}
+
+/* 原子取出待处理 prompt 并置空；返回值所有权移交调用方（用完 free），无则 NULL。 */
+static char* take_pending_prompt(void) {
+    xSemaphoreTake(g_prompt_mutex, portMAX_DELAY);
+    char* p = g_pending_prompt;
+    g_pending_prompt = NULL;
+    xSemaphoreGive(g_prompt_mutex);
+    return p;
+}
+
 static void worker(void *arg) {
     (void)arg;
     for (;;) {
         xSemaphoreTake(g_prompt_sem, portMAX_DELAY);
+        /* 顺序保证：先处理 new_session 的重建，再消费 prompt，即使二者的 give 因
+         * 二值信号量合并成一个 token 也不漏——本轮把两件事都办掉。 */
+        if (g_rebuild_pending) {
+            g_rebuild_pending = false;
+            rebuild_agent();
+        }
+        char* prompt = take_pending_prompt();
+        if (!prompt)
+            continue;   /* 只是 new_session 的唤醒，无 prompt */
+        if (!g_agent) { /* 重建失败：丢弃该 prompt，不崩 */
+            free(prompt);
+            continue;
+        }
+        g_active_gen = g_session_gen; /* 本 run 所属代次，其事件据此打标 */
         g_running = true;
-        int rc = pi_agent_prompt(g_agent, g_pending_prompt);
+        int rc = pi_agent_prompt(g_agent, prompt);
         if (rc != PI_OK) ESP_LOGW(TAG, "pi_agent_prompt rc=%d", rc);
         g_running = false;
+        free(prompt);
     }
 }
 
@@ -455,6 +575,8 @@ void pi_agent_task_start(void) {
 
     pi_ui_queue();
     g_prompt_sem = xSemaphoreCreateBinary();
+    g_prompt_mutex = xSemaphoreCreateMutex();
+    g_agent_mutex = xSemaphoreCreateMutex();
     ensure_env();
     g_agent = create_agent();
     if (!g_agent) {
@@ -472,40 +594,43 @@ void pi_agent_task_send_prompt(const char *preset) {
         ESP_LOGW(TAG, "pi_agent_task_send_prompt: not started");
         return;
     }
-    snprintf(g_pending_prompt, sizeof(g_pending_prompt), "%s", preset ? preset : "");
+    char* dup = strdup(preset ? preset : ""); /* 动态分配，彻底消除旧 512B 截断 */
+    if (!dup) {
+        ESP_LOGE(TAG, "pi_agent_task_send_prompt: strdup OOM");
+        return;
+    }
+    xSemaphoreTake(g_prompt_mutex, portMAX_DELAY);
+    free(g_pending_prompt); /* 覆盖尚未消费的旧 prompt（正常有 UI 侧 s_agent_busy 拦截）*/
+    g_pending_prompt = dup;
+    xSemaphoreGive(g_prompt_mutex);
     xSemaphoreGive(g_prompt_sem);
 }
 
 void pi_agent_task_abort(void) {
     tts_stop_async(); /* STOP/打断：文字流与播报一起停 */
+    xSemaphoreTake(
+        g_agent_mutex,
+        portMAX_DELAY); /* 防撞 worker 的 rebuild 窗口（destroy/create 很快，阻塞可忽略） */
     if (g_agent) pi_agent_abort(g_agent);
+    xSemaphoreGive(g_agent_mutex);
 }
 
 void pi_agent_task_new_session(void) {
     if (!g_agent) return;
+    /* 非阻塞：只置标志 + 打断当前 run + 唤醒 worker；destroy+重建交给 worker 在它
+     * 自己的循环里做（它天然满足"pi_agent_prompt 返回后才能 destroy"，不需要 LVGL
+     * 线程自旋等待）。代次自增让旧 run 正在 unwind 的残余事件被 drain 丢弃。 */
+    g_session_gen++; /* 仅本函数（LVGL 线程）写，单写者，++ 安全 */
+    g_rebuild_pending = true;
     tts_stop_async();
-    pi_agent_abort(g_agent);
-    /* pi_agent_destroy() is UB while a run is in progress (pi_agent.h contract,
-     * blueprint R9): wait for worker()'s pi_agent_prompt() call to return
-     * (bounded — best-effort; abort() above is what actually unwinds the run). */
-    for (int waited_ms = 0; g_running && waited_ms < 2000; waited_ms += 10) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (g_running) {
-        ESP_LOGE(TAG, "pi_agent_task_new_session: worker still running, aborting rebuild");
-        return;
-    }
-    pi_agent_destroy(g_agent);
-#if PI_AGENT_TASK_USE_MOCK
-    pi_mock_deinit(&g_mock);
-    pi_mock_init(&g_mock, g_responses, 2, 24); /* resets mock.next -> replay from turn 1 */
-    g_env.transport = pi_mock_transport(&g_mock);
-#endif
-    /* models.json/catalog is not reloaded: it's an immutable embedded blob for
-     * the firmware's whole run, so a new session only needs a fresh agent. */
-    g_agent = create_agent();
-    if (!g_agent) ESP_LOGE(TAG, "pi_agent_task_new_session: pi_agent_create failed");
+    xSemaphoreTake(g_agent_mutex, portMAX_DELAY); /* 上一次重建可能仍在途，防打到悬空指针 */
+    if (g_agent)
+        pi_agent_abort(g_agent);
+    xSemaphoreGive(g_agent_mutex);
+    xSemaphoreGive(g_prompt_sem);
 }
+
+uint32_t pi_agent_task_session_gen(void) { return g_session_gen; }
 
 const char *pi_agent_model_name(void) {
 #if PI_AGENT_TASK_USE_MOCK

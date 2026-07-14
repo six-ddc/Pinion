@@ -176,6 +176,7 @@ uint32_t s_tool_start_ms = 0;
 int s_turn_tool_count = 0;
 std::string s_turn_last_tool_output;
 int s_out_tokens = 0;
+bool s_out_tokens_known = false;  // false until a real DONE.i2 exists (stream carries no count)
 int32_t s_ttfb_ms = -1;  // time to first text_delta this turn; -1 = not yet seen
 int s_ctx_pct = 0;
 bool s_ctx_known = false;  // false until a real DONE.i1 / context_window reading exists
@@ -1535,6 +1536,7 @@ void ResetTurnState() {
     s_turn_tool_count = 0;
     s_turn_last_tool_output.clear();
     s_out_tokens = 0;
+    s_out_tokens_known = false;
     s_in_tokens = 0;
     s_in_tokens_known = false;
     s_ttfb_ms = -1;
@@ -1600,23 +1602,29 @@ void ToolRunningTimerTick(lv_timer_t*) {
 }
 
 // "^"/"v" stand in for "↑"/"↓" (not in the mono font's ASCII+·°-only
-// subset). ^ only ever shows a real number once DONE has reported real
-// usage.input at least once this turn; before that (and forever, if the
-// bridge never sends it) it shows "--" rather than a fabricated count.
+// subset). Both counts only ever show a real number once DONE has reported
+// the real pi_usage_t this turn; before that (the stream carries no token
+// count) they show "--" rather than a fabricated / event-count number.
 void UpdateDockStat() {
     if (s_dock_stat_lbl == nullptr) return;
     char stat[80];
     char in_part[24];
+    char out_part[24];
     if (s_in_tokens_known) {
         std::snprintf(in_part, sizeof(in_part), "%d tok", s_in_tokens);
     } else {
         std::snprintf(in_part, sizeof(in_part), "-- tok");
     }
-    if (s_ttfb_ms >= 0) {
-        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %d tok\nttfb %dms", in_part,
-                      s_out_tokens, static_cast<int>(s_ttfb_ms));
+    if (s_out_tokens_known) {
+        std::snprintf(out_part, sizeof(out_part), "%d tok", s_out_tokens);
     } else {
-        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %d tok", in_part, s_out_tokens);
+        std::snprintf(out_part, sizeof(out_part), "-- tok");
+    }
+    if (s_ttfb_ms >= 0) {
+        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %s\nttfb %dms", in_part, out_part,
+                      static_cast<int>(s_ttfb_ms));
+    } else {
+        std::snprintf(stat, sizeof(stat), "^ %s \xc2\xb7 v %s", in_part, out_part);
     }
     lv_label_set_text(s_dock_stat_lbl, stat);
 }
@@ -1628,7 +1636,17 @@ void DrainQueueTick(lv_timer_t*) {
     int budget = 64;
     bool touched = false;
     bool stat_dirty = false;
+    // 会话代次过滤：new_session 后旧 run 仍在 unwind，其残余 TEXT_DELTA/TOOL_*
+    // 携带旧代次——直接丢弃，不污染新会话（也避免触碰已被 ClearFeed 清空的游标）。
+    uint32_t cur_gen = pi_agent_task_session_gen();
     while (budget-- > 0 && xQueueReceive(q, &evt, 0) == pdTRUE) {
+        if (evt.gen != cur_gen) {
+            if (evt.s1 != nullptr)
+                free(evt.s1);
+            if (evt.s2 != nullptr)
+                free(evt.s2);
+            continue;
+        }
         touched = true;
         switch (evt.kind) {
             case UI_AGENT_START:
@@ -1741,14 +1759,25 @@ void DrainQueueTick(lv_timer_t*) {
             case UI_TEXT_DELTA:
                 if (s_ttfb_ms < 0) s_ttfb_ms = static_cast<int32_t>(lv_tick_get() - s_turn_start_ms);
                 if (evt.s1 != nullptr) batched_text += evt.s1;
-                // Streaming approximation (per-turn i2 from TEXT_DELTA); DONE
-                // corrects both ^ and v to the real pi_usage_t values. The
-                // dock label itself is refreshed once per tick, after the
-                // loop -- not per event.
-                s_out_tokens = evt.i2;
+                // 流式期间没有真实输出 token 计数（bridge 契约：i2 保留不发序号），
+                // 故不更新 s_out_tokens——dock 的 "v" 显示占位 "-- tok"，直到 DONE
+                // 用真实 usage 校正。这里仍标脏，好让首个 delta 触发的 ttfb 刷上去。
                 stat_dirty = true;
                 break;
             case UI_DONE: {
+                // Symmetric with UI_ERROR: defensively stop the think/tool
+                // timers here too. Normally THINKING_END / TOOL_END already
+                // deleted them, but a turn can finish while one is still open
+                // (e.g. no matching END arrived) -- leaving a live timer would
+                // keep ticking a stale row into the next turn.
+                if (s_think_timer != nullptr) {
+                    lv_timer_delete(s_think_timer);
+                    s_think_timer = nullptr;
+                }
+                if (s_tool_running_timer != nullptr) {
+                    lv_timer_delete(s_tool_running_timer);
+                    s_tool_running_timer = nullptr;
+                }
                 if (!batched_text.empty()) {
                     AppendAssistantText(batched_text.c_str());
                     batched_text.clear();
@@ -1781,6 +1810,7 @@ void DrainQueueTick(lv_timer_t*) {
                 s_in_tokens = evt.i1;
                 s_in_tokens_known = true;
                 s_out_tokens = evt.i2;
+                s_out_tokens_known = true;
                 UpdateDockStat();
                 ApplyCtxUsage(static_cast<uint32_t>(evt.i1));
                 break;

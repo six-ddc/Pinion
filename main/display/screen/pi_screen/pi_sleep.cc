@@ -16,7 +16,6 @@ constexpr uint32_t kTickMs = 300;                // 唤醒响应粒度（Dim 下
 constexpr uint32_t kChatTimeoutMs = 120 * 1000;  // Chat 无操作回待机（固定值）
 constexpr uint32_t kDimToOffMs = 60 * 1000;      // Dim 再 60s 熄灭
 constexpr uint8_t kDimBrightness = 20;
-constexpr uint32_t kConfigRefreshTicks = 16;  // ~5s 重读一次 NVS "ui"/"sleep_s"
 
 enum class State { Awake, Dim, Off };
 
@@ -24,8 +23,7 @@ pi_sleep::Hooks s_hooks;
 lv_obj_t* s_shield = nullptr;  // Off 态置顶全屏拦截层（吞掉唤醒的第一次触摸）
 lv_timer_t* s_timer = nullptr;
 State s_state = State::Awake;
-int32_t s_sleep_s = 0;  // NVS "ui"/"sleep_s"（0=永不）
-uint32_t s_ticks = 0;
+int32_t s_sleep_s = 0;           // NVS "ui"/"sleep_s"（0=永不）
 uint32_t s_key_activity_ms = 0;  // 最近一次 PWR_KEY（lv_tick 时基；indev 感知不到按键）
 uint32_t s_anchor_ms = 0;        // 闸门/状态切换的计时重置锚点
 uint8_t s_user_brightness = 75;  // 进 Dim 前缓存的用户亮度（唤醒恢复用）
@@ -100,10 +98,6 @@ void OnShieldReleased(lv_event_t*) {
 }
 
 void Tick(lv_timer_t*) {
-    s_ticks++;
-    if (s_ticks % kConfigRefreshTicks == 0)
-        LoadConfig();  // 设置页改档兜底（正路是 ReloadConfig()）
-
     if (s_hooks.is_gated != nullptr && s_hooks.is_gated()) {
         ResetIdleAnchor();  // 闸门期间计时持续重置
         if (s_state != State::Awake)
@@ -148,7 +142,6 @@ namespace pi_sleep {
 void Start(lv_obj_t* screen, const Hooks& hooks) {
     s_hooks = hooks;
     s_state = State::Awake;
-    s_ticks = 0;
     s_key_activity_ms = lv_tick_get();
     ResetIdleAnchor();
     LoadConfig();
@@ -180,6 +173,7 @@ bool ConsumeKeyWake() {
     return false;
 }
 
+// 配置更新的唯一入口（设置页改档走这里）；新增写者必须调用。
 void ReloadConfig() { LoadConfig(); }
 
 bool IsAwake() { return s_state == State::Awake; }

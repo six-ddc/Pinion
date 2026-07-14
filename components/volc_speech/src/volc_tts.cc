@@ -54,7 +54,9 @@ struct TtsState {
     volatile bool session_active;
     volatile bool pending_finish;  // SessionFinished 已到，待播放队列排空
     volatile bool discard_audio;   // 打断后丢弃迟到的下行音频
+    volatile bool flush_pending;   // 出错路径记账：待收尾路径清空播放队列
     volatile bool audio_started;
+    uint32_t playback_gen;   // 本会话开始时捕获的播放代次（打断残音竞态收口）
     size_t dropped_samples;  // 本会话因 Feed 超时丢弃的样本数（诊断）
     // WS 消息重组
     uint8_t* rx;
@@ -83,10 +85,15 @@ static void tts_emit_error(TtsState* s, int code, const char* msg,
     ESP_LOGE(TAG, "error %d: %s", code, buf);
     s->session_active = false;
     s->pending_finish = false;
-    // 出错即打断：清掉缓冲余音（大队列下可能还有数十秒），迟到帧不再入队，
-    // 避免 UI 已进错误态扬声器还在播。
+    // 出错即打断，但本函数跑在 WS 事件任务上：FlushPlayback 内含最多数百 ms
+    // 忙等（等在途喂入退出 + 等在写残帧落地），在此调用会冻结 WS 收发（含
+    // ping/pong）。故只置标志——discard_audio 令迟到的下行帧不再入队，flush_pending
+    // 记账缓冲余音待清；真正 FlushPlayback 挪到持 api_lock 的收尾路径执行：
+    // barge-in 的 volc_tts_stop()，或下一次 volc_tts_speak_begin() 的清理。
+    // 依赖：出错后必有一条收尾路径被触达——UI 打断/STOP/新会话会调 stop，
+    // 否则下一轮播报的 speak_begin 会先清队列再开播。
     s->discard_audio = true;
-    mhal::audio_pipeline::FlushPlayback();
+    s->flush_pending = true;
     volc_tts_callbacks_t c = tts_cbs_snapshot(s);
     if (c.on_error) c.on_error(code, buf, c.ctx);
     xEventGroupSetBits(s->eg, BIT_FAILED | BIT_DONE);
@@ -99,10 +106,11 @@ static void tts_enqueue_audio(TtsState* s, const uint8_t* pcm, size_t len) {
         volc_tts_callbacks_t c = tts_cbs_snapshot(s);
         if (c.on_audio_start) c.on_audio_start(c.ctx);
     }
-    // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓）；打断时管线立即丢弃
+    // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓）；打断时管线立即丢弃。
+    // 带本会话代次：喂入与入队之间若发生打断（FlushPlayback），管线按已消费丢弃。
     size_t want = len / 2;
-    size_t fed = mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, want,
-                                                    TTS_FEED_TIMEOUT_MS);
+    size_t fed = mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, want, TTS_FEED_TIMEOUT_MS,
+                                                    s->playback_gen);
     if (fed < want && !s->discard_audio) {
         // 背压 10s 仍塞不进：正常只在播放端停摆（I2S 掉时钟）时走到。
         // 打断（discard_audio）导致的部分喂入是预期路径，不计。
@@ -378,6 +386,13 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     }
 
     if (err == ESP_OK) {
+        // 承接上一场出错路径延迟下来的打断：清掉可能残留的缓冲余音
+        // （tts_emit_error 只置 flush_pending，不在 WS 上下文 flush）。此处持
+        // api_lock，是收尾路径之一。
+        if (s->flush_pending) {
+            mhal::audio_pipeline::FlushPlayback();
+            s->flush_pending = false;
+        }
         xSemaphoreTake(s->cbs_lock, portMAX_DELAY);
         s->cbs = *cbs;
         xSemaphoreGive(s->cbs_lock);
@@ -385,6 +400,9 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
         s->audio_started = false;
         s->pending_finish = false;
         s->dropped_samples = 0;
+        // 捕获当前播放代次：本会话喂入的每帧都带上它（见 tts_enqueue_audio）。
+        // 必须在上面可能的 FlushPlayback（会 ++gen）之后取。
+        s->playback_gen = mhal::audio_pipeline::PlaybackGen();
         volc_gen_uuid(s->session_id);
         xEventGroupClearBits(s->eg, BIT_SESS_STARTED | BIT_SESS_FINISHED |
                                         BIT_SESS_CANCELED | BIT_FAILED |
@@ -472,7 +490,8 @@ void volc_tts_stop(void) {
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
     s->discard_audio = true;    // 迟到的下行音频直接丢
     s->pending_finish = false;  // 短路排空回调，不再触发 on_finished
-    mhal::audio_pipeline::FlushPlayback();
+    mhal::audio_pipeline::FlushPlayback();  // 收尾路径：连同出错延迟的清空一起做
+    s->flush_pending = false;
     if (s->session_active) {
         s->session_active = false;
         if (tts_send_event(s, VOLC_EVT_CANCEL_SESSION, s->session_id, "{}") ==

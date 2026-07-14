@@ -69,7 +69,6 @@ public:
 
 private:
     void OnEvent(mhal::network::Event event, const std::string& data = "");
-    static void OnNetworkReadyTimeout(void* arg);
     // 在 modem 回调上下文之外异步 Stop()（原 Application::Schedule 语义，
     // 用一次性 task 实现）。
     void AsyncStop();
@@ -89,8 +88,12 @@ private:
 
     mhal::network::EventCallback event_callback_;
     esp_pm_lock_handle_t pm_lock_cpu_max_ = nullptr;
-    esp_timer_handle_t network_ready_timer_ = nullptr;
-    EventGroupHandle_t network_wait_event_ = nullptr;
+    // modem 回调（modem 任务上下文）与 Start()（网络任务）并发访问：Start
+    // 用 exchange(nullptr) 摘下句柄后再删，回调 load 到局部非空才 SetBits。
+    // 注意这只收窄不消灭窗口（回调 load 到非空后被抢占、Start 恰好删除仍可
+    // 命中已释放句柄）——常态路径靠"超时/失败即 Stop 停机"保证无存活回调，
+    // 此处是针对极端时序的保险层。
+    std::atomic<EventGroupHandle_t> network_wait_event_{nullptr};
 
     // 信号/注册态缓存 + 后台刷新任务
     TaskHandle_t signal_task_ = nullptr;

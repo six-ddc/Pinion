@@ -6,6 +6,17 @@
 
 #define TAG "BTAudioCodec"
 
+// I2S 读写有界超时：正常一帧（≤200ms 音频）远快于此；超时只在 BT 模组掉时钟
+// （未上电/PowerCycle/复位）时命中——此时返回 0 而非无限阻塞，让上层采集/播放
+// 循环能继续轮询 stop_requested，使 StopCapture / FlushPlayback 可靠收尾。
+static constexpr uint32_t kI2sRwTimeoutMs = 200;
+
+// 32bit I2S slot 取 16bit 有效样本的右移量：本 codec 的有效音频落在 slot 高位，
+// 右移 12 位后再钳到 int16，相对"直接取低 16bit"多保留 4bit ≈ ×16 电平提升，
+// 高电平输入会在下面的 INT16 饱和处削顶。采集侧能量 VAD 阈值即标定在此电平上
+// （见 audio_pipeline.h CaptureConfig）：换 codec 或改此移位量需同步重标 VAD。
+static constexpr int kRxSampleShift = 12;
+
 BTAudioCodec::~BTAudioCodec()
 {
     if (rx_handle_ != nullptr)
@@ -96,8 +107,15 @@ int BTAudioCodec::Write(const int16_t *data, int samples)
         buffer[i * 2 + 1] = processed_sample; // 右声道（复制相同的数据）
     }
 
-    size_t bytes_written;
-    ESP_ERROR_CHECK(i2s_channel_write(tx_handle_, buffer.data(), samples * 2 * sizeof(int32_t), &bytes_written, portMAX_DELAY));
+    size_t bytes_written = 0;
+    // 有界超时而非 portMAX_DELAY：掉时钟时不无限阻塞（也不再用 ESP_ERROR_CHECK
+    // 把超时升级成 abort）。超时返回已写字节（通常 0），上层播放循环对 0 温和处理。
+    esp_err_t err = i2s_channel_write(tx_handle_, buffer.data(), samples * 2 * sizeof(int32_t),
+                                      &bytes_written, pdMS_TO_TICKS(kI2sRwTimeoutMs));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Write timeout/err (%s), wrote %u/%u bytes", esp_err_to_name(err),
+                 (unsigned)bytes_written, (unsigned)(samples * 2 * sizeof(int32_t)));
+    }
     // 返回写入的采样点数量（以单声道计算）
     return bytes_written / (2 * sizeof(int32_t));
 }
@@ -107,16 +125,22 @@ int BTAudioCodec::Read(int16_t *dest, int samples)
     size_t bytes_read;
 
     std::vector<int32_t> bit32_buffer(samples);
-    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Read Failed!");
+    // 有界超时而非 portMAX_DELAY：掉时钟时不把采集任务钉死，让 StopCapture 的
+    // join 可靠。超时返回 0，上层采集循环温和轮询 stop_requested。超时不打日志
+    // （掉时钟时每 200ms 一条会刷屏，静音由采集侧 mic 电平日志体现）；仅真正的
+    // 读错误告警。
+    esp_err_t err = i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t),
+                                     &bytes_read, pdMS_TO_TICKS(kI2sRwTimeoutMs));
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_TIMEOUT)
+            ESP_LOGW(TAG, "Read failed: %s", esp_err_to_name(err));
         return 0;
     }
 
     samples = bytes_read / sizeof(int32_t);
     for (int i = 0; i < samples; i++)
     {
-        int32_t value = bit32_buffer[i] >> 12;
+        int32_t value = bit32_buffer[i] >> kRxSampleShift;
         dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX
                                                                          : (int16_t)value;
     }

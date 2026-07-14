@@ -430,7 +430,6 @@ void MdView::FinalizeBlock(const Block& blk) {
         if (w.label != nullptr) last_finalized_label_ = w.label;
     }
     finalized_count_++;
-    tail_fence_cjk_ = false;
     finalized_blocks_.push_back(blk);  // retained so Retheme can re-render
 }
 
@@ -444,18 +443,12 @@ void MdView::RenderTail() {
         last_label_ = last_finalized_label_;
         return;
     }
-    bool rebuild = tail_.root == nullptr || tail_type_ != open->type;
     // level feeds the widget at creation time (heading color/margin, ordinal)
-    if (!rebuild && (open->type == BlockType::kHeading || open->type == BlockType::kOrdered) &&
-        tail_level_ != open->level) {
-        rebuild = true;
-    }
+    bool rebuild = tail_.root == nullptr || tail_type_ != open->type;
     if (rebuild) {
         if (tail_.root != nullptr) lv_obj_delete(tail_.root);
         tail_ = CreateBlockWidget(*open);
         tail_type_ = open->type;
-        tail_level_ = open->level;
-        tail_fence_cjk_ = false;
         tail_rev_ = parser_.OpenRevision() - 1;  // force the text apply below
     }
     if (tail_rev_ != parser_.OpenRevision()) {
@@ -492,11 +485,10 @@ BlockWidget MdView::CreateBlockWidget(const Block& blk) {
 void MdView::ApplyBlockText(const BlockWidget& w, const Block& blk) {
     if (w.label == nullptr) return;
     if (blk.type == BlockType::kFence) {
+        // blk.text is the fence's full accumulated body (not a delta), so this
+        // is monotonic across a streaming tail: once any CJK byte appears the
+        // check stays true on every later call without needing extra state.
         bool cjk = HasNonAscii(blk.text);
-        if (w.root == tail_.root) {  // sticky while streaming so the font never flips back
-            tail_fence_cjk_ = tail_fence_cjk_ || cjk;
-            cjk = tail_fence_cjk_;
-        }
         lv_obj_set_style_text_font(w.label, cjk ? theme_.mono_cjk : theme_.mono, LV_PART_MAIN);
         lv_label_set_text(w.label, blk.text.c_str());
         return;

@@ -49,13 +49,22 @@ void Backlight::SetBrightness(uint8_t brightness, bool permanent) {
         brightness = 100;
     }
 
-    if (brightness_ == brightness) {
-        return;
+    if (permanent) {
+        // 无条件落盘：brightness_ 是渐变定时器追赶中的中间态，不能拿它来判断
+        // 要不要写 NVS，否则"拖动预览 + 松手落盘"模式下松手那次必被短路吞掉。
+        // 用 last_persisted_brightness_ 去重，避免同一目标值重复擦写 NVS。
+        if (!persisted_ || last_persisted_brightness_ != brightness) {
+            Settings settings("display", true);
+            settings.SetInt("brightness", brightness);
+            last_persisted_brightness_ = brightness;
+            persisted_ = true;
+        }
     }
 
-    if (permanent) {
-        Settings settings("display", true);
-        settings.SetInt("brightness", brightness);
+    // 渐变提前返回：改比较 target_brightness_，目标未变且已到位才 return，
+    // 不再用会被中间态污染的 brightness_ 判断。
+    if (target_brightness_ == brightness && brightness_ == brightness) {
+        return;
     }
 
     target_brightness_ = brightness;

@@ -96,9 +96,10 @@ void CaptureTask(void*) {
     int dbg_peak = 0;
     while (!s_cap.stop_requested) {
         int got = mhal::audio::ReadPcm(buf, frame_samples);
-        // ReadPcm 底层是 I2S slave 的 portMAX_DELAY 阻塞读，可能跨越停止点
-        // 才返回。若此间已 StopCapture（并随后 volc_asr_stop 注销了会话），
-        // 绝不能再把这最后一帧喂给已释放的消费者——立即退出。
+        // ReadPcm 底层是 I2S slave 的有界阻塞读（bt_audio_codec 里 200ms 超时）：
+        // 停止后最多一个超时周期即返回。若返回时已 StopCapture（并随后
+        // volc_asr_stop 注销了会话），绝不能再把这最后一帧喂给已释放的消费者
+        // ——立即退出。BT 模组掉时钟时 got 会持续为 0，下面的分支温和轮询。
         if (s_cap.stop_requested) break;
         if (got <= 0) {
             vTaskDelay(pdMS_TO_TICKS(s_cap.cfg.frame_ms));
@@ -148,12 +149,13 @@ bool StartCapture(const CaptureConfig& cfg, CaptureCallbacks cbs) {
 void StopCapture() {
     if (!s_cap.running) return;
     s_cap.stop_requested = true;
-    // 正常情况下采集任务在一帧内（≤frame_ms）就看到 stop_requested 退出。
-    // 但 ReadPcm 底层是 I2S slave 的 portMAX_DELAY 阻塞读：BT 模组掉时钟
-    // （未上电/PowerCycle/复位）时会长时间无法返回。join 加超时，避免把调用
-    // 线程（pi_voice 语音控制任务）一起拖死——超时后放弃 join，任务自行退出
-    // 且已被上面的 stop 守卫拦住不会再触碰消费者。最坏是下一轮 StartCapture
-    // 因 running 未清而暂时失败，而非整条语音链死锁。
+    // ReadPcm 底层是 I2S slave 的有界阻塞读（bt_audio_codec 里 200ms 超时）：
+    // 即便 BT 模组掉时钟（未上电/PowerCycle/复位），采集任务也会在 ≤200ms 内
+    // 从 ReadPcm 返回并看到 stop_requested 退出、清零 running，故 1000ms join
+    // 正常必然成功。下面的超时放弃仅作极端兜底（如底层驱动异常长时间不返回），
+    // 避免把调用线程（pi_voice 语音控制任务）拖死——放弃后任务仍会自行退出且
+    // 已被 stop 守卫拦住不再触碰消费者，最坏是下一轮 StartCapture 因 running
+    // 未清而暂时失败，而非整条语音链死锁。
     const int kJoinTimeoutMs = 1000;
     int waited = 0;
     while (s_cap.running && waited < kJoinTimeoutMs) {
@@ -184,6 +186,7 @@ struct PlaybackState {
     volatile bool had_data = false;  // 本轮是否播放过数据（排空回调条件）
     volatile bool prebuffering = true;  // 下批数据到达时先做低水位预积累
     std::atomic<int> feeding{0};     // 在途 FeedPlayback 数（Flush 竞态收口）
+    std::atomic<uint32_t> gen{0};    // 播放代次，每次 FlushPlayback 进入即 ++
     std::mutex drained_mutex;
     std::function<void()> drained_cb;
 };
@@ -279,11 +282,21 @@ bool EnsurePlayback(const PlaybackConfig& cfg) {
     return true;
 }
 
-size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
+uint32_t PlaybackGen() { return s_play.gen.load(); }
+
+size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms,
+                    uint32_t expected_gen) {
     if (!s_play.rb || samples == 0) return 0;
     if (s_play.flushing) return samples;  // 打断中：静默丢弃
 
     s_play.feeding++;
+    // 代次校验：feeding++ 与入队之间若已发生 FlushPlayback（gen 已 ++），本帧
+    // 属于被打断的上一轮，不入队、按已消费丢弃。补齐了"喂入方过了自身 discard
+    // 检查、尚未 feeding++"窗口里 flushing 已被清回、这帧被当新一轮播出的竞态。
+    if (s_play.gen.load() != expected_gen) {
+        s_play.feeding--;
+        return samples;
+    }
     const auto* src = (const uint8_t*)pcm;
     size_t remaining = samples * sizeof(int16_t);
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -302,8 +315,16 @@ size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
     return samples - remaining / sizeof(int16_t);
 }
 
+// 三参兼容重载：期望代次取当前值，即不做代次校验（保留既有调用方语义）。
+size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
+    return FeedPlayback(pcm, samples, timeout_ms, s_play.gen.load());
+}
+
 void FlushPlayback() {
     if (!s_play.rb) return;
+    // 一进来即自增代次：晚于此刻读代次的喂入方（FeedPlayback 带 expected_gen
+    // 重载）会看到不等而丢弃本轮迟到帧，见 FeedPlayback。
+    s_play.gen.fetch_add(1);
     s_play.flushing = true;
     // 清空队列（播放任务同时在 flushing 下丢弃，二者并发消费无害）
     size_t got = 0;

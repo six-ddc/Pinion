@@ -40,8 +40,8 @@ using EventCallback = std::function<void(Event event, const std::string& data)>;
 // 必须在 Start 之前注册才能收到起网过程事件。
 void OnEvent(EventCallback cb);
 
-// 按当前 Type 起网。阻塞（Wi-Fi 最长 60s；4G 检测+注册最长约 90s），
-// 返回是否已连通。在专用任务里调，或直接用 StartAsync()。
+// 按当前 Type 起网。阻塞（Wi-Fi 最长 60s；4G 检测+注册最长约 60s，
+// 单一权威时限），返回是否已连通。在专用任务里调，或直接用 StartAsync()。
 bool Start();
 // xTaskCreate 包装：后台起网，结果通过 OnEvent 观察。
 void StartAsync();

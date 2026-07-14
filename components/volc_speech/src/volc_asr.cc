@@ -5,11 +5,13 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
+#include "freertos/task.h"
 
 #include "volc_proto.h"
 
@@ -29,21 +31,36 @@ static const char* TAG = "volc_asr";
 #define ASR_SEGMENT_BYTES (ASR_SAMPLE_RATE * 2 * ASR_SEGMENT_MS / 1000)
 #define ASR_CONNECT_TIMEOUT_MS 10000
 #define ASR_SEND_TIMEOUT_MS 5000
+// 采集→上行任务的有界 PCM 队列：~2s 音频余量（网络抖动缓冲）。
+#define ASR_UPLINK_QUEUE_BYTES (ASR_SAMPLE_RATE * 2 * 2000 / 1000)
+#define ASR_UPLINK_STACK 6144  // 栈：gzip(volc_build_asr_audio) + TLS 写，对齐采集任务
+#define ASR_UPLINK_PRIO 5      // I/O 型，低于采集(8)、高于空闲
+// 等上行任务退出的超时：需 > 单次 asr_send 的 TLS 写超时（任务最坏卡在一次
+// send 里，超时返回后才看 abort/finish 标志退出）。
+#define ASR_UPLINK_EXIT_TIMEOUT_MS 7000
+#define ASR_UPLINK_POLL_MS 100  // 队列空时的轮询周期（及时响应 finish/abort）
 
 #define BIT_CONNECTED BIT0
 #define BIT_FINAL BIT1
 #define BIT_ERROR BIT2
+#define BIT_UPLINK_EXIT BIT3  // 上行任务已退出
 
 struct AsrSession {
     esp_websocket_client_handle_t ws;
     volc_asr_callbacks_t cbs;
     EventGroupHandle_t eg;
-    SemaphoreHandle_t lock;   // 保护发送路径与 pending 缓冲
     char* headers;            // 含密钥，仅传给 WS 客户端，不打日志
+    // 上行解耦：feed 只把 PCM 塞入有界队列（非阻塞），专用上行任务取出做
+    // 200ms 分段 + gzip + TLS 写。seq/pending/finish_sent 均只由上行任务读写。
+    RingbufHandle_t pcm_rb;
+    TaskHandle_t uplink_task;
+    volatile bool finish_requested;  // stop 请求：搬完队列 + 末段上传后退出
+    volatile bool abort_requested;   // teardown 请求：立即退出，不再发送
+    size_t dropped_bytes;            // 队列满丢弃的 PCM 字节（诊断）
     int32_t seq;
-    bool finish_sent;
-    bool failed;
-    // 200ms 分段聚合
+    volatile bool finish_sent;
+    volatile bool failed;
+    // 200ms 分段聚合（上行任务私有）
     uint8_t pending[ASR_SEGMENT_BYTES];
     size_t pending_len;
     // WS 消息重组（esp_websocket_client 按 buffer_size 分片投递）
@@ -200,15 +217,75 @@ static esp_err_t asr_send(AsrSession* s, const uint8_t* frame, size_t len) {
     return sent == (int)len ? ESP_OK : ESP_FAIL;
 }
 
+// 把当前 pending 段（gzip 后）上传。last=true 为末段（负序号）。仅上行任务调用。
+static void asr_flush_segment(AsrSession* s, bool last) {
+    size_t frame_len = 0;
+    uint8_t* frame = volc_build_asr_audio(s->seq, last, s->pending, s->pending_len, &frame_len);
+    s->pending_len = 0;
+    if (!frame) {
+        asr_emit_error(s, -ESP_ERR_NO_MEM, "asr frame alloc");
+        return;
+    }
+    esp_err_t err = asr_send(s, frame, frame_len);
+    free(frame);
+    if (err != ESP_OK) {
+        // teardown 期间的写失败是预期噪声，不当业务错误上报。
+        if (!s->abort_requested)
+            asr_emit_error(s, -ESP_FAIL, "asr uplink send failed");
+        return;
+    }
+    s->seq++;
+}
+
+// 上行任务：从有界队列取 PCM，聚成 200ms 段上传。把 gzip+TLS 写从采集任务
+// （on_frame → volc_asr_feed）解耦，网络阻塞只在此任务侧积压，绝不回压 I2S RX。
+static void asr_uplink_task(void* arg) {
+    auto* s = static_cast<AsrSession*>(arg);
+    while (!s->abort_requested && !s->failed) {
+        size_t got = 0;
+        auto* chunk = (uint8_t*)xRingbufferReceiveUpTo(
+            s->pcm_rb, &got, pdMS_TO_TICKS(ASR_UPLINK_POLL_MS), ASR_SEGMENT_BYTES - s->pending_len);
+        if (chunk) {
+            memcpy(s->pending + s->pending_len, chunk, got);
+            s->pending_len += got;
+            vRingbufferReturnItem(s->pcm_rb, chunk);
+            if (s->pending_len == ASR_SEGMENT_BYTES)
+                asr_flush_segment(s, false);
+            continue;  // 尽快继续搬运
+        }
+        if (s->finish_requested)
+            break;  // 队列已空且收到收尾请求
+    }
+    // 正常收尾：残余 pending（可为空）作为末段上传。abort/failed 时跳过。
+    if (s->finish_requested && !s->abort_requested && !s->failed) {
+        s->finish_sent = true;
+        asr_flush_segment(s, true);
+    }
+    xEventGroupSetBits(s->eg, BIT_UPLINK_EXIT);
+    vTaskDelete(nullptr);
+}
+
 static void asr_destroy_locked_out(AsrSession* s) {
-    // 必须在非 WS 任务上下文调用。
+    // 必须在非 WS 任务、非上行任务上下文调用。
+    // 先停上行任务再拆连接：任务退出前仍在用 s->ws / pending / eg，不能提前
+    // close/destroy/free（UAF）。置 abort 后它当前那次 asr_send 最坏 5s（TLS
+    // 写超时）返回、再看 abort 退出，故等待超时取 > 单次 send 超时。正常 stop
+    // 路径此时任务已退出（BIT_UPLINK_EXIT 已置），等待立即返回。
+    s->abort_requested = true;
+    if (s->uplink_task) {
+        xEventGroupWaitBits(s->eg, BIT_UPLINK_EXIT, pdFALSE, pdFALSE,
+                            pdMS_TO_TICKS(ASR_UPLINK_EXIT_TIMEOUT_MS));
+    }
     // 会话结论至此已定，teardown 期间的 WS 事件都是噪声（服务端 final 后
     // 主动断连，close 帧写失败会触发 ERROR），先注销回调防止污染上层标志。
-    esp_websocket_unregister_events(s->ws, WEBSOCKET_EVENT_ANY, asr_ws_event);
-    esp_websocket_client_close(s->ws, pdMS_TO_TICKS(2000));
-    esp_websocket_client_destroy(s->ws);
+    if (s->ws) {
+        esp_websocket_unregister_events(s->ws, WEBSOCKET_EVENT_ANY, asr_ws_event);
+        esp_websocket_client_close(s->ws, pdMS_TO_TICKS(2000));
+        esp_websocket_client_destroy(s->ws);
+    }
     vEventGroupDelete(s->eg);
-    vSemaphoreDelete(s->lock);
+    if (s->pcm_rb)
+        vRingbufferDeleteWithCaps(s->pcm_rb);
     free(s->headers);
     free(s->rx);
     free(s->last_text);
@@ -224,19 +301,17 @@ esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs) {
     s->cbs = *cbs;
     s->seq = 1;
     s->eg = xEventGroupCreate();
-    s->lock = xSemaphoreCreateMutex();
 
     char request_id[37];
     volc_gen_uuid(request_id);
-    if (!s->eg || !s->lock ||
-        asprintf(&s->headers,
-                 "X-Api-Resource-Id: " ASR_RESOURCE_ID "\r\n"
-                 "X-Api-Request-Id: %s\r\n"
-                 "X-Api-Access-Key: " VOLC_ACCESS_KEY "\r\n"
-                 "X-Api-App-Key: " VOLC_APP_KEY "\r\n",
-                 request_id) < 0) {
-        if (s->eg) vEventGroupDelete(s->eg);
-        if (s->lock) vSemaphoreDelete(s->lock);
+    if (!s->eg || asprintf(&s->headers,
+                           "X-Api-Resource-Id: " ASR_RESOURCE_ID "\r\n"
+                           "X-Api-Request-Id: %s\r\n"
+                           "X-Api-Access-Key: " VOLC_ACCESS_KEY "\r\n"
+                           "X-Api-App-Key: " VOLC_APP_KEY "\r\n",
+                           request_id) < 0) {
+        if (s->eg)
+            vEventGroupDelete(s->eg);
         free(s);
         return ESP_ERR_NO_MEM;
     }
@@ -253,7 +328,6 @@ esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs) {
     s->ws = esp_websocket_client_init(&cfg);
     if (!s->ws) {
         vEventGroupDelete(s->eg);
-        vSemaphoreDelete(s->lock);
         free(s->headers);
         free(s);
         return ESP_FAIL;
@@ -296,6 +370,17 @@ esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs) {
         asr_destroy_locked_out(s);
         return err;
     }
+
+    // 有界 PCM 队列（PSRAM）+ 专用上行任务：把 gzip+TLS 写从采集任务解耦。
+    s->pcm_rb = xRingbufferCreateWithCaps(ASR_UPLINK_QUEUE_BYTES, RINGBUF_TYPE_BYTEBUF,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s->pcm_rb || xTaskCreate(asr_uplink_task, "asr_uplink", ASR_UPLINK_STACK, s,
+                                  ASR_UPLINK_PRIO, &s->uplink_task) != pdPASS) {
+        ESP_LOGE(TAG, "asr uplink queue/task create failed");
+        asr_destroy_locked_out(s);
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "session started");
     s_asr = s;
     return ESP_OK;
@@ -305,62 +390,32 @@ esp_err_t volc_asr_feed(const int16_t* pcm, size_t samples) {
     AsrSession* s = s_asr;
     if (!s) return ESP_ERR_INVALID_STATE;
     if (!pcm || samples == 0) return ESP_OK;
-
-    xSemaphoreTake(s->lock, portMAX_DELAY);
-    esp_err_t err = ESP_OK;
-    if (s->finish_sent || s->failed) {
-        err = ESP_ERR_INVALID_STATE;
-    } else {
-        const uint8_t* src = (const uint8_t*)pcm;
-        size_t remaining = samples * sizeof(int16_t);
-        while (remaining > 0 && err == ESP_OK) {
-            size_t space = ASR_SEGMENT_BYTES - s->pending_len;
-            size_t take = remaining < space ? remaining : space;
-            memcpy(s->pending + s->pending_len, src, take);
-            s->pending_len += take;
-            src += take;
-            remaining -= take;
-
-            if (s->pending_len == ASR_SEGMENT_BYTES) {
-                size_t frame_len = 0;
-                uint8_t* frame = volc_build_asr_audio(
-                    s->seq, false, s->pending, s->pending_len, &frame_len);
-                if (!frame) {
-                    err = ESP_ERR_NO_MEM;
-                } else {
-                    err = asr_send(s, frame, frame_len);
-                    free(frame);
-                    if (err == ESP_OK) s->seq++;
-                }
-                s->pending_len = 0;
-            }
-        }
+    if (s->finish_sent || s->finish_requested || s->failed) {
+        return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreGive(s->lock);
-    return err;
+    // 非阻塞入队，绝不回压调用方（采集任务，I2S RX 仅 ~90ms 余量，阻塞即溢出）。
+    // gzip+TLS 写全在上行任务侧；网络阻塞只在此队列积压。满则丢本帧并计数——
+    // 宁可丢新帧也不让采集侧停摆。
+    size_t bytes = samples * sizeof(int16_t);
+    if (xRingbufferSend(s->pcm_rb, pcm, bytes, 0) != pdTRUE) {
+        s->dropped_bytes += bytes;
+        ESP_LOGW(TAG, "uplink queue full: dropped %u bytes (session total %u)", (unsigned)bytes,
+                 (unsigned)s->dropped_bytes);
+    }
+    return ESP_OK;
 }
 
 esp_err_t volc_asr_stop(uint32_t final_timeout_ms) {
     AsrSession* s = s_asr;
     if (!s) return ESP_ERR_INVALID_STATE;
 
-    xSemaphoreTake(s->lock, portMAX_DELAY);
-    esp_err_t err = ESP_OK;
-    if (!s->finish_sent && !s->failed) {
-        s->finish_sent = true;
-        // 残余（可为空）作为末段：负序号，对齐参考实现 finish()
-        size_t frame_len = 0;
-        uint8_t* frame = volc_build_asr_audio(s->seq, true, s->pending,
-                                              s->pending_len, &frame_len);
-        s->pending_len = 0;
-        if (frame) {
-            err = asr_send(s, frame, frame_len);
-            free(frame);
-        } else {
-            err = ESP_ERR_NO_MEM;
-        }
-    }
-    xSemaphoreGive(s->lock);
+    // 请求上行任务把队列剩余 PCM 搬完、残余作为末段（负序号）上传后退出。
+    // 依赖不变量“先 StopCapture 再本函数”（见 volc_asr.h）：此刻不再有并发
+    // feed 往队列塞，任务可独占排空。
+    s->finish_requested = true;
+    xEventGroupWaitBits(s->eg, BIT_UPLINK_EXIT, pdFALSE, pdFALSE,
+                        pdMS_TO_TICKS(ASR_UPLINK_EXIT_TIMEOUT_MS));
+    esp_err_t err = s->failed ? ESP_FAIL : ESP_OK;
 
     if (err == ESP_OK && final_timeout_ms > 0) {
         EventBits_t bits =

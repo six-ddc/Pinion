@@ -1391,7 +1391,7 @@ void OnSleepSegClicked(lv_event_t* e) {
         Settings ui("ui", true);
         ui.SetInt("sleep_s", kSleepSecs[idx]);
     }
-    pi_sleep::ReloadConfig();  // 息屏状态机即时吃新档位（否则要等 ~5s 自动重读）
+    pi_sleep::ReloadConfig();  // 配置更新的唯一入口：写完 NVS 必须显式通知息屏状态机
     SegSetSelected(s_sleep_seg, 4, static_cast<int>(idx));
 }
 
