@@ -55,6 +55,10 @@ bool Enqueue(pi_ui_kind_t kind, char* s1, char* s2, char* s3, int i1, int i2) {
     evt.s3 = s3;
     evt.i1 = i1;
     evt.i2 = i2;
+    /* 打上当前 run 代次：否则 evt.gen 是栈上未初始化值，几乎必被 drain 的代次过滤器丢弃，
+     * 卡片声明式 UI 会整体失效。工具在 worker 线程 run 内同步执行，用 run 代次与本轮
+     * 文本事件保持一致过滤（barge-in 打断后旧 run 的迟到卡片据此被正确丢弃）。 */
+    evt.gen = pi_agent_task_run_gen();
     if (xQueueSend(pi_ui_queue(), &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "pi_ui_queue full, dropping card evt kind=%d", static_cast<int>(kind));
         free(s1);

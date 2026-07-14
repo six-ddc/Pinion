@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 
+#include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -198,6 +199,7 @@ uint32_t s_tool_start_ms = 0;
 int s_turn_tool_count = 0;
 std::string s_turn_last_tool_output;
 int s_out_tokens = 0;
+bool s_out_tokens_known = false;  // false until a real DONE.i2 exists (stream carries no count)
 int32_t s_ttfb_ms = -1;  // time to first text_delta this turn; -1 = not yet seen
 int s_ctx_pct = 0;
 bool s_ctx_known = false;  // false until a real DONE.i1 / context_window reading exists
@@ -1723,6 +1725,7 @@ void ResetTurnState() {
     s_turn_tool_count = 0;
     s_turn_last_tool_output.clear();
     s_out_tokens = 0;
+    s_out_tokens_known = false;
     s_in_tokens = 0;
     s_in_tokens_known = false;
     s_ttfb_ms = -1;
@@ -1806,27 +1809,34 @@ void ToolRunningTimerTick(lv_timer_t*) {
     lv_label_set_text(s_cur_tool_ret_lbl, buf);
 }
 
-// 单行消耗簇：IN 输入 token · OUT 输出 token · CTX 上下文占用率。IN 在 DONE
-// 首次上报真实 usage.input 前显示 "--"（不编造）；CTX 在拿到真实占用率前显示
-// "--"。ttfb（首字延迟）是开发指标、对使用无意义，已按用户反馈去掉；CTX 也不
-// 再画进度条，跟 IN/OUT 一样只写数字/百分比（原 "^"/"v" 亦改为直白的 IN/OUT）。
+// 单行消耗簇：IN 输入 token · OUT 输出 token · CTX 上下文占用率。三者都在 DONE
+// 上报真实 pi_usage_t 前显示 "--"（不编造）：流式不携带真实 token 计数，OUT 尤
+// 其不能拿流式序号充数（bridge 契约里 i2 已保留不发序号），CTX 也在拿到真实占用
+// 率前显示 "--"。ttfb（首字延迟）是开发指标、对使用无意义，已按用户反馈去掉；CTX
+// 也不再画进度条，跟 IN/OUT 一样只写数字/百分比（原 "^"/"v" 亦改为直白的 IN/OUT）。
 void UpdateDockStat() {
     if (s_dock_stat_lbl == nullptr) return;
     char stat[80];
     char in_part[16];
+    char out_part[16];
     char ctx_part[16];
     if (s_in_tokens_known) {
         std::snprintf(in_part, sizeof(in_part), "%d", s_in_tokens);
     } else {
         std::snprintf(in_part, sizeof(in_part), "--");
     }
+    if (s_out_tokens_known) {
+        std::snprintf(out_part, sizeof(out_part), "%d", s_out_tokens);
+    } else {
+        std::snprintf(out_part, sizeof(out_part), "--");
+    }
     if (s_ctx_known && pi_agent_context_window() > 0) {
         std::snprintf(ctx_part, sizeof(ctx_part), "%d%%", s_ctx_pct);
     } else {
         std::snprintf(ctx_part, sizeof(ctx_part), "--");
     }
-    std::snprintf(stat, sizeof(stat), "IN %s \xc2\xb7 OUT %d tok \xc2\xb7 CTX %s", in_part,
-                  s_out_tokens, ctx_part);
+    std::snprintf(stat, sizeof(stat), "IN %s \xc2\xb7 OUT %s tok \xc2\xb7 CTX %s", in_part,
+                  out_part, ctx_part);
     lv_label_set_text(s_dock_stat_lbl, stat);
 }
 
@@ -1837,7 +1847,19 @@ void DrainQueueTick(lv_timer_t*) {
     int budget = 64;
     bool touched = false;
     bool stat_dirty = false;
+    // 会话代次过滤：new_session 后旧 run 仍在 unwind，其残余 TEXT_DELTA/TOOL_*
+    // 携带旧代次——直接丢弃，不污染新会话（也避免触碰已被 ClearFeed 清空的游标）。
+    uint32_t cur_gen = pi_agent_task_session_gen();
     while (budget-- > 0 && xQueueReceive(q, &evt, 0) == pdTRUE) {
+        if (evt.gen != cur_gen) {
+            if (evt.s1 != nullptr)
+                free(evt.s1);
+            if (evt.s2 != nullptr)
+                free(evt.s2);
+            if (evt.s3 != nullptr)  // 卡片事件的 s3（root/props JSON）也需回收，别漏
+                free(evt.s3);
+            continue;
+        }
         touched = true;
         switch (evt.kind) {
             case UI_AGENT_START:
@@ -1956,14 +1978,25 @@ void DrainQueueTick(lv_timer_t*) {
                     // 显示不变；另外把 delta 剥成纯文本后按句喂 TTS（仅开 TTS 时）。
                     if (pi_agent_tts_enabled()) TtsExtractFeed(evt.s1);
                 }
-                // Streaming approximation (per-turn i2 from TEXT_DELTA); DONE
-                // corrects both ^ and v to the real pi_usage_t values. The
-                // dock label itself is refreshed once per tick, after the
-                // loop -- not per event.
-                s_out_tokens = evt.i2;
+                // 流式期间没有真实输出 token 计数（bridge 契约：i2 保留不发序号），
+                // 故不更新 s_out_tokens——dock 的 OUT 显示占位 "-- tok"，直到 DONE
+                // 用真实 usage 校正。这里仍标脏，好让首个 delta 触发的 ttfb 刷上去。
                 stat_dirty = true;
                 break;
             case UI_DONE: {
+                // Symmetric with UI_ERROR: defensively stop the think/tool
+                // timers here too. Normally THINKING_END / TOOL_END already
+                // deleted them, but a turn can finish while one is still open
+                // (e.g. no matching END arrived) -- leaving a live timer would
+                // keep ticking a stale row into the next turn.
+                if (s_think_timer != nullptr) {
+                    lv_timer_delete(s_think_timer);
+                    s_think_timer = nullptr;
+                }
+                if (s_tool_running_timer != nullptr) {
+                    lv_timer_delete(s_tool_running_timer);
+                    s_tool_running_timer = nullptr;
+                }
                 if (!batched_text.empty()) {
                     AppendAssistantText(batched_text.c_str());
                     batched_text.clear();
@@ -1998,6 +2031,7 @@ void DrainQueueTick(lv_timer_t*) {
                 s_in_tokens = evt.i1;
                 s_in_tokens_known = true;
                 s_out_tokens = evt.i2;
+                s_out_tokens_known = true;
                 UpdateDockStat();
                 ApplyCtxUsage(static_cast<uint32_t>(evt.i1));
                 break;

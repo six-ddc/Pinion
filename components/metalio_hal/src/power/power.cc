@@ -65,19 +65,59 @@ void BatteryBootGuard() {
     int level = 0;
     bool charging = false;
     bool discharging = false;
+
+    // 读不到 gauge 时的重试：沿用原有 5 次 / 100ms 间隔逻辑。
+    bool got_reading = false;
     for (int attempt = 0; attempt < 5; ++attempt) {
         if (gauge.GetBatteryLevel(level, charging, discharging)) {
-            ESP_LOGI(TAG, "Boot battery check: level=%d%%, charging=%s", level,
-                     charging ? "true" : "false");
-            if (level == 0 && !charging) {
-                ESP_LOGW(TAG, "Battery 0%%, forcing power off");
-                power::ForcePowerOff();
-            }
-            return;
+            got_reading = true;
+            break;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ESP_LOGW(TAG, "Boot battery check: gauge unavailable, skip shutdown");
+    if (!got_reading) {
+        ESP_LOGW(TAG, "Boot battery check: gauge unavailable, skip shutdown");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Boot battery check: level=%d%%, charging=%s", level,
+             charging ? "true" : "false");
+    if (level != 0 || charging) {
+        return;
+    }
+
+    // 首次采样命中"低电压且未充电"只是嫌疑，不能单次采样即触发不可逆的
+    // ForcePowerOff——紧跟在电源轨切换之后，瞬时耦合噪声可能骗到一次假读数。
+    // 间隔 ~50ms 连续复采几次防抖：任一次读到正常电压/充电立即放行；
+    // 只有全部复采都一致确认"低电压且未充电"才真正断电。
+    constexpr int kConfirmSamples = 5;
+    int confirmed = 0;
+    int low_count = 0;
+    for (int i = 0; i < kConfirmSamples; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        int confirm_level = 0;
+        bool confirm_charging = false;
+        bool confirm_discharging = false;
+        if (!gauge.GetBatteryLevel(confirm_level, confirm_charging, confirm_discharging)) {
+            continue;
+        }
+        ++confirmed;
+        if (confirm_level == 0 && !confirm_charging) {
+            ++low_count;
+        } else {
+            ESP_LOGI(TAG, "Boot battery check: normal reading during confirm, skip shutdown");
+            return;
+        }
+    }
+
+    if (confirmed > 0 && low_count == confirmed) {
+        ESP_LOGW(TAG, "Battery 0%% confirmed over %d/%d samples, forcing power off", low_count,
+                 confirmed);
+        power::ForcePowerOff();
+    } else {
+        ESP_LOGW(TAG, "Boot battery check: low-battery not confirmed (%d/%d valid), skip shutdown",
+                 confirmed, kConfirmSamples);
+    }
 }
 
 void StartWirelessChargeMonitor() {

@@ -13,6 +13,7 @@
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include "IOExpander.hpp"
@@ -32,6 +33,12 @@ ConnState s_conn_state = ConnState::Idle;
 std::string s_rx_buffer;
 Callbacks s_cbs;
 std::mutex s_cbs_mutex;
+
+// AT 序列必须原子：模组协议要求同一组指令间的 700ms/200ms 间隔不可被打断，
+// 而 ModeCmdTask/CallModeTask/MusicModeTask/BtResetTask 都是各自开任务、可能
+// 被快速连点交织触发。用一把模块级互斥量把每个任务函数体整体串行化——
+// 快速连点会排队依次执行，而不是交织出半截 AT 序列。
+SemaphoreHandle_t s_at_seq_mutex = nullptr;
 
 void EmitStatus(const char* text) {
     std::lock_guard<std::mutex> lock(s_cbs_mutex);
@@ -207,6 +214,8 @@ void ModeCmdTask(void* param) {
     const Mode mode = static_cast<Mode>(reinterpret_cast<intptr_t>(param));
     SimpleUart& uart = SimpleUart::getInstance();
 
+    xSemaphoreTake(s_at_seq_mutex, portMAX_DELAY);
+
     // 两条 AT 之间 700ms 间隔是模组协议要求。
     switch (mode) {
         case Mode::Rx:
@@ -237,6 +246,7 @@ void ModeCmdTask(void* param) {
             break;
     }
 
+    xSemaphoreGive(s_at_seq_mutex);
     vTaskDelete(nullptr);
 }
 
@@ -251,6 +261,7 @@ void SendModeCommand(Mode mode) {
 }
 
 void CallModeTask(void*) {
+    xSemaphoreTake(s_at_seq_mutex, portMAX_DELAY);
     SimpleUart& uart = SimpleUart::getInstance();
     EmitStatus("切换通话模式...");
     uart.sendString("AT+PP=1\r\n");
@@ -258,10 +269,12 @@ void CallModeTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(200));
     uart.sendString("AT+BTSCO=1\r\n");
     ESP_LOGI(TAG, "TX: AT+BTSCO=1");
+    xSemaphoreGive(s_at_seq_mutex);
     vTaskDelete(nullptr);
 }
 
 void MusicModeTask(void*) {
+    xSemaphoreTake(s_at_seq_mutex, portMAX_DELAY);
     SimpleUart& uart = SimpleUart::getInstance();
     EmitStatus("切换音乐模式...");
     uart.sendString("AT+BTSCO=0\r\n");
@@ -269,10 +282,12 @@ void MusicModeTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(200));
     uart.sendString("AT+PP=1\r\n");
     ESP_LOGI(TAG, "TX: AT+PP=1");
+    xSemaphoreGive(s_at_seq_mutex);
     vTaskDelete(nullptr);
 }
 
 void BtResetTask(void*) {
+    xSemaphoreTake(s_at_seq_mutex, portMAX_DELAY);
     EmitStatus("正在复位蓝牙...");
     auto& io = IOExpander::getInstance();
     io.setLevel(IOExpander::Pin::BT_POWER, false);
@@ -283,6 +298,7 @@ void BtResetTask(void*) {
     SetModeState(Mode::None);
     SetConnState(ConnState::Idle);
     EmitStatus("蓝牙电源已复位");
+    xSemaphoreGive(s_at_seq_mutex);
     vTaskDelete(nullptr);
 }
 
@@ -360,6 +376,10 @@ ConnState GetConnState() { return s_conn_state; }
 namespace mhal::internal {
 
 void InitBtModule(bool apply_default_mode) {
+    if (mhal::bt::s_at_seq_mutex == nullptr) {
+        mhal::bt::s_at_seq_mutex = xSemaphoreCreateMutex();
+    }
+
     SimpleUart& uart = SimpleUart::getInstance();
     if (!uart.begin(BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN, 115200, UART_NUM_2)) {
         ESP_LOGE(TAG, "BT UART initialization failed");

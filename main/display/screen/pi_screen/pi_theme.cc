@@ -98,7 +98,7 @@ namespace pi_theme {
 void Init() {
     Settings ui("ui", false);
     s_light = ui.GetInt("theme", 0) != 0;  // 0=深色 1=浅色（与设置页既有键一致）
-    RefreshStyles();                       // 惰性表通常尚未建，兜底重复 Init 也无害
+    RefreshStyles();                       // 单一调用点；惰性表此时尚未建，函数本身幂等
 }
 
 const Palette& PaletteOf(bool light) {

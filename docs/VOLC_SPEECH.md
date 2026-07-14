@@ -70,9 +70,13 @@ volc_tts_speak_end();                 // FinishSession；音频继续到达并�
 ```
 
 音频路径走播放管线：WS 任务 → `mhal::audio_pipeline::FeedPlayback`
-（64KB PSRAM 抖动队列 ≈2s，满则阻塞 WS 任务形成 TCP 背压）→ 播放任务
-写 I2S。100ms 低水位预启动防欠载；打断延迟 ≤128ms（单次写块上限）；
-播完由 `OnPlaybackDrained` 排空回调驱动 `on_finished`。
+（2MB PSRAM 抖动队列 ≈64s）→ 播放任务写 I2S。队列按"合成超前实时播放
+的典型积压量"定容，让整段应答尽快收进本地：喂入方长期阻塞会把 WS 连接
+压成 TCP zero-window（此间双向 ping/pong 全部冻结），服务端 slow-consumer
+超时断连即中途丢音频——队列满阻塞 WS 任务的背压 + 10s Feed 超时（丢弃
+有 WARN 日志与计数）仅作超长应答的安全网。100ms 低水位预启动防欠载；
+打断延迟 ≤128ms（单次写块上限）；播完由 `OnPlaybackDrained` 排空回调
+驱动 `on_finished`；出错/断连路径即时 Flush，不播缓冲余音。
 
 ## 音频管线（metalio_hal/audio_pipeline.h）
 
@@ -150,7 +154,7 @@ MetalioClaw5 按需取回；AFE（若将来纳入）同样工作在 16k，槽位
   ^1.3（zlib 本已被 esp_lvgl_adapter 间接拉入）。固件增量 ≈ 85KB
   （0x620030 → 0x634d20），app 分区仍余 48%。
 - 运行期：每条 WS 连接 1 个任务（6KB 栈）+ 4KB 收发缓冲；管线播放任务
-  （4KB 栈，常驻）+ 64KB PSRAM 抖动队列；采集任务（4KB 栈，仅录音期间）；
+  （4KB 栈，常驻）+ 2MB PSRAM 抖动队列；采集任务（4KB 栈，仅录音期间）；
   gzip 单流 ≈32KB（段级一次性）。
 - 回调上下文：ASR/TTS 事件回调运行在 WS 客户端任务，采集 `on_frame`/
   `on_vad` 在采集任务，`on_finished` 在播放任务——一律禁止阻塞/耗时操作

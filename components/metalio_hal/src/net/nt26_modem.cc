@@ -28,15 +28,6 @@ Nt26Modem::Nt26Modem(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t mrdy_pin,
 
     esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "nt26_cpu", &pm_lock_cpu_max_);
 
-    esp_timer_create_args_t timer_args = {
-        .callback = OnNetworkReadyTimeout,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "nt26_net_timer",
-        .skip_unhandled_events = true,
-    };
-    esp_timer_create(&timer_args, &network_ready_timer_);
-
     StartSignalWorker();
 }
 
@@ -45,14 +36,8 @@ Nt26Modem::~Nt26Modem() {
     // 必须在 modem_->Stop() 之前 join，避免 use-after-free。
     StopSignalWorker();
 
-    if (network_ready_timer_) {
-        esp_timer_stop(network_ready_timer_);
-        esp_timer_delete(network_ready_timer_);
-    }
-
-    if (network_wait_event_) {
-        vEventGroupDelete(network_wait_event_);
-        network_wait_event_ = nullptr;
+    if (auto* eg = network_wait_event_.exchange(nullptr)) {
+        vEventGroupDelete(eg);
     }
 
     if (modem_) {
@@ -70,15 +55,6 @@ void Nt26Modem::OnEvent(Event event, const std::string& data) {
     }
 }
 
-void Nt26Modem::OnNetworkReadyTimeout(void* arg) {
-    auto* self = static_cast<Nt26Modem*>(arg);
-    ESP_LOGW(TAG, "Network ready timeout");
-    if (self->network_wait_event_) {
-        xEventGroupSetBits(self->network_wait_event_, kWaitNetworkFailed);
-    }
-    self->OnEvent(Event::CellularErrorTimeout, "网络连接超时");
-}
-
 bool Nt26Modem::Start() {
     OnEvent(Event::ModemDetecting);
 
@@ -91,22 +67,24 @@ bool Nt26Modem::Start() {
         .srdy_pin = srdy_pin_,
     };
 
-    network_wait_event_ = xEventGroupCreate();
-    if (!network_wait_event_) {
+    EventGroupHandle_t eg = xEventGroupCreate();
+    if (!eg) {
         ESP_LOGE(TAG, "Failed to create network wait event group");
         OnEvent(Event::CellularErrorInitFailed);
         return false;
     }
+    network_wait_event_.store(eg);
 
     modem_ = std::make_unique<UartEthModem>(config);
     modem_->SetDebug(false);
     modem_->SetNetworkEventCallback([this](UartEthModem::UartEthModemEvent event) {
         ESP_LOGI(TAG, "Modem event: %s", UartEthModem::GetNetworkEventName(event));
+        // 回调运行在 modem 任务上下文：load 到局部再判空，避免与 Start()
+        // 摘句柄的 exchange 竞争后写已释放句柄。
         switch (event) {
             case UartEthModem::UartEthModemEvent::Connected:
-                esp_timer_stop(network_ready_timer_);
-                if (network_wait_event_) {
-                    xEventGroupSetBits(network_wait_event_, kWaitNetworkConnected);
+                if (auto* eg = network_wait_event_.load()) {
+                    xEventGroupSetBits(eg, kWaitNetworkConnected);
                 }
                 OnEvent(Event::CellularConnected);
                 break;
@@ -114,17 +92,15 @@ bool Nt26Modem::Start() {
                 OnEvent(Event::CellularDisconnected);
                 break;
             case UartEthModem::UartEthModemEvent::ErrorNoSim:
-                esp_timer_stop(network_ready_timer_);
-                if (network_wait_event_) {
-                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                if (auto* eg = network_wait_event_.load()) {
+                    xEventGroupSetBits(eg, kWaitNetworkFailed);
                 }
                 AsyncStop();
                 OnEvent(Event::CellularErrorNoSim);
                 break;
             case UartEthModem::UartEthModemEvent::ErrorRegistrationDenied:
-                esp_timer_stop(network_ready_timer_);
-                if (network_wait_event_) {
-                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                if (auto* eg = network_wait_event_.load()) {
+                    xEventGroupSetBits(eg, kWaitNetworkFailed);
                 }
                 AsyncStop();
                 OnEvent(Event::CellularErrorRegDenied);
@@ -134,17 +110,16 @@ bool Nt26Modem::Start() {
                 break;
             case UartEthModem::UartEthModemEvent::ErrorInitFailed:
             case UartEthModem::UartEthModemEvent::ErrorNoCarrier:
-                esp_timer_stop(network_ready_timer_);
-                if (network_wait_event_) {
-                    xEventGroupSetBits(network_wait_event_, kWaitNetworkFailed);
+                if (auto* eg = network_wait_event_.load()) {
+                    xEventGroupSetBits(eg, kWaitNetworkFailed);
                 }
                 AsyncStop();
                 OnEvent(Event::CellularErrorInitFailed);
                 break;
             case UartEthModem::UartEthModemEvent::InFlightMode:
                 ESP_LOGW(TAG, "Modem in flight mode");
-                if (network_wait_event_) {
-                    xEventGroupSetBits(network_wait_event_, kWaitNetworkInFlight);
+                if (auto* eg = network_wait_event_.load()) {
+                    xEventGroupSetBits(eg, kWaitNetworkInFlight);
                 }
                 break;
             case UartEthModem::UartEthModemEvent::RequestingPdpContext:
@@ -153,31 +128,45 @@ bool Nt26Modem::Start() {
     });
 
     if (modem_->Start() != ESP_OK) {
-        vEventGroupDelete(network_wait_event_);
-        network_wait_event_ = nullptr;
+        if (auto* g = network_wait_event_.exchange(nullptr)) {
+            vEventGroupDelete(g);
+        }
         OnEvent(Event::CellularErrorInitFailed);
         return false;
     }
 
-    esp_timer_start_once(network_ready_timer_, 30000 * 1000ULL);
     OnEvent(Event::CellularConnecting);
 
+    // 唯一权威时限：等 60s 事件组（原 30s network_ready_timer_ 已删除，
+    // 消除"30s 报超时、45s 又冒出已连接"的 late-connect）。
     ESP_LOGI(TAG, "Waiting for network ready...");
-    EventBits_t bits = xEventGroupWaitBits(network_wait_event_, kWaitNetworkAll, pdFALSE,
-                                           pdFALSE, pdMS_TO_TICKS(kNetworkWaitTimeoutMs));
-    vEventGroupDelete(network_wait_event_);
-    network_wait_event_ = nullptr;
+    EventBits_t bits = xEventGroupWaitBits(eg, kWaitNetworkAll, pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(kNetworkWaitTimeoutMs));
+    // 先原子摘下句柄再删，之后 modem 回调 load 到 nullptr 即不再 SetBits。
+    if (auto* g = network_wait_event_.exchange(nullptr)) {
+        vEventGroupDelete(g);
+    }
 
     if (bits & kWaitNetworkConnected) {
         ESP_LOGI(TAG, "Network ready");
         return true;
     }
     if (bits & kWaitNetworkInFlight) {
+        // 无 SIM / flight：保留 modem（AT 通道可用），不停机。
         ESP_LOGW(TAG, "Network unavailable (flight mode / no SIM)");
         return false;
     }
+    if (bits & kWaitNetworkFailed) {
+        // 错误回调已通过 AsyncStop() 停机，这里直接返回。
+        ESP_LOGW(TAG, "Network registration failed");
+        return false;
+    }
 
-    ESP_LOGW(TAG, "Network wait failed or timed out (bits=0x%lx)", (unsigned long)bits);
+    // 纯超时（60s 内无任何事件）：同步停机，杜绝返回后 modem 迟到 Connected。
+    ESP_LOGW(TAG, "Network wait timed out, stopping modem");
+    if (modem_) {
+        modem_->Stop();
+    }
     return false;
 }
 

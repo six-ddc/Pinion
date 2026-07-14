@@ -75,9 +75,7 @@ class MdView {
     lv_obj_t* root_ = nullptr;
     BlockWidget tail_{};
     BlockType tail_type_ = BlockType::kParagraph;
-    int tail_level_ = 0;
     uint32_t tail_rev_ = 0;
-    bool tail_fence_cjk_ = false;     // sticky mono->mono_cjk fallback for the open fence
     uint32_t finalized_count_ = 0;    // first block in the column gets margin_top 0
     lv_obj_t* last_label_ = nullptr;  // cursor anchor: tail label, else last finalized label
     lv_obj_t* last_finalized_label_ = nullptr;

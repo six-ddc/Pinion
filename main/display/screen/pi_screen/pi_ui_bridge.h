@@ -40,11 +40,13 @@ typedef struct {
     char *s3;
     int i1;
     int i2;
+    uint32_t gen; /* 会话代次：new_session 时自增；drain 丢弃 gen != 当前代次的残余事件 */
 } pi_ui_evt_t;
 /* s1/s2/s3 由 agent 线程 strdup（普通 malloc），drain 侧 free。
    TOOL_START: s1=tool_name; TOOL_ARGS: s1=partial_json;
    TOOL_END: s1=name,s2=output,i1=elapsed_ms;
-   TEXT_DELTA: s1=fragment,i2=out_tokens; ERROR: s1=msg;
+   TEXT_DELTA: s1=fragment（i2 保留：流式期间无 token 计数，输出量以 DONE 的 usage
+   为准）; ERROR: s1=msg;
    DONE: i1=usage.input,i2=usage.output（本次 run 最后一条 assistant 消息的真实
    pi_usage_t 用量，来自 pi-c MESSAGE_END 事件的 message->usage，非估算值）。
    CARD_RENDER: s1=root 子树 json,s2=card_id,i1=display(0chat/1overlay),i2=ttl_ms;
@@ -54,7 +56,10 @@ QueueHandle_t pi_ui_queue(void);      /* 懒创建，长度 ~32，元素 sizeof(
 void pi_agent_task_start(void);       /* 建 env/agent/task，幂等 */
 void pi_agent_task_send_prompt(const char *preset);
 void pi_agent_task_abort(void);       /* -> pi_agent_abort，线程安全 */
-void pi_agent_task_new_session(void); /* abort+wait+destroy+重建 agent（mock.next 归零） */
+void pi_agent_task_new_session(void); /* 非阻塞：代次自增+abort+唤醒 worker，destroy+重建
+                                         由 worker 自己做（mock.next 归零），不阻塞 LVGL */
+uint32_t pi_agent_task_session_gen(void); /* 当前会话代次，drain 用它丢弃旧会话残余事件 */
+uint32_t pi_agent_task_run_gen(void); /* 当前 run 代次，worker 线程内的事件生产者(如 pi_card)据此给 evt.gen 打标 */
 
 /* 只读 getter（加不减扩展，需求变更：真实 API 取代 mock 后新增）。返回值指向
    models.json 目录常驻存储（agent 生命周期内不变），线程安全，pi_agent_task_start()

@@ -31,7 +31,7 @@ constexpr int32_t kGridBtnH = 104;  // 触点 >= 96px
 constexpr int32_t kSwipeCloseThreshold = 60;
 
 constexpr uint32_t kOffHoldMs = 2000;     // 关机需长按 2 秒
-constexpr uint32_t kVolApplyGapMs = 150;  // 拖动中 SetVolume 节流（NVS 写保护）
+constexpr uint32_t kSliderApplyGapMs = 150;  // 拖动中节流写入（NVS 写保护，VOL/BRT 共用）
 constexpr uint32_t kToastMs = 1500;
 constexpr uint32_t kStatusRefreshMs = 2000;
 
@@ -168,7 +168,7 @@ void StatusTimerTick(lv_timer_t*) { RefreshStatus(); }
 
 // ----- VOL / BRT 滑条 --------------------------------------------------------
 // 拖动即时生效；NVS 持久化收敛到松手那一下（mhal::audio::SetVolume 内部
-// 永远持久化，故拖动中按 kVolApplyGapMs 节流写入，避免每个 move 事件都刷
+// 永远持久化，故拖动中按 kSliderApplyGapMs 节流写入，避免每个 move 事件都刷
 // NVS；backlight 的 persist 形参是真的，拖动中 false、松手 true）。
 void OnVolChanged(lv_event_t*) {
     int v = static_cast<int>(lv_slider_get_value(s_vol_slider));
@@ -176,7 +176,7 @@ void OnVolChanged(lv_event_t*) {
     std::snprintf(buf, sizeof(buf), "%d", v);
     lv_label_set_text(s_vol_val, buf);
     uint32_t now = lv_tick_get();
-    if (now - s_vol_last_apply_ms >= kVolApplyGapMs) {
+    if (now - s_vol_last_apply_ms >= kSliderApplyGapMs) {
         s_vol_last_apply_ms = now;
         mhal::audio::SetVolume(v, true);
     }
@@ -192,7 +192,7 @@ void OnBrtChanged(lv_event_t*) {
     std::snprintf(buf, sizeof(buf), "%d", v);
     lv_label_set_text(s_brt_val, buf);
     uint32_t now = lv_tick_get();
-    if (now - s_brt_last_apply_ms >= kVolApplyGapMs) {
+    if (now - s_brt_last_apply_ms >= kSliderApplyGapMs) {
         s_brt_last_apply_ms = now;
         mhal::backlight::SetBrightness(static_cast<uint8_t>(v), false);
     }

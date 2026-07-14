@@ -97,6 +97,7 @@ esp_err_t UartEthModem::Start(bool flight_mode) {
     }
 
     flight_mode_ = flight_mode;
+    no_sim_ = false;
     stop_flag_ = false;
     handshake_done_ = false;
     initializing_ = true;
@@ -673,12 +674,11 @@ void UartEthModem::TxTaskRun() {
                 if (frame.data) {
                     free(frame.data);
                 }
-                // Notify waiter if any
-                if (frame.done_sem) {
-                    if (frame.result) {
-                        *frame.result = ESP_ERR_INVALID_STATE;
-                    }
-                    xSemaphoreGive(frame.done_sem);
+                // Notify waiter if any, then release our reference.
+                if (frame.completion) {
+                    frame.completion->result = ESP_ERR_INVALID_STATE;
+                    xSemaphoreGive(frame.completion->sem);
+                    ReleaseTxCompletion(frame.completion);
                 }
                 break;
             }
@@ -718,7 +718,7 @@ void UartEthModem::TxTaskRun() {
             //ConfigureSrdyInterrupt(kSrdyInterruptForAck);
             gpio_set_intr_type(config_.srdy_pin, GPIO_INTR_NEGEDGE);
             gpio_intr_enable(config_.srdy_pin);
-            xEventGroupClearBits(event_group_, kEventSrdyHigh);
+            xEventGroupClearBits(event_group_, kEventSrdyActivity);
 
             // Transmit via UHCI (Synchronous FIFO mode)
             ret = uart_uhci_.Transmit(frame.data, frame.length);
@@ -729,22 +729,24 @@ void UartEthModem::TxTaskRun() {
 
             // Wait for ACK (SRDY high)
             {
-                EventBits_t bits = xEventGroupWaitBits(
-                    event_group_,
-                    kEventSrdyHigh | kEventStop,
-                    pdTRUE,   // clear on exit
-                    pdFALSE,  // wait for any bit
-                    pdMS_TO_TICKS(kAckTimeoutMs)
-                );
+                EventBits_t bits =
+                    xEventGroupWaitBits(event_group_, kEventSrdyActivity | kEventStop,
+                                        pdTRUE,   // clear on exit
+                                        pdFALSE,  // wait for any bit
+                                        pdMS_TO_TICKS(kAckTimeoutMs));
 
                 if (bits & kEventStop) {
                     ret = ESP_ERR_INVALID_STATE;
                     goto done;
                 }
 
-                if (!(bits & kEventSrdyHigh)) {
-                    // ACK timeout - assume data was received
-                    ESP_LOGW(kTag, "TX task: ACK timeout in %ld us", (long)(esp_timer_get_time() - last_activity_time_us_));
+                if (!(bits & kEventSrdyActivity)) {
+                    // ACK timeout - assume data was received (behavior unchanged).
+                    // 累计超时次数，便于诊断链路健康（仿 Feed 超时的样本计数写法）。
+                    uint32_t n = ack_timeout_count_.fetch_add(1) + 1;
+                    ESP_LOGW(kTag, "TX task: ACK timeout in %ld us (total %lu)",
+                             (long)(esp_timer_get_time() - last_activity_time_us_),
+                             (unsigned long)n);
                 } else if (debug_enabled_.load()) {
                     ESP_LOGI(kTag, "TX task: frame sent, %d bytes, acked in %ld us", 
                              frame.length, (long)(esp_timer_get_time() - last_activity_time_us_));
@@ -755,11 +757,10 @@ done:
             ConfigureSrdyInterrupt(kSrdyInterruptForAck);
             // Cleanup and notify
             free(frame.data);
-            if (frame.done_sem) {
-                if (frame.result) {
-                    *frame.result = ret;
-                }
-                xSemaphoreGive(frame.done_sem);
+            if (frame.completion) {
+                frame.completion->result = ret;
+                xSemaphoreGive(frame.completion->sem);
+                ReleaseTxCompletion(frame.completion);
             }
         }
     }
@@ -1231,8 +1232,8 @@ void UartEthModem::InitTaskRun() {
             goto exit;
         }
 
-        // Initialize iot_eth (skip in flight mode - no network needed)
-        if (!flight_mode_) {
+        // Initialize iot_eth (skip in flight mode or no-SIM - no network needed)
+        if (!flight_mode_ && !no_sim_) {
             if (InitIotEth() != ESP_OK) {
                 ESP_LOGE(kTag, "Failed to initialize iot_eth");
                 stop_flag_ = true;
@@ -1276,10 +1277,9 @@ esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
 
     // Enqueue frame (non-blocking, no completion notification)
     TxFrame frame = {
-        .data = buffer, 
+        .data = buffer,
         .length = total_len,
-        .done_sem = nullptr,
-        .result = nullptr
+        .completion = nullptr,
     };
     if (xQueueSend(tx_queue_, &frame, 0) != pdTRUE) {
         ESP_LOGW(kTag, "TX queue full, dropping frame");
@@ -1288,6 +1288,17 @@ esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
     }
 
     return ESP_OK;
+}
+
+// 释放一份 TxCompletion 引用；最后一方回收信号量与对象。
+void UartEthModem::ReleaseTxCompletion(TxCompletion* completion) {
+    if (!completion) {
+        return;
+    }
+    if (completion->refs.fetch_sub(1) == 1) {
+        vSemaphoreDelete(completion->sem);
+        delete completion;
+    }
 }
 
 // Send frame (public interface): enqueue and wait for completion
@@ -1313,44 +1324,47 @@ esp_err_t UartEthModem::SendFrame(const uint8_t* data, size_t length, FrameType 
     // Copy payload
     memcpy(buffer + sizeof(FrameHeader), data, length);
 
-    // Create binary semaphore for synchronous wait
+    // Create heap-allocated completion shared with the TX task. refs 从 2 起
+    // （本调用方 + TX 任务），最后释放引用的一方回收，因此调用方超时返回
+    // 时 TX 任务仍能安全写入自己那份引用。
     SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
     if (!done_sem) {
         ESP_LOGE(kTag, "Failed to create semaphore");
         free(buffer);
         return ESP_ERR_NO_MEM;
     }
+    TxCompletion* completion = new TxCompletion{done_sem, ESP_OK, {2}};
 
     // Prepare frame with completion notification
-    esp_err_t result = ESP_OK;
     TxFrame frame = {
         .data = buffer,
         .length = total_len,
-        .done_sem = done_sem,
-        .result = &result
+        .completion = completion,
     };
 
     // Enqueue frame (block for a short time if queue is full)
     if (xQueueSend(tx_queue_, &frame, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(kTag, "TX queue full, cannot send frame");
-        vSemaphoreDelete(done_sem);
+        // 未入队，TX 任务不会持有引用：这里释放两份引用直接删。
+        ReleaseTxCompletion(completion);
+        ReleaseTxCompletion(completion);
         free(buffer);
         return ESP_ERR_NO_MEM;
     }
 
-    // Wait for transmission to complete (with timeout)
-    // We wait long enough for TxTaskRun to finish its own internal timeouts (up to 1s for TX, 200ms for active state)
-    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    // Wait for transmission to complete (with timeout).
+    // We wait long enough for TxTaskRun to finish its own internal timeouts (up to 1s for TX, 200ms
+    // for active state)
+    esp_err_t result;
+    if (xSemaphoreTake(completion->sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGE(kTag, "SendFrame timeout waiting for completion");
-        // WARNING: If we delete the semaphore here, TxTaskRun might still try to use it later,
-        // causing a crash. However, after 2 seconds, it's very likely TxTaskRun has already
-        // finished or timed out itself.
-        vSemaphoreDelete(done_sem);
-        // Note: buffer is freed by TxTaskRun, don't free here
-        return ESP_ERR_TIMEOUT;
+        // 超时不删对象：TX 任务仍持有一份引用，由它稍后释放。
+        // Note: buffer is freed by TxTaskRun, don't free here.
+        result = ESP_ERR_TIMEOUT;
+    } else {
+        result = completion->result;
     }
-
-    vSemaphoreDelete(done_sem);
+    ReleaseTxCompletion(completion);
     return result;
 }
 
@@ -1685,8 +1699,11 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         // ScheduleAsyncStop() 把整个 modem 关掉，结果 AT 通道也被一起拆
         // 了，用户没法用 AT+ECSIMCFG=SimSlot,X 再切到另一张卡。这里保
         // 留 modem 在 CFUN=1 状态：网络注册 / PDP / netdev 跳过，但 AT
-        // 通道继续可用。
+        // 通道继续可用。用独立的 no_sim_ 标志让 InitTaskRun 跳过 InitIotEth，
+        // 不白建 netif（不复用 flight_mode_ 语义）。
+        // 已知限制：换卡后需重新 Start 走一遍 init，当前无热插拔重注册路径。
         ESP_LOGW(kTag, "SIM not ready, keep AT channel alive (no network)");
+        no_sim_ = true;
         QueryModemInfo();
         initialized_ = true;
         SetNetworkEvent(UartEthModemEvent::InFlightMode);
@@ -1781,9 +1798,15 @@ bool UartEthModem::CheckSimCard() {
                 return true;
             }
         }
-        if (resp.find("+CME ERROR: 10") != std::string::npos) {
-            // SIM not inserted
-            return false;
+        // 精确解析 CME 错误码，避免 "10" 子串误匹配 100/103/106 等其它码。
+        size_t cme_pos = resp.find("+CME ERROR: ");
+        if (cme_pos != std::string::npos) {
+            int cme_code = -1;
+            if (sscanf(resp.c_str() + cme_pos, "+CME ERROR: %d", &cme_code) == 1 &&
+                cme_code == 10) {
+                // SIM not inserted
+                return false;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -1881,8 +1904,8 @@ void IRAM_ATTR UartEthModem::SrdyIsrHandler(void* arg) {
 
     xQueueSendFromISR(self->event_queue_, &event, &xHigherPriorityTaskWoken);
 
-    // Set event group bit for SRDY high (used by WaitForSrdyAck)
-    xEventGroupSetBitsFromISR(self->event_group_, kEventSrdyHigh, &xHigherPriorityTaskWoken);
+    // 任意 SRDY 沿活动都置位（不分高低电平）——TX 任务据此判定对端 ACK。
+    xEventGroupSetBitsFromISR(self->event_group_, kEventSrdyActivity, &xHigherPriorityTaskWoken);
 
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
@@ -1935,12 +1958,19 @@ void UartEthModem::CleanupResources(bool cleanup_iot_eth) {
     reassembly_size_ = 0;
     reassembly_expected_ = 0;
 
-    // Cleanup TX queue (free any pending frames)
+    // Cleanup TX queue (free any pending frames). 未被 TxTask 处理的帧若带
+    // completion，必须逐一释放引用并唤醒可能仍在等待的 SendFrame 调用方，
+    // 否则泄漏 / 死等。
     if (tx_queue_) {
         TxFrame frame;
         while (xQueueReceive(tx_queue_, &frame, 0) == pdTRUE) {
             if (frame.data) {
                 free(frame.data);
+            }
+            if (frame.completion) {
+                frame.completion->result = ESP_ERR_INVALID_STATE;
+                xSemaphoreGive(frame.completion->sem);
+                ReleaseTxCompletion(frame.completion);
             }
         }
         vQueueDelete(tx_queue_);

@@ -26,6 +26,10 @@ protected:
     uint8_t brightness_ = 0;
     uint8_t target_brightness_ = 0;
     uint8_t step_ = 1;
+
+    // 上一次成功落盘 NVS 的亮度值，用于 permanent 写前去重，避免重复擦写。
+    uint8_t last_persisted_brightness_ = 0;
+    bool persisted_ = false;
 };
 
 

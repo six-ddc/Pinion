@@ -170,18 +170,32 @@ void InitPanelImpl() {
 }
 #endif  // METALIO_CLAW_4_USE_FL7707N
 
+// GT911 的 I2C 地址取决于上电时 INT 引脚的电平（由模组固定的上拉/下拉决定），
+// 而 rst/int 两根线本工程尚未接管驱动，无法在软件侧确定性选址——这是已知
+// 取舍，正路是接管 rst/int 走驱动主动选址。当前只能靠探测：每个候选地址
+// 探 3 次、间隔 20ms 再判失败，降低单次总线抖动误判成"没接"的概率；两地址
+// 都探测失败时不再静默 fallback 到默认地址装作没事，而是 ESP_LOGE 醒目报错
+// （触摸可能不可用，实际地址取决于上次上电遗留的 INT 电平），但仍按现状继续
+// 用默认地址 fallback 初始化，不比现在更糟。
 uint8_t ProbeGT911I2CAddress() {
     const uint8_t addrs[] = {
         ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS,
         ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP,
     };
     for (uint8_t addr : addrs) {
-        if (i2c_master_probe(internal::I2cBus(), addr, 100) == ESP_OK) {
-            ESP_LOGI(TAG, "GT911 found at I2C address 0x%02X", addr);
-            return addr;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (i2c_master_probe(internal::I2cBus(), addr, 100) == ESP_OK) {
+                ESP_LOGI(TAG, "GT911 found at I2C address 0x%02X", addr);
+                return addr;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-    ESP_LOGW(TAG, "GT911 I2C probe failed, fallback to default 0x%02X",
+    ESP_LOGE(TAG,
+             "GT911 I2C probe failed at both 0x%02X/0x%02X, touch may be unavailable "
+             "(actual address depends on INT level left over from last power-up); "
+             "fallback to default 0x%02X anyway",
+             ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP,
              ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS);
     return ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS;
 }

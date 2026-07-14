@@ -37,6 +37,7 @@ static const char* TAG = "volc_tts";
 #define TTS_CONNECT_TIMEOUT_MS 10000
 #define TTS_SEND_TIMEOUT_MS 5000
 #define TTS_FEED_TIMEOUT_MS 10000  // 抖动队列满时对搬运任务的最大背压时长
+#define TTS_RX_MAX_BYTES (1024 * 1024)  // 单条 WS 消息重组上限（防御异常长度）
 // 下行音频中间缓冲：WS 接收任务把服务端音频帧非阻塞入队到这里，独立搬运任务
 // 再取出、流式解码、阻塞喂给播放管线。绝不能在 WS 接收任务里为播放阻塞——那会
 // 冻结这条连接的收/发/keepalive，长消息尾部被服务端当慢消费者掐断（见根因分析）。
@@ -45,7 +46,7 @@ static const char* TAG = "volc_tts";
 // 流式解码回 16kHz PCM 再喂播放。实测火山 opus ≈98kbps（约 12KB/s，比裸 PCM 256kbps
 // 省约 2.7x，无码率参数可调），服务端以约 5x 实时速率灌数据；pump 被播放背压限在实时
 // 消费，差额压在本缓冲。1.5MB ≈ 覆盖 150s 回复（与旧 4MB PCM 的回复时长鲁棒性相当），
-// 相比旧 4MB 释放约 2.5MB PSRAM。PSRAM。
+// 相比旧 4MB 释放约 2.5MB PSRAM。
 // 关键：opus 是有状态流，丢中间字节会让 Ogg 永久失步（不像裸 PCM 丢字节只是一声咔哒）。
 // 故缓冲满时不再逐块丢弃，而是置 audio_broken 优雅截断本会话（见 tts_enqueue_audio）。
 #define TTS_AUDIO_RB_BYTES (1536 * 1024)
@@ -70,13 +71,17 @@ struct TtsState {
     bool conn_started;
     EventGroupHandle_t eg;
     SemaphoreHandle_t api_lock;
+    SemaphoreHandle_t cbs_lock;  // cbs 由 speak_begin 改写、WS/播放任务读
     volc_tts_callbacks_t cbs;
     char session_id[37];
     volatile bool session_active;
     volatile bool pending_finish;  // SessionFinished 已到，待播放队列排空
     volatile bool discard_audio;   // 打断后丢弃迟到的下行音频
     volatile bool audio_broken;    // 本会话压缩流已断（缓冲溢出/解码错）→ 剩余音频整段丢弃
+    volatile bool flush_pending;   // 出错路径记账：待收尾路径清空播放队列
     volatile bool audio_started;
+    uint32_t playback_gen;   // 本会话开始时捕获的播放代次（打断残音竞态收口）
+    size_t dropped_samples;  // 本会话因 Feed 超时丢弃的样本数（诊断）
     // 下行音频解耦：WS 接收任务非阻塞入队 → 搬运任务阻塞喂播放管线
     RingbufHandle_t audio_rb;
     TaskHandle_t pump_task;
@@ -99,6 +104,15 @@ struct TtsState {
 
 static TtsState* s_tts = nullptr;
 
+// cbs 是多个函数指针的结构体，跨任务整体拷贝非原子：读写都过 cbs_lock，
+// 防止遗留连接事件撞上新会话改写 cbs 时读到半新半旧的指针。
+static volc_tts_callbacks_t tts_cbs_snapshot(TtsState* s) {
+    xSemaphoreTake(s->cbs_lock, portMAX_DELAY);
+    volc_tts_callbacks_t c = s->cbs;
+    xSemaphoreGive(s->cbs_lock);
+    return c;
+}
+
 static void tts_emit_error(TtsState* s, int code, const char* msg,
                            size_t msg_len) {
     char buf[160] = {0};
@@ -107,11 +121,20 @@ static void tts_emit_error(TtsState* s, int code, const char* msg,
         memcpy(buf, msg, n);
     }
     ESP_LOGE(TAG, "error %d: %s", code, buf);
-    if (s->cbs.on_error) s->cbs.on_error(code, buf, s->cbs.ctx);
     s->session_active = false;
     s->pending_finish = false;
-    s->discard_audio = true;         // 会话失败：丢弃迟到/残留音频
-    s->pump_finish_pending = false;  // 取消待触发的排空
+    // 出错即打断，但本函数跑在 WS 事件任务上：FlushPlayback 内含最多数百 ms
+    // 忙等（等在途喂入退出 + 等在写残帧落地），在此调用会冻结 WS 收发（含
+    // ping/pong）。故只置标志——discard_audio 令迟到的下行帧不再入队（搬运任务据此
+    // 把 audio_rb 残帧丢弃排空），flush_pending 记账播放余音待清；真正 FlushPlayback
+    // 挪到持 api_lock 的收尾路径执行：barge-in 的 volc_tts_stop()，或下一次
+    // volc_tts_speak_begin() 的清理。依赖：出错后必有一条收尾路径被触达——UI 打断/
+    // STOP/新会话会调 stop，否则下一轮播报的 speak_begin 会先清队列再开播。
+    s->discard_audio = true;
+    s->pump_finish_pending = false;  // 取消待触发的排空（pump 不再挂 OnPlaybackDrained）
+    s->flush_pending = true;
+    volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+    if (c.on_error) c.on_error(code, buf, c.ctx);
     xEventGroupSetBits(s->eg, BIT_FAILED | BIT_DONE);
 }
 
@@ -130,11 +153,13 @@ static void tts_enqueue_audio(TtsState* s, const uint8_t* data, size_t len) {
     if (len < 1 || s->discard_audio || s->audio_broken || !s->audio_rb) return;
     if (!s->audio_started) {
         s->audio_started = true;
-        if (s->cbs.on_audio_start) s->cbs.on_audio_start(s->cbs.ctx);
+        volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+        if (c.on_audio_start) c.on_audio_start(c.ctx);
     }
     // 载荷是 ogg_opus 压缩字节流（自带 Ogg page/lacing 定界），原样入队即可——
-    // 解码在 pump 任务里做，绝不在此 WS 接收任务里为解码/播放阻塞。旧的 16bit
-    // 对齐 carry 是「载荷是 PCM 样本」的假设，对压缩字节不成立，已去除。
+    // 解码在 pump 任务里做，绝不在此 WS 接收任务里为解码/播放阻塞。旧的直接
+    // FeedPlayback（连同 origin/main 的代次/丢帧记账）已随架构挪到 pump 任务的
+    // tts_decode_and_feed，此处只负责非阻塞入队压缩字节。
     if (!tts_audio_rb_send(s, data, len)) {
         // 缓冲满：opus 是有状态流，逐块丢会让 Ogg 永久失步、解码器崩成 err 风暴。
         // 改为优雅截断——置 broken，本会话后续帧 WS 直接静默丢；pump 放完已入队的
@@ -150,7 +175,8 @@ static void tts_on_drained(TtsState* s) {
     if (!s->pending_finish) return;
     s->pending_finish = false;
     ESP_LOGI(TAG, "playback drained");
-    if (s->cbs.on_finished) s->cbs.on_finished(s->cbs.ctx);
+    volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+    if (c.on_finished) c.on_finished(c.ctx);
     xEventGroupSetBits(s->eg, BIT_DONE);
 }
 
@@ -223,8 +249,17 @@ static void tts_decode_and_feed(TtsState* s, const uint8_t* data, size_t len) {
             s->dec_win_used -= consumed;
         }
         if (samples > 0) {
-            mhal::audio_pipeline::FeedPlayback(s->dec_pcm, samples,
-                                               TTS_FEED_TIMEOUT_MS);
+            // 带本会话代次喂入：喂入方过了自身 discard 检查、尚未入队时若发生
+            // 打断（FlushPlayback ++gen），管线据代次不等丢弃本帧，收口打断残音竞态。
+            size_t fed = mhal::audio_pipeline::FeedPlayback(
+                s->dec_pcm, samples, TTS_FEED_TIMEOUT_MS, s->playback_gen);
+            if (fed < samples && !s->discard_audio) {
+                // 背压 10s 仍塞不进：正常只在播放端停摆（I2S 掉时钟）时走到。
+                // 打断（discard_audio）导致的部分喂入是预期路径，不计。
+                s->dropped_samples += samples - fed;
+                ESP_LOGW(TAG, "feed timeout: dropped %u samples (session total %u)",
+                         (unsigned)(samples - fed), (unsigned)s->dropped_samples);
+            }
         } else {
             break;  // 需更多输入（当前滑窗不足一整包）
         }
@@ -354,10 +389,18 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
             }
             if (data->payload_len == 0) break;
             if (data->payload_offset == 0) {
+                if ((size_t)data->payload_len > TTS_RX_MAX_BYTES) {
+                    ESP_LOGE(TAG, "rx message too large: %d bytes",
+                             data->payload_len);
+                    s->rx_expected = 0;  // 该消息的后续分片一并丢弃
+                    tts_emit_error(s, -ESP_ERR_NO_MEM, "rx too large", 12);
+                    break;
+                }
                 if ((size_t)data->payload_len > s->rx_cap) {
                     uint8_t* grown =
                         (uint8_t*)realloc(s->rx, data->payload_len);
                     if (!grown) {
+                        s->rx_expected = 0;
                         tts_emit_error(s, -ESP_ERR_NO_MEM, "rx alloc", 8);
                         break;
                     }
@@ -366,8 +409,8 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
                 }
                 s->rx_expected = data->payload_len;
             }
-            if (!s->rx || (size_t)(data->payload_offset + data->data_len) >
-                              s->rx_cap) {
+            if (!s->rx || s->rx_expected == 0 ||
+                (size_t)(data->payload_offset + data->data_len) > s->rx_cap) {
                 break;
             }
             memcpy(s->rx + data->payload_offset, data->data_ptr,
@@ -524,6 +567,7 @@ static TtsState* tts_get_state(void) {
     if (!s) return nullptr;
     s->eg = xEventGroupCreate();
     s->api_lock = xSemaphoreCreateMutex();
+    s->cbs_lock = xSemaphoreCreateMutex();
     s->audio_rb = xRingbufferCreateWithCaps(TTS_AUDIO_RB_BYTES,
                                             RINGBUF_TYPE_BYTEBUF,
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -533,9 +577,11 @@ static TtsState* tts_get_state(void) {
         new (std::nothrow) micro_opus::OggOpusDecoder(false, TTS_SAMPLE_RATE, 1);
     s->dec_pcm = (int16_t*)heap_caps_malloc(
         TTS_DEC_PCM_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s->eg || !s->api_lock || !s->audio_rb || !s->decoder || !s->dec_pcm) {
+    if (!s->eg || !s->api_lock || !s->cbs_lock || !s->audio_rb || !s->decoder ||
+        !s->dec_pcm) {
         if (s->eg) vEventGroupDelete(s->eg);
         if (s->api_lock) vSemaphoreDelete(s->api_lock);
+        if (s->cbs_lock) vSemaphoreDelete(s->cbs_lock);
         if (s->audio_rb) vRingbufferDeleteWithCaps(s->audio_rb);
         delete s->decoder;
         heap_caps_free(s->dec_pcm);
@@ -552,6 +598,7 @@ static TtsState* tts_get_state(void) {
                     &s->pump_task) != pdPASS) {
         vEventGroupDelete(s->eg);
         vSemaphoreDelete(s->api_lock);
+        vSemaphoreDelete(s->cbs_lock);
         vRingbufferDeleteWithCaps(s->audio_rb);
         delete s->decoder;
         heap_caps_free(s->dec_pcm);
@@ -580,8 +627,17 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     }
 
     if (err == ESP_OK) {
+        // 承接上一场出错路径延迟下来的打断：清掉可能残留的缓冲余音
+        // （tts_emit_error 只置 flush_pending，不在 WS 上下文 flush）。此处持
+        // api_lock，是收尾路径之一。
+        if (s->flush_pending) {
+            mhal::audio_pipeline::FlushPlayback();
+            s->flush_pending = false;
+        }
+        xSemaphoreTake(s->cbs_lock, portMAX_DELAY);
         s->cbs = *cbs;
-        s->discard_audio = true;  // 让搬运任务丢弃上一场残帧
+        xSemaphoreGive(s->cbs_lock);
+        s->discard_audio = true;     // 让搬运任务丢弃上一场残帧
         s->pump_finish_pending = false;
         s->demux_reset_req = true;   // 让 pump 复位解码器+清滑窗，从干净 Ogg 流起解
         tts_wait_audio_rb_empty(s);  // 等中间缓冲排空，从干净起播
@@ -589,6 +645,10 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
         s->pending_finish = false;
         s->audio_broken = false;  // 新会话：清上会话的截断标志
         s->discard_audio = false;
+        s->dropped_samples = 0;
+        // 捕获当前播放代次：本会话喂入的每帧都带上它（见 tts_decode_and_feed）。
+        // 必须在上面可能的 FlushPlayback（会 ++gen）之后取。
+        s->playback_gen = mhal::audio_pipeline::PlaybackGen();
         volc_gen_uuid(s->session_id);
         xEventGroupClearBits(s->eg, BIT_SESS_STARTED | BIT_SESS_FINISHED |
                                         BIT_SESS_CANCELED | BIT_FAILED |
@@ -677,7 +737,10 @@ void volc_tts_stop(void) {
     s->discard_audio = true;    // 迟到音频直接丢；搬运任务据此把 audio_rb 残帧丢弃排空
     s->pending_finish = false;  // 短路排空回调，不再触发 on_finished
     s->pump_finish_pending = false;  // 取消待触发的排空
-    mhal::audio_pipeline::FlushPlayback();  // 立即静音（清播放队列；audio_rb 由搬运任务丢弃）
+    // 收尾路径：立即静音（清播放队列；audio_rb 由搬运任务据 discard_audio 丢弃），
+    // 连同出错路径延迟下来的清空一起做。
+    mhal::audio_pipeline::FlushPlayback();
+    s->flush_pending = false;
     if (s->session_active) {
         s->session_active = false;
         if (tts_send_event(s, VOLC_EVT_CANCEL_SESSION, s->session_id, "{}") ==
@@ -707,6 +770,9 @@ void volc_tts_shutdown(void) {
     TtsState* s = s_tts;
     if (!s) return;
     volc_tts_stop();
+    // 注销可能挂着的排空回调（其捕获了 s）：返回即保证无在途回调，
+    // 之后 free(s) 安全。
+    mhal::audio_pipeline::OnPlaybackDrained(nullptr);
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
     tts_teardown_connection(s);
     s_tts = nullptr;
@@ -721,6 +787,7 @@ void volc_tts_shutdown(void) {
     heap_caps_free(s->dec_win);
     heap_caps_free(s->dec_pcm);
     vSemaphoreDelete(s->api_lock);
+    vSemaphoreDelete(s->cbs_lock);
     vEventGroupDelete(s->eg);
     vRingbufferDeleteWithCaps(s->audio_rb);
     free(s->rx);
