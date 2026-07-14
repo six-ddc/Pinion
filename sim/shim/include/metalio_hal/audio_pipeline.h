@@ -35,7 +35,7 @@ bool IsVoiceDetected();
 // —— playback ——
 
 struct PlaybackConfig {
-    size_t queue_bytes = 64 * 1024;
+    size_t queue_bytes = 2 * 1024 * 1024;
     uint32_t prestart_ms = 100;
     uint32_t idle_power_off_ms = 15000;
 };

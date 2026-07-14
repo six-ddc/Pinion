@@ -1,5 +1,6 @@
 #include "metalio_hal/audio_pipeline.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 
@@ -181,6 +182,8 @@ struct PlaybackState {
     volatile bool flushing = false;
     volatile bool writing = false;   // 正在写 I2S（IsPlaybackIdle 判据之一）
     volatile bool had_data = false;  // 本轮是否播放过数据（排空回调条件）
+    volatile bool prebuffering = true;  // 下批数据到达时先做低水位预积累
+    std::atomic<int> feeding{0};     // 在途 FeedPlayback 数（Flush 竞态收口）
     std::mutex drained_mutex;
     std::function<void()> drained_cb;
 };
@@ -192,24 +195,23 @@ size_t PlaybackFilled() {
 }
 
 void FireDrainedCb() {
-    std::function<void()> cb;
-    {
-        std::lock_guard<std::mutex> lock(s_play.drained_mutex);
-        cb = std::move(s_play.drained_cb);
-        s_play.drained_cb = nullptr;
-    }
-    if (cb) cb();
+    // 持锁执行回调：OnPlaybackDrained(nullptr) 的注销方取得锁即保证不再有
+    // 在途回调（回调约定禁止阻塞/回注册，见头文件），消费者可安全释放自身。
+    std::lock_guard<std::mutex> lock(s_play.drained_mutex);
+    if (!s_play.drained_cb) return;
+    auto cb = std::move(s_play.drained_cb);
+    s_play.drained_cb = nullptr;
+    cb();
 }
 
 void PlaybackTask(void*) {
-    bool prebuffering = true;
     bool output_on = false;
     uint32_t idle_ms = 0;
 
     while (true) {
         // 低水位预启动：空转后首批数据到达时，先积累 prestart_ms 再开播，
         // 避免流式下行初期欠载卡顿；积累超时（3x）则不再等。
-        if (prebuffering && PlaybackFilled() > 0 && !s_play.flushing) {
+        if (s_play.prebuffering && PlaybackFilled() > 0 && !s_play.flushing) {
             const size_t prestart_bytes =
                 (size_t)s_play.cfg.prestart_ms * SampleRate() * 2 / 1000;
             for (uint32_t waited = 0;
@@ -218,7 +220,7 @@ void PlaybackTask(void*) {
                  waited += 10) {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            prebuffering = false;
+            s_play.prebuffering = false;
         }
 
         size_t got = 0;
@@ -243,7 +245,7 @@ void PlaybackTask(void*) {
         // 队列排空
         if (s_play.had_data) {
             s_play.had_data = false;
-            prebuffering = true;
+            s_play.prebuffering = true;
             FireDrainedCb();
         }
         idle_ms += 50;
@@ -281,6 +283,7 @@ size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
     if (!s_play.rb || samples == 0) return 0;
     if (s_play.flushing) return samples;  // 打断中：静默丢弃
 
+    s_play.feeding++;
     const auto* src = (const uint8_t*)pcm;
     size_t remaining = samples * sizeof(int16_t);
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -289,12 +292,13 @@ size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
         TickType_t now = xTaskGetTickCount();
         TickType_t wait = (now < deadline) ? (deadline - now) : 0;
         if (xRingbufferSend(s_play.rb, src, chunk, wait) != pdTRUE) {
-            if (wait == 0) break;
-            continue;  // 队列碎片放不下整块，缩块重试
+            if (wait == 0) break;  // 总 deadline 用尽：放弃剩余，返回值告知
+            continue;              // 按剩余 deadline 再等
         }
         src += chunk;
         remaining -= chunk;
     }
+    s_play.feeding--;
     return samples - remaining / sizeof(int16_t);
 }
 
@@ -307,6 +311,21 @@ void FlushPlayback() {
     while ((item = xRingbufferReceiveUpTo(s_play.rb, &got, 0, kPlayerChunk)) !=
            nullptr) {
         vRingbufferReturnItem(s_play.rb, item);
+    }
+    // 喂入竞态收口：置 flushing 前已阻塞在 xRingbufferSend 的喂入方，会因
+    // 上面的排空腾出空间而先完成一次 send 才看到 flushing 退出。等它退出后
+    // 再排空一次，防止这 ≤1 块残帧（≤128ms）在 flushing 清零后被播出。
+    {
+        const int kFeederExitTimeoutMs = 200;
+        int waited = 0;
+        while (s_play.feeding.load() > 0 && waited < kFeederExitTimeoutMs) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            waited += 10;
+        }
+        while ((item = xRingbufferReceiveUpTo(s_play.rb, &got, 0,
+                                              kPlayerChunk)) != nullptr) {
+            vRingbufferReturnItem(s_play.rb, item);
+        }
     }
     // 等正在写的残帧（≤128ms）落地，保证返回后不再出声。加超时兜底：
     // WritePcm 底层 i2s_channel_write 是 portMAX_DELAY，BT 模组掉时钟时会
@@ -325,14 +344,22 @@ void FlushPlayback() {
         }
     }
     s_play.had_data = false;
+    // 打断清掉了 had_data，播放任务不会再走"排空→重新武装预积累"分支，
+    // 在此补上：下一场播报同样先积累 prestart_ms，避免打断后首帧欠载。
+    s_play.prebuffering = true;
     s_play.flushing = false;
     // 打断即视为一次排空（挂起的排空回调不再有意义，直接触发释放等待方）
     FireDrainedCb();
 }
 
 void OnPlaybackDrained(std::function<void()> cb) {
+    if (!cb) {  // 注销：FireDrainedCb 持锁执行，取得锁即无在途回调
+        std::lock_guard<std::mutex> lock(s_play.drained_mutex);
+        s_play.drained_cb = nullptr;
+        return;
+    }
     if (!s_play.rb || IsPlaybackIdle()) {
-        if (cb) cb();
+        cb();
         return;
     }
     bool fire_now = false;

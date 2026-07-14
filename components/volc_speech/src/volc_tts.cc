@@ -32,6 +32,7 @@ static const char* TAG = "volc_tts";
 #define TTS_CONNECT_TIMEOUT_MS 10000
 #define TTS_SEND_TIMEOUT_MS 5000
 #define TTS_FEED_TIMEOUT_MS 10000  // 抖动队列满时对 WS 任务的最大背压时长
+#define TTS_RX_MAX_BYTES (1024 * 1024)  // 单条 WS 消息重组上限（防御异常长度）
 
 #define BIT_WS_CONNECTED BIT0
 #define BIT_CONN_STARTED BIT1
@@ -47,12 +48,14 @@ struct TtsState {
     bool conn_started;
     EventGroupHandle_t eg;
     SemaphoreHandle_t api_lock;
+    SemaphoreHandle_t cbs_lock;  // cbs 由 speak_begin 改写、WS/播放任务读
     volc_tts_callbacks_t cbs;
     char session_id[37];
     volatile bool session_active;
     volatile bool pending_finish;  // SessionFinished 已到，待播放队列排空
     volatile bool discard_audio;   // 打断后丢弃迟到的下行音频
     volatile bool audio_started;
+    size_t dropped_samples;  // 本会话因 Feed 超时丢弃的样本数（诊断）
     // WS 消息重组
     uint8_t* rx;
     size_t rx_cap;
@@ -60,6 +63,15 @@ struct TtsState {
 };
 
 static TtsState* s_tts = nullptr;
+
+// cbs 是多个函数指针的结构体，跨任务整体拷贝非原子：读写都过 cbs_lock，
+// 防止遗留连接事件撞上新会话改写 cbs 时读到半新半旧的指针。
+static volc_tts_callbacks_t tts_cbs_snapshot(TtsState* s) {
+    xSemaphoreTake(s->cbs_lock, portMAX_DELAY);
+    volc_tts_callbacks_t c = s->cbs;
+    xSemaphoreGive(s->cbs_lock);
+    return c;
+}
 
 static void tts_emit_error(TtsState* s, int code, const char* msg,
                            size_t msg_len) {
@@ -69,9 +81,14 @@ static void tts_emit_error(TtsState* s, int code, const char* msg,
         memcpy(buf, msg, n);
     }
     ESP_LOGE(TAG, "error %d: %s", code, buf);
-    if (s->cbs.on_error) s->cbs.on_error(code, buf, s->cbs.ctx);
     s->session_active = false;
     s->pending_finish = false;
+    // 出错即打断：清掉缓冲余音（大队列下可能还有数十秒），迟到帧不再入队，
+    // 避免 UI 已进错误态扬声器还在播。
+    s->discard_audio = true;
+    mhal::audio_pipeline::FlushPlayback();
+    volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+    if (c.on_error) c.on_error(code, buf, c.ctx);
     xEventGroupSetBits(s->eg, BIT_FAILED | BIT_DONE);
 }
 
@@ -79,11 +96,20 @@ static void tts_enqueue_audio(TtsState* s, const uint8_t* pcm, size_t len) {
     if (len < 2 || s->discard_audio) return;
     if (!s->audio_started) {
         s->audio_started = true;
-        if (s->cbs.on_audio_start) s->cbs.on_audio_start(s->cbs.ctx);
+        volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+        if (c.on_audio_start) c.on_audio_start(c.ctx);
     }
     // 队列满则阻塞 WS 任务（TCP 背压让服务端放缓）；打断时管线立即丢弃
-    mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, len / 2,
-                                       TTS_FEED_TIMEOUT_MS);
+    size_t want = len / 2;
+    size_t fed = mhal::audio_pipeline::FeedPlayback((const int16_t*)pcm, want,
+                                                    TTS_FEED_TIMEOUT_MS);
+    if (fed < want && !s->discard_audio) {
+        // 背压 10s 仍塞不进：正常只在播放端停摆（I2S 掉时钟）时走到。
+        // 打断（discard_audio）导致的部分喂入是预期路径，不计。
+        s->dropped_samples += want - fed;
+        ESP_LOGW(TAG, "feed timeout: dropped %u samples (session total %u)",
+                 (unsigned)(want - fed), (unsigned)s->dropped_samples);
+    }
 }
 
 // SessionFinished 后由播放管线在队列排空时触发（打断路径上被
@@ -92,7 +118,8 @@ static void tts_on_drained(TtsState* s) {
     if (!s->pending_finish) return;
     s->pending_finish = false;
     ESP_LOGI(TAG, "playback drained");
-    if (s->cbs.on_finished) s->cbs.on_finished(s->cbs.ctx);
+    volc_tts_callbacks_t c = tts_cbs_snapshot(s);
+    if (c.on_finished) c.on_finished(c.ctx);
     xEventGroupSetBits(s->eg, BIT_DONE);
 }
 
@@ -162,10 +189,18 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
             }
             if (data->payload_len == 0) break;
             if (data->payload_offset == 0) {
+                if ((size_t)data->payload_len > TTS_RX_MAX_BYTES) {
+                    ESP_LOGE(TAG, "rx message too large: %d bytes",
+                             data->payload_len);
+                    s->rx_expected = 0;  // 该消息的后续分片一并丢弃
+                    tts_emit_error(s, -ESP_ERR_NO_MEM, "rx too large", 12);
+                    break;
+                }
                 if ((size_t)data->payload_len > s->rx_cap) {
                     uint8_t* grown =
                         (uint8_t*)realloc(s->rx, data->payload_len);
                     if (!grown) {
+                        s->rx_expected = 0;
                         tts_emit_error(s, -ESP_ERR_NO_MEM, "rx alloc", 8);
                         break;
                     }
@@ -174,8 +209,8 @@ static void tts_ws_event(void* arg, esp_event_base_t /*base*/, int32_t event_id,
                 }
                 s->rx_expected = data->payload_len;
             }
-            if (!s->rx || (size_t)(data->payload_offset + data->data_len) >
-                              s->rx_cap) {
+            if (!s->rx || s->rx_expected == 0 ||
+                (size_t)(data->payload_offset + data->data_len) > s->rx_cap) {
                 break;
             }
             memcpy(s->rx + data->payload_offset, data->data_ptr,
@@ -315,9 +350,11 @@ static TtsState* tts_get_state(void) {
     if (!s) return nullptr;
     s->eg = xEventGroupCreate();
     s->api_lock = xSemaphoreCreateMutex();
-    if (!s->eg || !s->api_lock) {
+    s->cbs_lock = xSemaphoreCreateMutex();
+    if (!s->eg || !s->api_lock || !s->cbs_lock) {
         if (s->eg) vEventGroupDelete(s->eg);
         if (s->api_lock) vSemaphoreDelete(s->api_lock);
+        if (s->cbs_lock) vSemaphoreDelete(s->cbs_lock);
         free(s);
         return nullptr;
     }
@@ -341,10 +378,13 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     }
 
     if (err == ESP_OK) {
+        xSemaphoreTake(s->cbs_lock, portMAX_DELAY);
         s->cbs = *cbs;
+        xSemaphoreGive(s->cbs_lock);
         s->discard_audio = false;
         s->audio_started = false;
         s->pending_finish = false;
+        s->dropped_samples = 0;
         volc_gen_uuid(s->session_id);
         xEventGroupClearBits(s->eg, BIT_SESS_STARTED | BIT_SESS_FINISHED |
                                         BIT_SESS_CANCELED | BIT_FAILED |
@@ -462,11 +502,15 @@ void volc_tts_shutdown(void) {
     TtsState* s = s_tts;
     if (!s) return;
     volc_tts_stop();
+    // 注销可能挂着的排空回调（其捕获了 s）：返回即保证无在途回调，
+    // 之后 free(s) 安全。
+    mhal::audio_pipeline::OnPlaybackDrained(nullptr);
     xSemaphoreTake(s->api_lock, portMAX_DELAY);
     tts_teardown_connection(s);
     s_tts = nullptr;
     xSemaphoreGive(s->api_lock);
     vSemaphoreDelete(s->api_lock);
+    vSemaphoreDelete(s->cbs_lock);
     vEventGroupDelete(s->eg);
     free(s->rx);
     free(s);

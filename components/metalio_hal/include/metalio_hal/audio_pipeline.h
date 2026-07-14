@@ -50,8 +50,12 @@ bool IsVoiceDetected();  // 最近 VAD 状态（未开 VAD 恒 false）
 // —— 播放侧 ——
 
 struct PlaybackConfig {
-    size_t queue_bytes = 64 * 1024;  // 抖动队列（PSRAM），~2s @16k/16bit
-    uint32_t prestart_ms = 100;      // 队列积累到该时长（或 300ms 超时）才开播
+    // 抖动队列（PSRAM），~64s @16k/16bit。定容原则：装得下"上游产出超前
+    // 实时播放"的典型积压量，让有界应答（如整段 TTS 回复）尽快全部收进
+    // 本地——喂入方长期阻塞会把上游 socket 压成 TCP zero-window，触发对端
+    // slow-consumer 断连。队列满的背压 + Feed 超时只是超长应答的安全网。
+    size_t queue_bytes = 2 * 1024 * 1024;
+    uint32_t prestart_ms = 100;  // 队列积累到该时长（或 300ms 超时）才开播
     uint32_t idle_power_off_ms = 15000;  // 队列空闲该时长后关扬声器通路
 };
 
@@ -62,7 +66,8 @@ size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms);
 // 打断：清空队列，正在写 I2S 的残帧（≤128ms）播完即静音。
 void FlushPlayback();
 // 一次性回调：播放队列由非空转为排空时触发（当前已空则立即触发）。
-// 播放任务上下文，禁止阻塞。
+// 播放任务上下文，禁止阻塞、禁止在回调内再注册。传 nullptr 注销未触发的
+// 回调——返回即保证不再有在途回调（会等正在执行的回调结束）。
 void OnPlaybackDrained(std::function<void()> cb);
 bool IsPlaybackIdle();  // 队列空且无在写帧
 
