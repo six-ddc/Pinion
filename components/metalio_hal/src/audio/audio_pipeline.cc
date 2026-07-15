@@ -193,10 +193,6 @@ struct PlaybackState {
 
 PlaybackState s_play;
 
-size_t PlaybackFilled() {
-    return s_play.cfg.queue_bytes - xRingbufferGetCurFreeSize(s_play.rb);
-}
-
 void FireDrainedCb() {
     // 持锁执行回调：OnPlaybackDrained(nullptr) 的注销方取得锁即保证不再有
     // 在途回调（回调约定禁止阻塞/回注册，见头文件），消费者可安全释放自身。
@@ -304,6 +300,10 @@ bool EnsurePlayback(const PlaybackConfig& cfg) {
 }
 
 uint32_t PlaybackGen() { return s_play.gen.load(); }
+
+size_t PlaybackFilled() {
+    return s_play.cfg.queue_bytes - xRingbufferGetCurFreeSize(s_play.rb);
+}
 
 size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms,
                     uint32_t expected_gen) {

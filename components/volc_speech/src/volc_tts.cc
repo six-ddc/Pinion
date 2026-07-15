@@ -10,6 +10,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -56,6 +57,33 @@ static const char* TAG = "volc_tts";
 // 流式解码滑窗增长上限：单 Ogg page 上限 ≈64KB，超此判流损坏 → 复位解码器
 #define TTS_DEC_WIN_MAX (128 * 1024)
 
+// ── 文本侧节流（volc_tts_feed_text）：限速水位阀把 TASK_REQUEST 喂入节奏对齐端上播放 ──
+// 火山按约 5x 实时速率合成，长回复会把下行缓冲堆满而截断（opus 不能丢字节，见上）。
+// 对策不是加大缓冲，而是别把文本一股脑喂给服务端。控制律只有一条（无估算、无墙钟）：
+//   PlaybackFilled() < TARGET 且距上段 ≥ MIN_INTERVAL，才放行下一段（≤SEG_MAX 字节）。
+//  - 速率闸是关键：水位反馈有 ~1-2s 链路延迟（喂→服务端合成→opus 回流→解码→PCM），
+//    这窗口内水位闸形同虚设（曾实测：水位跌破阈值后 feed 循环毫秒级把整段剩余回复全量
+//    提交，PCM 冲满 2MB、audio_rb 冲满截断）。把放行速率封顶在 SEG_MAX/MIN_INTERVAL =
+//    60B/s，过冲被硬性限制在"延迟窗口 × 60B/s ≈ 2 段 ≈ 10s 音频"，结构上到不了溢出；
+//    60B/s 又是语速（中英文均 ~12-15B/s）的 4-5 倍，低水位时补喂永远追得上播放，也
+//    结构上不会欠载。稳态自时钟：约每播完一段放行一段，水位在 TARGET 上下小幅振荡。
+//  - 水位 ≥ TARGET 就一直等（无强放行）：播放恒以实时速率消耗，稳态段间隔 ≈ 单段音频
+//    时长（4-5s）；若火山对会话内喂入间隔有 idle 红线（无公开文档，姊妹协议经验 ~10s），
+//    gate 的长间隔日志 + SessionFailed 会在真机实测中直接暴露，届时再加会话轮换兜底。
+#define TTS_PACE_TARGET_MS 8000        // 水位阀目标：PCM 播放缓冲低于此才放行下一段（≈8s）
+#define TTS_PACE_MIN_INTERVAL_MS 1000  // 速率闸：两段 TASK_REQUEST 的最小间隔
+#define TTS_PACE_SEG_MAX_BYTES 60      // 单段 TASK_REQUEST 文本上限（UTF-8 安全切分，≈4-5s 音频）
+#define TTS_PACE_POLL_MS 50            // 节流等待轮询粒度（可被 barge-in 的 discard_audio 打断）
+
+// ── 会话轮换：规避服务端会话寿命上限 ──
+// 实测（serial3.log）：单个 TTS 会话活到 ≈300s 时服务端静默停产——不再回音频、
+// FinishSession 也无 SessionFinished 回应、无错误帧、连接不断。文本节流让会话寿命 =
+// 播放时长（旧方案 5x 合成一分钟就播完收场，从未触及），长回复必然踩线。对策：段间隙
+// 按会话年龄主动轮换（FinishSession → 新 StartSession 续喂，见 tts_rotate_session），
+// PCM 里 ~8-16s 存量盖住轮换间隙，用户无感。
+#define TTS_SESS_ROTATE_S 240     // 轮换年龄阈值（< 实测 ~300s 寿命上限，留 1 分钟余量）
+#define TTS_ROTATE_WAIT_MS 8000   // 轮换各步等待上限（SessionFinished/audio_rb 排空/SessionStarted）
+
 #define BIT_WS_CONNECTED BIT0
 #define BIT_CONN_STARTED BIT1
 #define BIT_SESS_STARTED BIT2
@@ -82,6 +110,9 @@ struct TtsState {
     volatile bool audio_started;
     uint32_t playback_gen;   // 本会话开始时捕获的播放代次（打断残音竞态收口）
     size_t dropped_samples;  // 本会话因 Feed 超时丢弃的样本数（诊断）
+    // 文本侧节流（feed_text 限速水位阀）会话级状态，speak_begin 复位。
+    int64_t pace_last_send_us;   // 上一段 TASK_REQUEST 发出时刻（esp_timer µs），0=本会话尚未发过
+    int64_t session_start_us;    // 当前会话 SessionStarted 时刻（会话轮换的年龄基准）
     // 下行音频解耦：WS 接收任务非阻塞入队 → 搬运任务阻塞喂播放管线
     RingbufHandle_t audio_rb;
     TaskHandle_t pump_task;
@@ -646,6 +677,7 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
         s->audio_broken = false;  // 新会话：清上会话的截断标志
         s->discard_audio = false;
         s->dropped_samples = 0;
+        s->pace_last_send_us = 0;  // 文本侧节流：新会话重置速率闸
         // 捕获当前播放代次：本会话喂入的每帧都带上它（见 tts_decode_and_feed）。
         // 必须在上面可能的 FlushPlayback（会 ++gen）之后取。
         s->playback_gen = mhal::audio_pipeline::PlaybackGen();
@@ -669,6 +701,7 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
             pdMS_TO_TICKS(TTS_CONNECT_TIMEOUT_MS));
         if (bits & BIT_SESS_STARTED) {
             s->session_active = true;
+            s->session_start_us = esp_timer_get_time();  // 会话轮换的年龄基准
             ESP_LOGI(TAG, "session started");
         } else {
             err = (bits & BIT_FAILED) ? ESP_FAIL : ESP_ERR_TIMEOUT;
@@ -684,6 +717,135 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     return err;
 }
 
+// 从 p 起取一段：不超过 max 字节且不切断 UTF-8 多字节字符，返回段字节数（非空输入必 >0）。
+static size_t tts_utf8_seg_len(const char* p, size_t max) {
+    size_t n = 0;
+    while (p[n]) {
+        unsigned char c = (unsigned char)p[n];
+        size_t clen = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        if (n && n + clen > max) break;  // 已有内容、再加会超上限 → 本段到此
+        n += clen;
+        if (n >= max) break;
+    }
+    return n;
+}
+
+// 文本侧节流阀：水位（PlaybackFilled < TARGET）与速率（距上段 ≥ MIN_INTERVAL）双条件都
+// 满足才放行下一段 TASK_REQUEST，否则一直等。等待期间不持 api_lock（好让 barge-in 的
+// volc_tts_stop 及时拿锁置 discard_audio 打断），并每 POLL_MS 轮询取消标志。放行即记
+// pace_last_send_us（速率闸基准）。返回 false 表示会话被取消，应中止本次喂入。
+static bool tts_pace_gate(TtsState* s) {
+    const size_t target_bytes = (size_t)TTS_PACE_TARGET_MS * (mhal::audio_pipeline::SampleRate() * 2) / 1000;
+    for (;;) {
+        if (s->discard_audio || !s->session_active) return false;
+        int64_t now = esp_timer_get_time();
+        int64_t gap_ms = s->pace_last_send_us ? (now - s->pace_last_send_us) / 1000 : -1;
+        if ((gap_ms < 0 || gap_ms >= TTS_PACE_MIN_INTERVAL_MS) &&
+            mhal::audio_pipeline::PlaybackFilled() < target_bytes) {
+            // 长段间隔可观测：校准火山会话 idle 红线（经验 ~10s，无公开文档）用
+            // 注意 newlib-nano 无 %lld，gap 秒级用 int 足够
+            if (gap_ms > 6000) ESP_LOGI(TAG, "pace: seg gap %dms", (int)gap_ms);
+            s->pace_last_send_us = now;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(TTS_PACE_POLL_MS));
+    }
+}
+
+// 会话轮换（见 TTS_SESS_ROTATE_S）：中场把当前会话干净收尾、原连接上开新会话续喂。
+// 音频帧先于 SessionFinished 到达（同一 socket 顺序），故收到该事件时旧会话音频已
+// 全部入队；等 pump 把 audio_rb 搬空后复位解码器（新会话是全新 Ogg 流），再 Start。
+// 对 pump/上层透明：不触发 on_finished/BIT_DONE（那是整场播报的收尾语义，轮换要拆掉
+// SessionFinished 的这两个副作用）。所有等待不持 api_lock 且轮询 discard_audio ——
+// barge-in 随时可打断；发送才短暂持锁。返回 false = 被打断/失败，调用方中止本次喂入。
+static bool tts_rotate_session(TtsState* s) {
+    ESP_LOGI(TAG, "session rotate: age %ds (server session lifetime cap ~300s)",
+             (int)((esp_timer_get_time() - s->session_start_us) / 1000000));
+    // 1) 旧会话干净收尾
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s->api_lock, portMAX_DELAY);
+    if (s->session_active && !s->discard_audio) {
+        err = tts_send_event(s, VOLC_EVT_FINISH_SESSION, s->session_id, "{}");
+    }
+    xSemaphoreGive(s->api_lock);
+    if (err != ESP_OK) return false;
+    // 2) 等 SessionFinished（服务端先 flush 在途音频再发它；节流下在途仅 1-2 段）
+    for (uint32_t waited = 0;; waited += TTS_PACE_POLL_MS) {
+        if (s->discard_audio) return false;
+        EventBits_t bits =
+            xEventGroupWaitBits(s->eg, BIT_SESS_FINISHED | BIT_FAILED, pdFALSE,
+                                pdFALSE, pdMS_TO_TICKS(TTS_PACE_POLL_MS));
+        if (bits & BIT_FAILED) return false;
+        if (bits & BIT_SESS_FINISHED) break;
+        if (waited >= TTS_ROTATE_WAIT_MS) {
+            ESP_LOGW(TAG, "session rotate: SessionFinished timeout");
+            return false;
+        }
+    }
+    // 轮换不是整场收尾：拆掉 SessionFinished 的收尾副作用（排空回调/on_finished）。
+    // 即便 pump 已抢先挂上 OnPlaybackDrained，PCM 存量远大于轮换耗时，回调触发前
+    // pending_finish 已为 false，tts_on_drained 会空转返回。
+    s->pump_finish_pending = false;
+    s->pending_finish = false;
+    // 3) 等 pump 把旧会话尾音从 audio_rb 解码搬完（读者只有 pump，此处只读查询；
+    //    稳态 audio_rb ≈0，PCM 未满 pump 不会久阻塞，正常亚秒级）
+    for (uint32_t waited = 0;
+         xRingbufferGetCurFreeSize(s->audio_rb) < s->audio_rb_free_empty;
+         waited += TTS_PACE_POLL_MS) {
+        if (s->discard_audio) return false;
+        if (waited >= TTS_ROTATE_WAIT_MS) {
+            ESP_LOGW(TAG, "session rotate: audio_rb drain timeout");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(TTS_PACE_POLL_MS));
+    }
+    // 4) 原连接开新会话。demux_reset_req 的消费窗口安全：新会话首帧音频最早也在
+    //    StartSession 一个 RTT + 合成之后，pump 空闲轮询 ≤POLL_MS 内必然先消费标志
+    //    （与 speak_begin 的既有模式一致）。
+    xSemaphoreTake(s->api_lock, portMAX_DELAY);
+    err = ESP_ERR_INVALID_STATE;
+    if (!s->discard_audio) {
+        s->demux_reset_req = true;
+        volc_gen_uuid(s->session_id);
+        xEventGroupClearBits(
+            s->eg, BIT_SESS_STARTED | BIT_SESS_FINISHED | BIT_SESS_CANCELED);
+        char* json = tts_build_request_json(VOLC_EVT_START_SESSION, nullptr);
+        if (json) {
+            err = tts_send_event(s, VOLC_EVT_START_SESSION, s->session_id, json);
+            cJSON_free(json);
+        } else {
+            err = ESP_ERR_NO_MEM;
+        }
+    }
+    xSemaphoreGive(s->api_lock);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "session rotate: StartSession failed");
+        return false;
+    }
+    // 5) 等 SessionStarted，成功后在锁下恢复 active（与 stop 的 discard 写串行化）
+    for (uint32_t waited = 0;; waited += TTS_PACE_POLL_MS) {
+        if (s->discard_audio) return false;
+        EventBits_t bits =
+            xEventGroupWaitBits(s->eg, BIT_SESS_STARTED | BIT_FAILED, pdFALSE,
+                                pdFALSE, pdMS_TO_TICKS(TTS_PACE_POLL_MS));
+        if (bits & BIT_FAILED) return false;
+        if (bits & BIT_SESS_STARTED) break;
+        if (waited >= TTS_ROTATE_WAIT_MS) {
+            ESP_LOGW(TAG, "session rotate: SessionStarted timeout");
+            return false;
+        }
+    }
+    xSemaphoreTake(s->api_lock, portMAX_DELAY);
+    bool ok = !s->discard_audio;
+    if (ok) {
+        s->session_active = true;
+        s->session_start_us = esp_timer_get_time();
+    }
+    xSemaphoreGive(s->api_lock);
+    if (ok) ESP_LOGI(TAG, "session rotated");
+    return ok;
+}
+
 esp_err_t volc_tts_feed_text(const char* text_utf8) {
     TtsState* s = s_tts;
     if (!s || !s->session_active) return ESP_ERR_INVALID_STATE;
@@ -693,19 +855,39 @@ esp_err_t volc_tts_feed_text(const char* text_utf8) {
     while (*p && isspace((unsigned char)*p)) p++;
     if (!*p) return ESP_OK;
 
-    xSemaphoreTake(s->api_lock, portMAX_DELAY);
-    esp_err_t err = ESP_ERR_INVALID_STATE;
-    if (s->session_active) {
-        char* json = tts_build_request_json(VOLC_EVT_TASK_REQUEST, text_utf8);
-        if (json) {
-            err = tts_send_event(s, VOLC_EVT_TASK_REQUEST, s->session_id, json);
-            cJSON_free(json);
-        } else {
-            err = ESP_ERR_NO_MEM;
+    // 按端上播放进度节流分段喂入：每段发 TASK_REQUEST 前过限速水位阀（tts_pace_gate），
+    // 使合成节奏对齐播放、下行缓冲恒定在小区间不被冲爆（根治长回复截断，见 TTS_PACE_*）。
+    // 等待不持 api_lock，barge-in 的 volc_tts_stop 才能及时打断；每段发送才短暂持锁。
+    while (*p) {
+        if (!tts_pace_gate(s)) return ESP_ERR_INVALID_STATE;  // 会话被取消/打断
+        // 会话年龄触顶：段间隙主动轮换，规避服务端 ~300s 会话寿命上限（静默停产）
+        if ((esp_timer_get_time() - s->session_start_us) / 1000000 >= TTS_SESS_ROTATE_S) {
+            if (!tts_rotate_session(s)) return ESP_ERR_INVALID_STATE;
         }
+        size_t seg = tts_utf8_seg_len(p, TTS_PACE_SEG_MAX_BYTES);
+        if (seg == 0) break;
+        char* text = (char*)malloc(seg + 1);
+        if (!text) return ESP_ERR_NO_MEM;
+        memcpy(text, p, seg);
+        text[seg] = '\0';
+
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        xSemaphoreTake(s->api_lock, portMAX_DELAY);
+        if (s->session_active) {
+            char* json = tts_build_request_json(VOLC_EVT_TASK_REQUEST, text);
+            if (json) {
+                err = tts_send_event(s, VOLC_EVT_TASK_REQUEST, s->session_id, json);
+                cJSON_free(json);
+            } else {
+                err = ESP_ERR_NO_MEM;
+            }
+        }
+        xSemaphoreGive(s->api_lock);
+        free(text);
+        if (err != ESP_OK) return err;
+        p += seg;
     }
-    xSemaphoreGive(s->api_lock);
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t volc_tts_speak_end(void) {

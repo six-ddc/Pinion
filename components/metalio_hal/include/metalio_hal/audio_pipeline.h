@@ -90,5 +90,8 @@ void FlushPlayback();
 // 回调——返回即保证不再有在途回调（会等正在执行的回调结束）。
 void OnPlaybackDrained(std::function<void()> cb);
 bool IsPlaybackIdle();  // 队列空且无在写帧
+// 当前播放队列已占用字节数（尚未播出的缓冲音频）。除以 SampleRate()*2 即缓冲时长（秒）。
+// 供上游（如 TTS 文本侧节流）按播放进度对齐喂入节奏，避免下行缓冲被冲爆。
+size_t PlaybackFilled();
 
 }  // namespace mhal::audio_pipeline
