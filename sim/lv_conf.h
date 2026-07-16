@@ -24,4 +24,10 @@
 
 #define LV_USE_SNAPSHOT 1
 
+/* pi_card v1 能力 3：qrcode 控件（依赖 canvas，两端均默认已开）。 */
+#define LV_USE_QRCODE 1
+
+/* pi_card Phase3：chart 控件（standby 常驻卡的 battery/rssi 历史折线，两端均默认已开）。 */
+#define LV_USE_CHART 1
+
 #endif /* LV_CONF_H */

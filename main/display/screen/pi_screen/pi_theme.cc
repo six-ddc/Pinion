@@ -32,9 +32,11 @@ bool s_light = false;
 lv_style_t s_bg[kTokCount];
 lv_style_t s_text[kTokCount];
 lv_style_t s_border[kTokCount];
+lv_style_t s_arc[kTokCount];
 bool s_bg_init[kTokCount] = {};
 bool s_text_init[kTokCount] = {};
 bool s_border_init[kTokCount] = {};
+bool s_arc_init[kTokCount] = {};
 lv_style_t s_scrim;
 bool s_scrim_init = false;
 
@@ -60,6 +62,8 @@ void RefreshStyles() {
             lv_style_set_text_color(&s_text[i], c);
         if (s_border_init[i])
             lv_style_set_border_color(&s_border[i], c);
+        if (s_arc_init[i])
+            lv_style_set_arc_color(&s_arc[i], c);
     }
     if (s_scrim_init)
         RefreshScrimStyle();
@@ -79,6 +83,7 @@ lv_style_t* EnsureStyle(lv_style_t* arr, bool* init, pi_theme::Tok t,
 void SetBgColor(lv_style_t* s, lv_color_t c) { lv_style_set_bg_color(s, c); }
 void SetTextColor(lv_style_t* s, lv_color_t c) { lv_style_set_text_color(s, c); }
 void SetBorderColor(lv_style_t* s, lv_color_t c) { lv_style_set_border_color(s, c); }
+void SetArcColor(lv_style_t* s, lv_color_t c) { lv_style_set_arc_color(s, c); }
 
 // 同属性的旧令牌样式先摘干净（含重复挂载），再挂新令牌 —— Apply* 即可做
 // 运行期角色切换。
@@ -170,6 +175,10 @@ void ApplyText(lv_obj_t* obj, Tok t, lv_style_selector_t sel) {
 
 void ApplyBorder(lv_obj_t* obj, Tok t, lv_style_selector_t sel) {
     ApplyOne(obj, s_border, s_border_init, t, SetBorderColor, sel);
+}
+
+void ApplyArc(lv_obj_t* obj, Tok t, lv_style_selector_t sel) {
+    ApplyOne(obj, s_arc, s_arc_init, t, SetArcColor, sel);
 }
 
 void ApplyScrim(lv_obj_t* obj) {

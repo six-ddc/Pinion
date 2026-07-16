@@ -49,8 +49,9 @@ typedef struct {
    为准）; ERROR: s1=msg;
    DONE: i1=usage.input,i2=usage.output（本次 run 最后一条 assistant 消息的真实
    pi_usage_t 用量，来自 pi-c MESSAGE_END 事件的 message->usage，非估算值）。
-   CARD_RENDER: s1=root 子树 json,s2=card_id,i1=display(0chat/1overlay),i2=ttl_ms;
-   CARD_UPDATE: s1=card_id,s2=node_id,s3=props json; CARD_CLOSE: s1=card_id。 */
+   CARD_RENDER: s1=root 子树 json,s2=card_id,s3=data json(可 NULL),i1=display(0chat/1overlay),
+   i2=ttl_ms; CARD_UPDATE: s1=card_id,s3=pi_card_tool_update 整份 args 的 json（{id,props}和/或
+   {data:{...}}，OnUpdateEvent 内部分流）; CARD_CLOSE: s1=card_id。 */
 
 QueueHandle_t pi_ui_queue(void);      /* 懒创建，长度 ~32，元素 sizeof(pi_ui_evt_t) */
 void pi_agent_task_start(void);       /* 建 env/agent/task，幂等 */
@@ -89,6 +90,15 @@ void pi_agent_task_tts_cancel(void);
 void pi_agent_task_tts_run_start(void);
 void pi_agent_task_tts_feed(const char *plain_utf8);
 void pi_agent_task_tts_run_end(void);
+
+/* 「卡片操作注入的那一轮，首次吐字时切掉上一轮尚未播完的音频」——take 读即清。
+   为什么需要它：inject 在运行中走 pi_agent_steer，那是在**当前 run 内**再起一轮，不产生
+   AGENT_START，故 TTS run 不会重开、新文本会排在旧音频后面慢慢等（限速阀下可等好几分钟）。
+   为什么在 TEXT_DELTA 而不是注入当场切：注入时新回复还没到（网络 RTT + 推理），当场切只会
+   留下几秒静音；等首字真的来了再切才是无缝的。
+   clear 用于轮次边界兜底：注入的那轮万一没产出文本，标志不能漏给下一轮。UI 线程调。 */
+bool pi_agent_task_tts_take_cut(void);
+void pi_agent_task_tts_clear_cut(void);
 
 /* pi_card 交互回传：把 UI 卡片上的用户操作（选择/开关…）注入回 LLM。运行中用
    pi_agent_steer 插到下一轮之前；空闲则起一轮让助手回应用户的选择。线程安全，

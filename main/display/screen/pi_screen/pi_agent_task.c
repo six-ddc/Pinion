@@ -1,5 +1,5 @@
-/* pi-c — MetalioClaw5 pi_screen App: agent thread + real API transport + calc
- * tool + on_event -> pi_ui_evt_t bridge (blueprint §2/§3 WP-B, §4 event map).
+/* pi-c — MetalioClaw5 pi_screen App: agent thread + real API transport +
+ * on_event -> pi_ui_evt_t bridge (blueprint §2/§3 WP-B, §4 event map).
  *
  * Production talks to the real API: transport = pi_esp32_transport() (TLS via
  * esp_crt_bundle, already wired by the port) and model/provider config comes
@@ -137,6 +137,9 @@ static SemaphoreHandle_t
     g_agent_mutex; /* 串行化 g_agent 的 abort 与 destroy/create（重建在 worker 线程） */
 static char* g_pending_prompt = NULL;           /* 动态分配，消费后 free：消除旧 512B 截断 */
 static volatile bool g_running = false;         /* true while pi_agent_prompt() is on the stack */
+/* 「下次吐字时切掉上一轮尚未播完的 TTS」——由 pi_agent_task_inject 的 steer 分支置位，UI 线程
+   在该轮首个 TEXT_DELTA 处取走（见 pi_agent_task_tts_take_cut 的调用点）。理由见 inject。 */
+static volatile bool g_tts_cut_pending = false;
 static volatile bool g_rebuild_pending = false; /* new_session 请求，由 worker 消费做重建 */
 /* 会话代次：new_session（LVGL 线程）自增；worker 每轮开跑前快照到 g_active_gen，
  * 打进它 enqueue 的每个事件；DrainQueueTick 丢弃 gen 与当前不符的旧会话残余事件。
@@ -366,49 +369,6 @@ static void tts_pump(void *arg) {
     }
 }
 
-/* ---------- calc tool (real execution: mul(37,89)=3293, host_chat/main.c parity) ---------- */
-/* file-scope static initializer needs a compile-time constant: a `static const
- * char *` variable is NOT one in C, so this must be a macro, not a string
- * pointed to by a static (that produced "initializer element is not constant"
- * in the TOOLS[] initializer below). */
-#define CALC_SCHEMA                                                                              \
-    "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},"                          \
-    "\"b\":{\"type\":\"number\"},\"op\":{\"type\":\"string\","                                   \
-    "\"enum\":[\"add\",\"sub\",\"mul\",\"div\"]}},"                                               \
-    "\"required\":[\"a\",\"b\",\"op\"]}"
-
-static int calc_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
-                     volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
-                     void *user, pi_tool_result_t *out) {
-    (void)id;
-    (void)abort_flag;
-    (void)on_update;
-    (void)update_user;
-    (void)user;
-    const cJSON *a = cJSON_GetObjectItemCaseSensitive(args, "a");
-    const cJSON *b = cJSON_GetObjectItemCaseSensitive(args, "b");
-    const cJSON *op = cJSON_GetObjectItemCaseSensitive(args, "op");
-    if (!cJSON_IsNumber(a) || !cJSON_IsNumber(b) || !cJSON_IsString(op)) {
-        out->output = pi_strdup(alloc, "invalid arguments");
-        out->is_error = true;
-        return PI_OK;
-    }
-    double x = a->valuedouble, y = b->valuedouble, r = 0;
-    const char *o = op->valuestring;
-    if (strcmp(o, "add") == 0)
-        r = x + y;
-    else if (strcmp(o, "sub") == 0)
-        r = x - y;
-    else if (strcmp(o, "mul") == 0)
-        r = x * y;
-    else if (strcmp(o, "div") == 0)
-        r = y != 0 ? x / y : 0;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%g", r);
-    out->output = pi_strdup(alloc, buf);
-    return PI_OK;
-}
-
 /* ---------- pi_card 声明式 UI 工具（ui_render / ui_update / ui_close） ----------
  * 工具名只能匹配 ^[a-zA-Z0-9_-]+$（OpenAI/DeepSeek 兼容 API 的 function.name 约束）——
  * 不能含点号，否则请求被拒 "invalid tools[N].function.name not match pattern"。故用下划线。
@@ -442,16 +402,12 @@ static int ui_close_exec(const pi_alloc_t *alloc, const char *id, const cJSON *a
     return card_tool_run(pi_card_tool_close, alloc, args, out);
 }
 
-static const pi_agent_tool_t TOOLS[] = {
-    {
-        .def = {.name = "calc",
-                .description = "Basic arithmetic on two numbers",
-                .parameters_schema_json = CALC_SCHEMA},
-        .execute = calc_exec,
-    },
+/* 非 const：ui_render 项的 description 在 pi_agent_task_start 里由 pi_card_render_desc()
+ * （动态生成，见 pi_card_tools.h）运行时回填，替掉这里的占位空串。 */
+static pi_agent_tool_t TOOLS[] = {
     {
         .def = {.name = "ui_render",
-                .description = PI_CARD_RENDER_DESC,
+                .description = "",
                 .parameters_schema_json = PI_CARD_RENDER_SCHEMA},
         .execute = ui_render_exec,
     },
@@ -707,7 +663,7 @@ static pi_agent_t *create_agent(void) {
                            * (never freed — lives for the firmware's whole run) */
     cfg.stream_opts.api_key = pi_models_api_key(g_catalog, g_model);
 #endif
-    cfg.system_prompt = "You are pi.";
+    cfg.system_prompt = pi_card_system_prompt(); /* function-static，深拷贝见 pi_agent.c:58-60 */
     cfg.tools = TOOLS;
     cfg.tool_count = sizeof(TOOLS) / sizeof(TOOLS[0]);
     cfg.on_event = on_event;
@@ -793,6 +749,29 @@ void pi_agent_task_start(void) {
     g_tts_lock = xSemaphoreCreateMutex();
     g_tts_signal = xSemaphoreCreateBinary();
     ensure_env();
+    /* ui_render 的描述是运行时动态生成的（含 DataHub::ListPaths() 拼出的活体路径清单），
+     * 必须在 create_agent() 之前填好——pi_agent_create 浅拷贝 TOOLS[] 借用 description 指针
+     * （pi-c pi_agent.c:67-68），此后 rebuild_agent 复用同一个 TOOLS[]，指针需常驻有效
+     * （pi_card_render_desc() 内部缓存进 function-static std::string，满足这一点）。初始化
+     * 顺序安全：main.cc PiScreen::Create() 注册全部路径同步先于 lv_screen_load -> LOAD 钩子
+     * -> pi_agent_task_start。 */
+    for (size_t i = 0; i < sizeof(TOOLS) / sizeof(TOOLS[0]); i++) {
+        if (strcmp(TOOLS[i].def.name, "ui_render") == 0) {
+            TOOLS[i].def.description = pi_card_render_desc();
+        }
+    }
+    /* 8KB 预算守卫（编排者裁决补充）：DESC+system prompt 之和常驻占用上下文，两者都随
+     * DataHub 路径 / CommandRegistry 命令的运行时注册增长——新加一条就可能悄悄越界。
+     * sim 的 "budget" 命令是本地核验；这里在真机启动路径上补一道只告警不 fail 的信号，
+     * 免得越界只能靠人工偶尔想起来去跑 sim 才发现。 */
+    {
+        size_t sys_len = strlen(pi_card_system_prompt());
+        size_t desc_len = strlen(pi_card_render_desc());
+        if (sys_len + desc_len > 8192) {
+            ESP_LOGW(TAG, "pi_card system_prompt(%u)+ui_render desc(%u)=%u bytes, over 8192 budget",
+                     (unsigned)sys_len, (unsigned)desc_len, (unsigned)(sys_len + desc_len));
+        }
+    }
     g_agent = create_agent();
     if (!g_agent) {
         ESP_LOGE(TAG, "pi_agent_create failed");
@@ -838,13 +817,27 @@ void pi_agent_task_abort(void) {
 void pi_agent_task_inject(const char *text) {
     if (!g_agent || !text || !text[0]) return;
     if (g_running) {
+        /* steer 是在**当前 run 内**再起一轮，不会产生新的 AGENT_START，于是 TTS run 也不会
+           重开——新一轮的文本会直接 append 进同一个缓冲，老老实实排在上一轮尚未播完的音频
+           后面（而 volc_tts_feed_text 的限速阀让"上一轮"能拖上好几分钟）。置个标志，等新一轮
+           **真的吐出第一个字**时再切旧音频（消费点见 pi_screen 的 UI_TEXT_DELTA）：此刻就切
+           只会换来几秒静音——文本还要等网络 RTT + 推理才来。 */
+        g_tts_cut_pending = true;
         pi_agent_steer(g_agent, text); /* 运行中：插到下一轮之前 */
     } else {
-        pi_agent_task_send_prompt(text); /* 空闲：起一轮，助手回应用户的选择 */
+        pi_agent_task_send_prompt(text); /* 空闲：起一轮（自带 AGENT_START → TTS run 会重开） */
     }
 }
 
 void pi_agent_task_tts_cancel(void) { tts_cancel_run(); }
+
+bool pi_agent_task_tts_take_cut(void) {
+    bool v = g_tts_cut_pending;
+    g_tts_cut_pending = false;
+    return v;
+}
+
+void pi_agent_task_tts_clear_cut(void) { g_tts_cut_pending = false; }
 
 void pi_agent_task_new_session(void) {
     if (!g_agent) return;

@@ -64,6 +64,8 @@ uint32_t Hex(Tok t);      // 0xRRGGBB（label recolor 内嵌 "#RRGGBB " 标记�
 void ApplyBg(lv_obj_t* obj, Tok t, lv_style_selector_t sel = LV_PART_MAIN);
 void ApplyText(lv_obj_t* obj, Tok t, lv_style_selector_t sel = LV_PART_MAIN);
 void ApplyBorder(lv_obj_t* obj, Tok t, lv_style_selector_t sel = LV_PART_MAIN);
+// arc 控件的弧线色（arc_color）共享样式；pi_card 的 arc 控件底轨/填充复用它。
+void ApplyArc(lv_obj_t* obj, Tok t, lv_style_selector_t sel = LV_PART_MAIN);
 
 // 遮罩样式（bg 色 + 透明度一体）：深色 = 纯黑 60%，浅色 = 深墨 45%。
 void ApplyScrim(lv_obj_t* obj);

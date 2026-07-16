@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "IOExpander.hpp"
 #include "lv_markdown/md_inline.h"
 #include "lv_markdown/md_view.h"
+#include "pi_card/pi_card_cmd.h"
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "metalio_hal/audio_pipeline.h"
@@ -84,6 +86,7 @@ constexpr int32_t kHSwipeDisarmPx = 40;
 // 触屏"按住说话"阈值：按住不足此时长的轻点不进聆听（不再闪一下），与实体键一致。
 constexpr uint32_t kTouchHoldToTalkMs = 240;
 constexpr int32_t kNvsNamespaceMaxTools = 4;   // cached tool cards per turn (ZEN peek)
+constexpr int32_t kPinClockH = 300;  // 常驻组件出现时，时钟区收缩到这个高度（原 kMidH=552）
 
 // ----- per-view state --------------------------------------------------
 enum class ViewState { Idle, Listen, Chat };
@@ -101,12 +104,18 @@ bool s_zen = false;
 // idle view widgets
 lv_obj_t* s_clock_lbl = nullptr;
 lv_obj_t* s_date_lbl = nullptr;
-lv_obj_t* s_idle_mid = nullptr;  // 时钟容器（DIM 防烧屏移位的对象）
+lv_obj_t* s_idle_mid = nullptr;  // 时钟容器（DIM 防烧屏移位的对象；pin 出现时收缩到 kPinClockH）
 lv_obj_t* s_idle_breath = nullptr;
 lv_obj_t* s_idle_ctx_fill = nullptr;
 lv_obj_t* s_idle_ctx_lbl = nullptr;
+lv_obj_t* s_idle_hint = nullptr;   // "按住说话" 提示条（pin 出现时隐藏，给常驻组件让位）
+lv_obj_t* s_idle_hrule = nullptr;  // 提示条上方的分隔线（随 hint 一起隐藏）
 lv_timer_t* s_clock_timer = nullptr;
 lv_timer_t* s_burnin_timer = nullptr;  // DIM 期间每 60s 平移时钟容器
+
+// ---- Phase3：常驻小组件（display:'standby'，单槽，固定 id "pin"）----
+lv_obj_t* s_pin_host = nullptr;  // pin 卡的父容器：scr 子对象，仅 Idle 可见，非 clickable/scrollable
+bool s_has_pin = false;
 
 // ----- P1: 状态栏网络真状态 -------------------------------------------------
 // 网络链路 UI 态。事件回调（网络栈任务线程）只写原子快照 + dirty，LVGL 侧
@@ -159,6 +168,13 @@ lv_obj_t* s_chat_model_lbl = nullptr;
 
 // chat view widgets
 lv_obj_t* s_feed = nullptr;
+// 消息流「贴底跟随」（sticky bottom）：用户往上翻看历史时，模型的新输出绝不该把视口抢回底部
+//（同网页/聊天 App 的惯例）。判据 = 用户**自己**是否停在底部附近；用户自身的动作（发消息、
+// 重试、错误横幅）仍然强制回底。由 feed 的 LV_EVENT_SCROLL_END 维护——注意流式期的程序化滚动
+// 走 ANIM_OFF，LVGL 不为它发 SCROLL_END（该事件只在 indev 松手或滚动动画结束时发），故不会
+// 污染这个标志。
+constexpr int32_t kFeedStickyPx = 40;  // 容差 ≈ 一行正文；差几像素不该判成「脱离底部」
+bool s_feed_stick = true;
 lv_obj_t* s_chat_ctx_fill = nullptr;
 lv_obj_t* s_chat_ctx_lbl = nullptr;
 lv_obj_t* s_mode_icon_flow = nullptr;  // 3-bar hamburger, shown in FLOW
@@ -262,6 +278,16 @@ lv_obj_t* s_sheet_root = nullptr;
 lv_obj_t* s_sheet_meta_lbl = nullptr;
 lv_obj_t* s_sheet_confirm_lbl = nullptr;
 bool s_sheet_open = false;
+
+// ---- Phase3：通用参数化确认 sheet（invoke-confirm 与 pin ✕ 手势共用）----
+// 与新对话 sheet 同款底部弹层风格，但 title/body/confirm_label/on_confirm 由调用方参数化——
+// CommandRegistry 的 confirm 级命令与 pi_card 的 pin 移除都走它，不必各自造一张 sheet。
+lv_obj_t* s_confirm_sheet_root = nullptr;
+lv_obj_t* s_confirm_title_lbl = nullptr;
+lv_obj_t* s_confirm_body_lbl = nullptr;
+lv_obj_t* s_confirm_confirm_lbl = nullptr;
+bool s_confirm_sheet_open = false;
+std::function<void()> s_confirm_on_confirm;
 
 // 会话级统计（新对话 sheet 的 meta 行）：轮数 = 已发送的 prompt 数；
 // 时长从会话建立（Create/NewSession）起算。
@@ -433,6 +459,9 @@ void UpdateModelLabels() {
 void NewSession();
 void SetZen(bool zen);
 void Go(ViewState s);
+bool UserDraggingFeed();
+void FeedScrollEndCb(lv_event_t* e);
+void ScrollFeedToBottom(bool force);  // force=false 只在贴底时跟随，见定义处
 void UpdateDockStat();
 void StartListen(ViewState return_state, ListenOwner owner);
 void FinishListenSend();
@@ -686,6 +715,7 @@ void BuildIdleView(lv_obj_t* parent) {
     StartBreath(s_idle_breath, 1600);
 
     lv_obj_t* hint = lv_obj_create(s_idle_view);
+    s_idle_hint = hint;
     screen_strip_obj_chrome(hint);
     lv_obj_remove_flag(hint, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(hint, LV_OBJ_FLAG_CLICKABLE);
@@ -693,6 +723,7 @@ void BuildIdleView(lv_obj_t* parent) {
     lv_obj_set_pos(hint, 0, kSbarH + kMidH);
     lv_obj_set_style_bg_opa(hint, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_t* hrule = MakeRect(s_idle_view, kW, 1, Tok::Line);
+    s_idle_hrule = hrule;
     lv_obj_set_pos(hrule, 0, kSbarH + kMidH);
     lv_obj_set_flex_flow(hint, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(hint, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1527,6 +1558,7 @@ void BuildChatView(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(s_feed, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(s_feed, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(s_feed, LV_DIR_VER);
+    lv_obj_add_event_cb(s_feed, FeedScrollEndCb, LV_EVENT_SCROLL_END, nullptr);  // 维护贴底跟随
     lv_obj_set_style_pad_top(s_feed, 30, LV_PART_MAIN);
     lv_obj_set_style_pad_left(s_feed, 32, LV_PART_MAIN);
     lv_obj_set_style_pad_right(s_feed, 32, LV_PART_MAIN);
@@ -1750,14 +1782,49 @@ void ResetTurnState() {
     ShowStopBtn();
 }
 
-void ScrollFeedToBottom() {
+// 用户松手（或甩滑的惯性结束）时记一次：视口还贴着底吗？
+//
+// 必须只认**手指驱动**的滚动。程序化滚动里，非流式那条走 ANIM_ON（见 ScrollFeedToBottom），
+// LVGL 会在滚动动画结束时照样发 SCROLL_END——而那一刻内容往往又长了一截，scroll_bottom 已经
+// 大于阈值，于是跟随态被误判成「用户翻上去了」，此后再不跟随（sim 实测过这个坑：scroll_y 卡在
+// 189 一动不动，新输出全部不跟）。lv_indev_active() 为空即非用户操作，直接忽略。
+// 用户的手指此刻是否正在滚 feed（含松手后的惯性——LVGL 在 throw 走完前一直把 scroll_obj
+// 指着它）。这是区分「用户滚动」与「程序化滚动」的唯一可靠办法：SCROLL / SCROLL_END 事件里
+// lv_indev_active() **恒为 null**（LVGL 发这些事件时已不在 indev 上下文里），sim 实测确认过，
+// 别再试图用它来判断。
+bool UserDraggingFeed() {
+    for (lv_indev_t* d = lv_indev_get_next(nullptr); d != nullptr; d = lv_indev_get_next(d)) {
+        if (lv_indev_get_scroll_obj(d) == s_feed) return true;
+    }
+    return false;
+}
+
+// 用户松手（含甩滑惯性走完）时记一次：视口还贴着底吗？
+//
+// 必须挡掉程序化滚动的收尾：非流式那条走 ANIM_ON（见 ScrollFeedToBottom），LVGL 会在滚动动画
+// 结束时照样发 SCROLL_END——而那一刻内容往往又长了一截，bottom 已经大于阈值，于是跟随态被误判
+// 成「用户翻上去了」，此后再也不跟随。
+void FeedScrollEndCb(lv_event_t*) {
+    if (s_feed == nullptr || !UserDraggingFeed()) return;
+    s_feed_stick = lv_obj_get_scroll_bottom(s_feed) <= kFeedStickyPx;
+}
+
+// force=true：用户自己的动作（发消息/重试/错误横幅）——无条件回到底部，并恢复跟随。
+// force=false：模型侧的输出（流式回复、卡片渲染）——只在用户本来就贴底时才跟。
+void ScrollFeedToBottom(bool force) {
     if (s_feed == nullptr) return;
     // scroll_to_view(last child) only aligns the child's TOP edge once it is
     // taller than the viewport -- a streaming MdView reply quickly is -- so
     // follow the stream by scrolling to the real content bottom instead.
     // This update_layout is the tick's ONE forced layout pass; MdView's
-    // SyncCursor below piggybacks on it.
+    // SyncCursor below piggybacks on it —— 故它必须**无条件**跑在 sticky 判断之前，
+    // 哪怕这次不滚。
     lv_obj_update_layout(s_feed);
+    if (force) {
+        s_feed_stick = true;  // 用户主动发言/重试 = 重新跟上直播
+    } else if (!s_feed_stick) {
+        return;  // 用户正在上面看历史——别抢他的视口
+    }
     int32_t below = lv_obj_get_scroll_bottom(s_feed);
     // While streaming, ANIM_ON would restart a 200-400ms scroll animation
     // every 80ms tick -- it never finishes, so every 16ms refresh has a
@@ -1786,7 +1853,7 @@ lv_obj_t* CardBeginRow() {
     lv_obj_move_to_index(s_act_line, lv_obj_get_child_count(s_feed) - 1);
     return row;
 }
-void CardEndRow() { ScrollFeedToBottom(); }
+void CardEndRow() { ScrollFeedToBottom(false); }  // 卡片是模型的输出 → 跟随，不抢
 
 // ---------------------------------------------------------------------------
 // pi_ai event -> queue -> widget drain (LVGL thread, 80ms; no adapter lock
@@ -1865,7 +1932,8 @@ void DrainQueueTick(lv_timer_t*) {
             case UI_AGENT_START:
                 s_agent_busy = true;
                 ShowStopBtn();
-                TtsExtractReset();             // 新回复：重置朗读文本提取器
+                pi_agent_task_tts_clear_cut();  // 新 run 自带 run_start，无需也不该再切
+                TtsExtractReset();              // 新回复：重置朗读文本提取器
                 pi_agent_task_tts_run_start();  // 开启本 run 的 TTS 缓冲
                 break;
             case UI_THINKING_START:
@@ -1975,8 +2043,24 @@ void DrainQueueTick(lv_timer_t*) {
                 if (s_ttfb_ms < 0) s_ttfb_ms = static_cast<int32_t>(lv_tick_get() - s_turn_start_ms);
                 if (evt.s1 != nullptr) {
                     batched_text += evt.s1;
+                    // 卡片操作（report）注入的那一轮走 steer，没有 AGENT_START，TTS run 不会自己
+                    // 重开——新文本会排在上一轮尚未播完的音频后面。**此刻**（新一轮真的吐出第一个
+                    // 字）才是切旧音频的正确时机：零静音衔接。标志无论 TTS 开没开都要取走，否则
+                    // 会漏到下一轮。
+                    const bool cut_stale_audio = pi_agent_task_tts_take_cut();
                     // 显示不变；另外把 delta 剥成纯文本后按句喂 TTS（仅开 TTS 时）。
-                    if (pi_agent_tts_enabled()) TtsExtractFeed(evt.s1);
+                    if (pi_agent_tts_enabled()) {
+                        if (cut_stale_audio) {
+                            // 必须是 tts_cancel：pump 此刻正卡在 volc_tts_feed_text 的限速阀里
+                            // （60B/s，等音频播到 <8s 存量才放行），只在循环顶部查代次——只有
+                            // stop 置的 discard_audio 能把它放出来。且 cancel 已含 run_start 的
+                            // 全部语义（pending_reset + 翻代次），**绝不能**再补一次 run_start：
+                            // stop worker 有代次戳守卫，代次再变会让它判 stale 直接跳过停播。
+                            pi_agent_task_tts_cancel();
+                            TtsExtractReset();  // 旧缓冲已作废，提取器别留半句
+                        }
+                        TtsExtractFeed(evt.s1);
+                    }
                 }
                 // 流式期间没有真实输出 token 计数（bridge 契约：i2 保留不发序号），
                 // 故不更新 s_out_tokens——dock 的 OUT 显示占位 "-- tok"，直到 DONE
@@ -2002,8 +2086,9 @@ void DrainQueueTick(lv_timer_t*) {
                     batched_text.clear();
                 }
                 FinalizeMdView();
-                TtsExtractFlush();            // 冲刷尾句
-                pi_agent_task_tts_run_end();  // pump 排空后 speak_end，余音继续播完
+                pi_agent_task_tts_clear_cut();  // run 收尾：注入轮若没产文本，标志别漏给下一轮
+                TtsExtractFlush();              // 冲刷尾句
+                pi_agent_task_tts_run_end();    // pump 排空后 speak_end，余音继续播完
                 s_agent_busy = false;
                 ShowTalkBtn();
                 s_zen_turn_done = true;
@@ -2070,11 +2155,11 @@ void DrainQueueTick(lv_timer_t*) {
                     batched_text.clear();
                 }
                 FinalizeMdView();
-                pi_card::OnRenderEvent(evt.s1, evt.s2, evt.i1, evt.i2);
+                pi_card::OnRenderEvent(evt.s1, evt.s2, evt.i1, evt.i2, evt.s3);
                 break;
             }
             case UI_CARD_UPDATE:
-                pi_card::OnUpdateEvent(evt.s1, evt.s2, evt.s3);
+                pi_card::OnUpdateEvent(evt.s1, evt.s3);
                 break;
             case UI_CARD_CLOSE:
                 pi_card::OnCloseEvent(evt.s1);
@@ -2087,7 +2172,9 @@ void DrainQueueTick(lv_timer_t*) {
     if (!batched_text.empty()) AppendAssistantText(batched_text.c_str());
     if (stat_dirty) UpdateDockStat();
     if (touched) {
-        ScrollFeedToBottom();  // the tick's single forced layout pass...
+        // 模型侧输出 → 跟随而非强制：用户往上翻看历史时不抢他的视口。注意 update_layout 仍会
+        // 无条件跑（就在 ScrollFeedToBottom 里），所以下面的 SyncCursor 照旧搭它的便车。
+        ScrollFeedToBottom(false);  // the tick's single forced layout pass...
         if (s_cur_md != nullptr) s_cur_md->SyncCursor();  // ...which cursor placement reuses
     }
 }
@@ -2104,17 +2191,46 @@ void Go(ViewState s) {
         case ViewState::Idle:
             lv_obj_remove_flag(s_idle_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
+            if (s_pin_host != nullptr) {
+                if (s_has_pin) lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+                else lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+            }
             break;
         case ViewState::Listen:
             s_ptt_cancel_armed = false;
             SetListenCancelState(false);  // 每次进聆听都从"松开发送"态起
             lv_obj_remove_flag(s_listen_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
+            if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
         case ViewState::Chat:
             lv_obj_remove_flag(s_chat_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
+            if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
+    }
+}
+
+// pin 常驻组件的待机布局：出现时收缩时钟区到 kPinClockH、隐 breath、隐"按住说话"提示条
+// （给常驻组件让位），Idle 态下显示 pin host；消失后完全复原（D2）。
+void ApplyPinLayout(bool has) {
+    s_has_pin = has;
+    if (s_idle_mid != nullptr) lv_obj_set_height(s_idle_mid, has ? kPinClockH : kMidH);
+    if (s_idle_breath != nullptr) {
+        if (has) lv_obj_add_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_idle_hint != nullptr) {
+        if (has) lv_obj_add_flag(s_idle_hint, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_idle_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_idle_hrule != nullptr) {
+        if (has) lv_obj_add_flag(s_idle_hrule, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_idle_hrule, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_pin_host != nullptr) {
+        if (has && s_state == ViewState::Idle) lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -2332,7 +2448,7 @@ void HandleAsrFinal() {
     Go(ViewState::Chat);
     AppendUserRow(text);
     ResetTurnState();
-    ScrollFeedToBottom();
+    ScrollFeedToBottom(true);  // 用户刚发言 → 强制回底
     s_last_user_prompt = text;
     s_session_turns++;  // 新对话 sheet 的 meta 轮数
     s_agent_busy = true;
@@ -2353,7 +2469,7 @@ void HandleAsrFailure() {
     Go(ViewState::Chat);          // 错误横幅住在 chat feed 里
     ShowErrorBanner(msg.empty() ? "ASR error" : msg.c_str());
     ShowTalkBtn();
-    ScrollFeedToBottom();
+    ScrollFeedToBottom(true);  // 错误横幅必须被看见 → 强制回底
 }
 
 void AsrTick(lv_timer_t*) {
@@ -2445,7 +2561,7 @@ void FinishListenSend() {
 void RetryLastPrompt() {
     if (s_last_user_prompt.empty()) return;
     ResetTurnState();
-    ScrollFeedToBottom();
+    ScrollFeedToBottom(true);  // 用户主动重试 → 强制回底
     s_agent_busy = true;
     pi_agent_task_send_prompt(s_last_user_prompt.c_str());
 }
@@ -2462,6 +2578,9 @@ void ClearFeed() {
             lv_obj_delete(child);
         }
     }
+    // feed 空了，视口自然贴底——必须恢复跟随，否则「用户翻到一半 → 开新会话」会把
+    // 脱离态带进新会话，新回复看着像卡住不动。
+    s_feed_stick = true;
     s_peek_container = nullptr;
     s_cur_think_row = s_cur_think_dot = s_cur_think_lbl = nullptr;
     s_cur_tool_card = s_cur_tool_dot = s_cur_tool_fn_lbl = nullptr;
@@ -2479,6 +2598,13 @@ void NewSession() {
     s_session_start_ms = lv_tick_get();
     s_agent_busy = false;
     Go(ViewState::Idle);
+}
+
+// 供 CommandRegistry 的 session.new（Confirm 级 invoke 命令）确认后调用：与新对话 sheet 的
+// 确认按钮同一套语义（生成中先 abort 再新建），只是入口从触屏 sheet 换成卡片 invoke 动作。
+void DoNewSession() {
+    if (s_agent_busy) pi_agent_task_abort();  // 生成中先 abort 再新建（同新对话 sheet 的确认按钮）
+    NewSession();
 }
 
 // ---------------------------------------------------------------------------
@@ -2651,10 +2777,113 @@ void CloseNewSessionSheet() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase3 -- 通用参数化确认 sheet（invoke-confirm 与 pin ✕ 手势共用，见决策摘要）。
+// 与新对话 sheet 同款底部弹层风格：仿 BuildNewSessionSheet，但 title/body/confirm_label/
+// on_confirm 由调用方参数化，不再各自造一张 sheet。取消=无副作用；确认才跑 on_confirm。
+// ---------------------------------------------------------------------------
+void CloseConfirmSheet() {
+    if (s_confirm_sheet_root == nullptr || !s_confirm_sheet_open)
+        return;
+    lv_obj_add_flag(s_confirm_sheet_root, LV_OBJ_FLAG_HIDDEN);
+    s_confirm_sheet_open = false;
+    s_confirm_on_confirm = nullptr;
+}
+
+void BuildConfirmSheet(lv_obj_t* parent) {
+    s_confirm_sheet_root = lv_obj_create(parent);
+    screen_strip_obj_chrome(s_confirm_sheet_root);
+    lv_obj_remove_flag(s_confirm_sheet_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_confirm_sheet_root, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_confirm_sheet_root, kW, kH);
+    lv_obj_set_pos(s_confirm_sheet_root, 0, 0);
+    lv_obj_set_style_bg_opa(s_confirm_sheet_root, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(s_confirm_sheet_root, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* scrim = lv_obj_create(s_confirm_sheet_root);
+    screen_strip_obj_chrome(scrim);
+    lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(scrim, kW, kH);
+    pi_theme::ApplyScrim(scrim);
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        scrim, [](lv_event_t*) { CloseConfirmSheet(); }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* sheet = lv_obj_create(s_confirm_sheet_root);
+    screen_strip_obj_chrome(sheet);
+    lv_obj_remove_flag(sheet, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(sheet, kW);
+    lv_obj_set_height(sheet, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(sheet, 24, LV_PART_MAIN);
+    pi_theme::ApplyBg(sheet, Tok::Card);
+    lv_obj_set_style_bg_opa(sheet, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sheet, 1, LV_PART_MAIN);
+    pi_theme::ApplyBorder(sheet, Tok::Line);
+    lv_obj_add_flag(sheet, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_flex_flow(sheet, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(sheet, 32, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(sheet, 32, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(sheet, 28 + 24, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(sheet, 14, LV_PART_MAIN);
+    lv_obj_align(sheet, LV_ALIGN_BOTTOM_MID, 0, 24);
+
+    s_confirm_title_lbl = lv_label_create(sheet);
+    lv_label_set_text(s_confirm_title_lbl, "");
+    SetLabelFont(s_confirm_title_lbl, &font_puhui_30_4, Tok::Tx);
+
+    s_confirm_body_lbl = lv_label_create(sheet);
+    lv_label_set_text(s_confirm_body_lbl, "");
+    lv_label_set_long_mode(s_confirm_body_lbl, LV_LABEL_LONG_WRAP);
+    SetLabelFont(s_confirm_body_lbl, &font_puhui_20_4, Tok::Faint);
+
+    lv_obj_t* btn_row = lv_obj_create(sheet);
+    screen_strip_obj_chrome(btn_row);
+    lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(btn_row, LV_PCT(100), 96 + 10);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(btn_row, 10, LV_PART_MAIN);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btn_row, 20, LV_PART_MAIN);
+
+    lv_obj_t* cancel_lbl = nullptr;
+    lv_obj_t* cancel_btn = MakeSheetButton(btn_row, Tok::Line2, &cancel_lbl);
+    lv_label_set_text(cancel_lbl, "\xe5\x8f\x96\xe6\xb6\x88");  // "取消"
+    SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Dim);
+    lv_obj_add_event_cb(
+        cancel_btn, [](lv_event_t*) { CloseConfirmSheet(); }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* confirm_btn = MakeSheetButton(btn_row, Tok::Accent, &s_confirm_confirm_lbl);
+    SetLabelFont(s_confirm_confirm_lbl, &font_puhui_24_4, Tok::Accent);
+    lv_obj_add_event_cb(
+        confirm_btn,
+        [](lv_event_t*) {
+            std::function<void()> fn = s_confirm_on_confirm;
+            CloseConfirmSheet();
+            if (fn) fn();
+        },
+        LV_EVENT_CLICKED, nullptr);
+}
+
+// 供 CommandRegistry::SetConfirmHook / pin ✕ 手势调用（均在 LVGL 线程）。
+void ShowConfirmSheet(const std::string& title, const std::string& body,
+                      const std::string& confirm_label, std::function<void()> on_confirm) {
+    if (s_confirm_sheet_root == nullptr) return;
+    if (s_state == ViewState::Listen) CancelListen();
+    if (pi_quick_panel::IsOpen()) pi_quick_panel::Close();
+    lv_label_set_text(s_confirm_title_lbl, title.c_str());
+    lv_label_set_text(s_confirm_body_lbl, body.c_str());
+    lv_label_set_text(s_confirm_confirm_lbl, confirm_label.empty() ? "\xe7\xa1\xae\xe8\xae\xa4"
+                                                                   : confirm_label.c_str());  // "确认"
+    s_confirm_on_confirm = std::move(on_confirm);
+    lv_obj_remove_flag(s_confirm_sheet_root, LV_OBJ_FLAG_HIDDEN);
+    s_confirm_sheet_open = true;
+}
+
+// ---------------------------------------------------------------------------
 // P0 -- 快捷面板呼出（PWR_KEY 长按 / 状态栏下拉）与 Chat 态右滑回待机。
 // ---------------------------------------------------------------------------
 void OpenQuickPanel() {
-    if (pi_quick_panel::IsOpen() || s_sheet_open)
+    if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open)
         return;
     if (s_state == ViewState::Listen)
         CancelListen();  // 聆听中先取消
@@ -2665,7 +2894,7 @@ void OpenQuickPanel() {
 // 靠 EVENT_BUBBLE（sbar 子树 + screen 直达按压）把 PRESSED/PRESSING 送到
 // screen 对象；命中后 wait_release 抑制 IdBox/mode/TTS 等的 CLICKED。
 void OnScrPressed(lv_event_t* e) {
-    if (pi_quick_panel::IsOpen() || s_sheet_open || pi_settings::IsOpen())
+    if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open || pi_settings::IsOpen())
         return;
     lv_indev_t* indev = lv_event_get_indev(e);
     if (indev == nullptr)
@@ -2711,7 +2940,7 @@ void OnScrGesture(lv_event_t* e) {
     if (dir == LV_DIR_LEFT) {
         if (s_state != ViewState::Idle || s_session_turns <= 0)
             return;
-        if (pi_quick_panel::IsOpen() || s_sheet_open || pi_settings::IsOpen())
+        if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open || pi_settings::IsOpen())
             return;
         lv_indev_wait_release(indev);
         Go(ViewState::Chat);
@@ -2723,7 +2952,7 @@ void OnScrGesture(lv_event_t* e) {
     if (s_state != ViewState::Chat)
         return;
     // 设置栈打开时右滑语义归 pi_settings（逐级返回），这里不抢
-    if (pi_quick_panel::IsOpen() || s_sheet_open || pi_settings::IsOpen())
+    if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open || pi_settings::IsOpen())
         return;
     if (IsGenerating())
         return;
@@ -2761,7 +2990,7 @@ void EnableEventBubbleRecursive(lv_obj_t* obj) {
 
 // 覆盖层（设置栈/快捷面板/新对话 sheet）打开时，实体键 PTT 一律惰性。
 bool KeyOverlayOpen() {
-    return pi_settings::IsOpen() || pi_quick_panel::IsOpen() || s_sheet_open;
+    return pi_settings::IsOpen() || pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open;
 }
 
 void OnKeyPressAsync(void*) {
@@ -2862,6 +3091,7 @@ void OnScreenUnloaded(lv_event_t*) {
 
     s_scr = s_idle_view = s_listen_view = s_chat_view = s_ptt_layer = nullptr;
     s_feed = s_act_line = s_act_dot = s_act_text = s_act_peek = s_peek_container = nullptr;
+    s_feed_stick = true;  // 别把脱离态泄漏给下一次 Create（屏卸载/重载）
     s_clock_lbl = s_date_lbl = s_idle_mid = s_idle_breath = s_idle_ctx_fill = s_idle_ctx_lbl =
         nullptr;
     s_wifi_widgets.clear();
@@ -2886,6 +3116,12 @@ void OnScreenUnloaded(lv_event_t*) {
     pi_settings::OnScreenUnloaded();
     s_sheet_root = s_sheet_meta_lbl = s_sheet_confirm_lbl = nullptr;
     s_sheet_open = false;
+    s_confirm_sheet_root = s_confirm_title_lbl = s_confirm_body_lbl = s_confirm_confirm_lbl = nullptr;
+    s_confirm_sheet_open = false;
+    s_confirm_on_confirm = nullptr;
+    s_pin_host = nullptr;
+    s_has_pin = false;
+    s_idle_hint = s_idle_hrule = nullptr;
     s_sbars.clear();
     s_sbar_pull_tracking = false;
     // PTT 所有权 / 实体键护栏：防跨屏残留
@@ -2948,6 +3184,18 @@ lv_obj_t* PiScreen::Create() {
     lv_obj_add_event_cb(s_ptt_layer, OnPttPressing, LV_EVENT_PRESSING, ret_idle);
     lv_obj_add_event_cb(s_ptt_layer, OnPttReleased, LV_EVENT_RELEASED, ret_idle);
 
+    // Phase3：常驻小组件宿主。建在 s_ptt_layer 之后（z 序压过它，pin 卡内可点击控件才能
+    // 收到触摸）；非 clickable + 非 scrollable，让空白区按压穿透回 s_ptt_layer 触发 PTT（D3）。
+    // 仅 Idle 且 s_has_pin 时可见（Go()/ApplyPinLayout 管理 HIDDEN），默认隐藏。
+    s_pin_host = lv_obj_create(scr);
+    screen_strip_obj_chrome(s_pin_host);
+    lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_pin_host, kW, kH - kSbarH - kPinClockH);
+    lv_obj_set_pos(s_pin_host, 0, kSbarH + kPinClockH);
+    lv_obj_set_style_bg_opa(s_pin_host, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+
     // P0 浮层：快捷面板在 ptt 层之上，新对话 sheet 再压一层（面板里的
     // 「新对话」要能弹出 sheet）。都常驻构建、HIDDEN 切换。
     pi_quick_panel::Hooks qp_hooks;
@@ -2957,6 +3205,7 @@ lv_obj_t* PiScreen::Create() {
     qp_hooks.on_settings = []() { pi_settings::Open(s_scr); };
     pi_quick_panel::Create(scr, qp_hooks);
     BuildNewSessionSheet(scr);
+    BuildConfirmSheet(scr);  // Phase3：通用确认 sheet（invoke-confirm 与 pin ✕ 共用）
 
     // 设置栈与 pi_screen 的同源开关联动（TTS/ZEN 都走 pi_screen 的
     // SetTtsOn/SetZen，NVS 持久化与状态栏视觉一并生效）。
@@ -3026,7 +3275,8 @@ lv_obj_t* PiScreen::Create() {
     sl_hooks.is_gated = []() {
         return s_agent_busy ||                                                       // 生成中
                !mhal::audio_pipeline::IsPlaybackIdle() ||                            // TTS 播报中
-               pi_quick_panel::IsOpen() || pi_settings::IsOpen() || s_sheet_open ||  // 浮层
+               pi_quick_panel::IsOpen() || pi_settings::IsOpen() || s_sheet_open ||
+               s_confirm_sheet_open ||  // 浮层
                pi_card::HasOpenOverlay() ||                                          // 卡片浮层
                s_state == ViewState::Listen;                                         // 聆听中
     };
@@ -3050,13 +3300,18 @@ lv_obj_t* PiScreen::Create() {
     // agent 首次跑工具（校验器查 bind 路径）之前就绪；这里在 Create 早于任何
     // prompt，满足。
     pi_card::Init();
+    pi_card::DataHub::Instance().StartLiveRefresh();
     // UI 侧可控路径注册进 DataHub（它不反向依赖 pi_screen，故由此处注入 getter/setter）：
     // TTS 播报开关 + 息屏时长档位——都无重启、纯 NVS/内存开关，可安全交给 LLM。
     {
         auto& hub = pi_card::DataHub::Instance();
+        // worker 可读：只读一个全局 bool。
         hub.Register("speech.tts", pi_card::HubType::Bool,
                      []() -> pi_card::HubValue { return s_tts_on; },
-                     [](const pi_card::HubValue& v) { SetTtsOn(std::get<bool>(v)); });
+                     [](const pi_card::HubValue& v) { SetTtsOn(std::get<bool>(v)); },
+                     pi_card::WorkerRead::Safe);
+        // worker 可读：NVS 读在 IDF 内部有锁；会阻塞几 ms，但阻塞在 agent worker 上无妨
+        //（真正要避免的是阻塞 LVGL 线程）。
         hub.Register("display.sleep_s", pi_card::HubType::Int,
                      []() -> pi_card::HubValue {
                          Settings ui("ui", false);
@@ -3067,12 +3322,27 @@ lv_obj_t* PiScreen::Create() {
                          ui.SetInt("sleep_s", std::get<int>(v));
                          pi_sleep::ReloadConfig();  // 立即重读，别等 ~5s tick
                      },
-                     0, 3600);
+                     pi_card::WorkerRead::Safe, 0, 3600);
     }
     pi_card::FeedHooks card_hooks;
     card_hooks.begin_row = CardBeginRow;
     card_hooks.end_row = CardEndRow;
+    card_hooks.pin_host = []() -> lv_obj_t* { return s_pin_host; };
+    card_hooks.on_pin_changed = [](bool has_pin) { ApplyPinLayout(has_pin); };
     pi_card::SetFeedHooks(card_hooks);
+
+    // Phase3：invoke 命令注册表——net.reconnect/bt.reconnect/net.switch_type 在
+    // CommandRegistry::RegisterBuiltins（纯 mhal/Settings，pi_card::Init 已调过）；
+    // session.new 需要 DoNewSession()（pi_screen 独有），故在此注册。固件确认 sheet
+    // 注入通道复用通用 confirm sheet（invoke-confirm 与 pin ✕ 手势共用同一张 UI）。
+    pi_card::CommandRegistry::Instance().Register(
+        "session.new", "new chat, clears history", pi_card::CmdLevel::Confirm,
+        []() { DoNewSession(); }, "开始新对话？", "将清空当前对话历史", "新建");
+    pi_card::CommandRegistry::Instance().SetConfirmHook(ShowConfirmSheet);
+
+    // rehydrate 常驻组件：Go(Idle) 之后（视图/pin host 都已就绪）、drain timer 建立前——
+    // 坏 JSON/版本不符/Validate 失败一律静默丢弃（RehydratePin 内部处理），绝不卡开机。
+    pi_card::RehydratePin();
 
     s_drain_timer = lv_timer_create(DrainQueueTick, 80, nullptr);
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);

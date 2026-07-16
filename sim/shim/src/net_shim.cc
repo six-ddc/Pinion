@@ -87,7 +87,12 @@ void OnEvent(EventCallback cb) {
 }
 
 bool Start() { return true; }
-void StartAsync() { StartBootSim(); }
+void StartAsync() {
+    // Phase3 测试用日志：即便 StartBootSim 因幂等早退（已起过），这行都能证明 net.reconnect
+    // invoke 命令确实调用到了这里（sim/shim 本阶段允许为测试加日志）。
+    std::fprintf(stderr, "[sim][net] StartAsync() called\n");
+    StartBootSim();
+}
 
 Type GetType() { return LoadType(); }
 

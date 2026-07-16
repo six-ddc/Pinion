@@ -8,7 +8,10 @@
  * 做**同步校验**（不碰 LVGL，错误同步回给 LLM 重试），校验过再把 spec 入
  * pi_ui_queue()，由 pi_screen 的 DrainQueueTick（LVGL 线程）按流式顺序真正建控件。
  *
- * 描述/schema 是编译期常量（TOOLS[] 静态初始化需要），故用宏而非 static const。 */
+ * ui_render 的描述是**运行时动态生成**的（pi_card_render_desc()，实现见
+ * pi_card_host.cc）：静态 HEAD/TAIL 骨架宏之间拼一段由 DataHub::ListPaths() 生成
+ * 的「本机实际可绑路径」权威清单，永远与活体注册表同步、不随硬编码示例过时。
+ * update/close 的描述仍是纯编译期常量，用宏（TOOLS[] 静态初始化需要）。 */
 
 #include <stdbool.h>
 
@@ -24,55 +27,128 @@ char *pi_card_tool_render(const cJSON *args, bool *is_error);
 char *pi_card_tool_update(const cJSON *args, bool *is_error);
 char *pi_card_tool_close(const cJSON *args, bool *is_error);
 
-/* ---- 喂给 LLM 的工具描述与 JSON-Schema（编译期常量）---- */
-#define PI_CARD_RENDER_DESC                                                                          \
-    "Render an interactive UI card into the chat conversation. The arguments ARE the card spec: "    \
-    "{display?:'chat'|'overlay', ttl_ms?:int, card?:'id', root:<node>}. Returns {\"card\":\"<id>\"}"  \
-    "; on invalid input returns an error to fix and retry. display chat(default)=inline card in "    \
-    "the chat feed; overlay=floating panel over the screen (a close button is added; ttl_ms>0 "      \
-    "auto-closes). Node={\"type\":..}. Types: column|row{children:[]}, label{text,role?,bind?,fmt?}, "\
-    "button{text,variant?,on_click}, slider{min,max,value,bind?,on_change?,on_release?}, "            \
-    "switch{checked,bind?,on_change?}, bar{min,max,value,bind?}, icon{icon:'name',size?}, divider, "  \
-    "spacer. Keep overlays to a few at once (a small cap applies); over-cap renders are reported "     \
-    "back as an async error. DESIGN — lean on these, don't hand-style: label role sets a designed type ramp " \
-    "(eyebrow=tiny spaced mono kicker, section=group label, title, heading, label=secondary, "        \
-    "value=mono number, caption). button variant: primary(the ONE amber call-to-action) | "           \
-    "ghost(outlined, for secondary/cancel) | plain(text-only). Give a card a header (eyebrow + "      \
-    "title) and group rows; use exactly one primary button. Amber is precious — the theme already "   \
-    "puts it on slider fills and the on-switch, so DON'T also color titles/most buttons amber; keep " \
-    "text tx/dim. Common props: id,w,h,grow,pad,gap,tone,fill,hidden. tone(text) and fill(bg) take a " \
-    "SEMANTIC token that auto-adapts to light/dark — PREFER over raw #hex: accent|ok|err|tx|dim|"     \
-    "faint|card|card2|line. Two-way bind paths — WRITABLE (bind a slider/switch to control hardware " \
-    "directly, no action needed; values are clamped to each path's valid range): audio.volume(0-100),"\
-    " display.brightness(5-100), display.sleep_s(screen-off seconds, 0=never) via slider; "            \
-    "ui.theme(0=dark/1=light), speech.tts(0/1 read-aloud) via switch. READ-ONLY: battery.level, "      \
-    "battery.charging, net.type, net.rssi, net.ssid, net.connected. "                                  \
-    "A label with bind shows the live value — fmt MUST match the bound type and hold ONE "           \
-    "placeholder: numbers use \"%d%%\"/\"%d dBm\", strings use \"%s\" (a %s on a number path is "     \
-    "rejected); use mono:true for numbers. Events "                                                   \
-    "are action arrays: {do:'close'} | {do:'set',path,value?} | {do:'report',text:'..{v}..'} "       \
-    "({v}=this widget's value; report tells you what the user chose — put it on buttons/switches, "  \
-    "NOT on hardware-bound sliders). Icon names: volume|mute|sun|battery|charging|wifi|cellular|"    \
-    "check|close|plus|minus|gear|chevron|info|warning|clock|dot. Limits: 64 nodes, depth 8. Layout " \
-    "is adaptive (a row shares width across buttons, a column fills width) — you rarely need w/h. "   \
-    "Example: {\"root\":{\"type\":\"column\",\"gap\":14,\"children\":[{\"type\":\"row\",\"children\":"\
-    "[{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio.volume\"},"       \
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]}]}}"
+/* ui_render 工具描述：编译期静态 HEAD/TAIL 骨架 + 运行时动态拼出的路径清单
+ * （pi_card_host.cc 的 pi_card_render_desc()）。pi_agent_task.c 的 TOOLS[] 是
+ * static（非 const）数组，在 pi_agent_task_start 里 ensure_env() 之后、
+ * create_agent() 之前，把 ui_render 项的 description 由 "" 改填成本函数返回的
+ * 指针——该指针指向 function-static std::string，常驻整个固件运行期，满足
+ * pi_agent_create 浅拷贝工具结构体、借用 description 指针的契约。 */
+const char *pi_card_render_desc(void);
 
-#define PI_CARD_RENDER_SCHEMA                                                                        \
-    "{\"type\":\"object\",\"properties\":{\"root\":{\"type\":\"object\"},"                            \
-    "\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\"]},"                              \
-    "\"ttl_ms\":{\"type\":\"number\"},\"card\":{\"type\":\"string\"}},\"required\":[\"root\"]}"
+/* system prompt：与 pi_card_render_desc 同款 function-static 缓存 + 常驻指针契约（骨架
+ * 固定 + BuildPathsClause(false) 插入活体路径清单，与 ui_render 的 DESC 共用同一份路径清单
+ * 生成器，不出现第三份硬编码路径）。create_agent() 里 cfg.system_prompt 借用它；pi-c 深拷贝
+ * system_prompt（pi_agent.c:58-60 pi_strdup），故 new_session 重建 agent 时再次借用同一
+ * 指针是安全的。实现见 pi_card_host.cc。 */
+const char *pi_card_system_prompt(void);
+
+/* ---- 喂给 LLM 的工具描述与 JSON-Schema（编译期常量）---- */
+
+/* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述。
+ * 拆两段是因为路径清单必须插在「双向 bind 目标」与「事件/图标/示例」这两段说明
+ * 之间——HEAD 收尾在类型清单/设计规范，TAIL 从"路径清单之后的补充说明"接着讲
+ * fmt/事件/图标/示例。 */
+#define PI_CARD_DESC_HEAD                                                                            \
+    "Render an interactive UI card into the chat. Args ARE the card spec: {display?:'chat'|"        \
+    "'overlay'|'standby', ttl_ms?:int, card?:'id', data?:{key:scalar|array}, preset?:'confirm'|'form'|"        \
+    "'dashboard'|'menu', slots?:{…}, root:<node>}. Give root, OR preset+slots. Returns "              \
+    "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = current value of every "  \
+    "hardware path this card binds (this IS your device read); hints = non-blocking design tips. "   \
+    "On invalid input returns an error to fix and retry; overlays auto-close (ttl_ms) and are "      \
+    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?}; label{text?,role?,bind?,fmt?,"  \
+    "bind_data?}; button{text,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
+    "on_release?}; arc{…like slider} (round dial); switch{checked,bind?,id?,on_change?}; "            \
+    "bar{min,max,value,bind?}; choice{options:[2-6],value?,id?,bind?,on_change?} (segmented picker; " \
+    "value=selected index; reports index and label); list{bind_data:'key',item:<node>,max?,empty?} " \
+    "(repeats item once per element of data[key]; inside item strings use {i}=0-based index, "       \
+    "{n}=1-based, {item.FIELD}=that record's field; row actions may be report/set/close only, not "  \
+    "toggle/patch); chart{bind_history:'path',points?,w?,h?} (LINE chart of a history-enabled "      \
+    "path); qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "        \
+    "eyebrow|kicker|section|title|heading|label|value|caption. variant (button): primary(the ONE "   \
+    "amber CTA)|ghost|plain|default. Common props: id,w,h,grow,pad,gap,size,mono,tone,fill,color,bg," \
+    "hidden. tone(text)/fill(bg) take a semantic token auto-adapting to light/dark: accent|"          \
+    "accent_dim|ok|err|tx|dim|faint|card|card2|line|line2|bg; or color/bg \"#RRGGBB\". "
+
+/* PI_CARD_DESC_TAIL：路径清单之后——fmt 安全/事件模型/preset/图标/限额/示例。 */
+#define PI_CARD_DESC_TAIL                                                                            \
+    "A bound label's fmt MUST match the bound type and hold ONE placeholder: number paths %d/"       \
+    "\"%d%%\", string paths %s (a %s on a number path is rejected — it would crash); use mono:true "  \
+    "for numbers. A bind_data label shows card data[key] (put {value} in its text to inline it). "   \
+    "EVENTS are action arrays; decide per click — can the device finish it? YES → {do:'close'} | "   \
+    "{do:'set',path,value?} | {do:'toggle'|'show'|'hide',target:'id'} (a hidden:true block toggled "  \
+    "for 'show details') | {do:'patch',target:'id',props:{text?,value?,checked?,hidden?,tone?,"      \
+    "color?}} ({v}/{value} in props.text = triggering control's value) | {do:'invoke',cmd:'…'} (safe " \
+    "cmds run at once, others pop a firmware confirm) — all zero round-trip. Only {do:'report',text:" \
+    "'…{v}…{label}…'} when you must generate/decide ({v}=value, {label}=choice's selected text; a "  \
+    "report auto-carries every id'd control's value, choice as idx(label)). DATA: ui_update mutates " \
+    "card data (data.set/append/"    \
+    "remove/replace) and any list/bind_data label re-renders. PRESETS expand to a normal card: "      \
+    "confirm{title,body?,confirm:{text?,report?/set?},cancel?}; form{title,fields:[{type,id,label,"  \
+    "…}],submit?}; dashboard{title,metrics:[{label,bind,kind?,fmt?,icon?}]}; menu{title,items:"       \
+    "[{text,report?}],style?}. Icons (representative): volume|battery|wifi|gear|check|close. "        \
+    "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
+    "Example: {\"root\":{\"type\":\"column\",\"gap\":14,\"children\":[{\"type\":\"row\","       \
+    "\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio."   \
+    "volume\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]}"  \
+    "]}}"
+
+#define PI_CARD_RENDER_SCHEMA \
+    "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
+    ":\"string\",\"enum\":[\"close\",\"set\",\"report\",\"toggle\",\"show\",\"hide\",\"patch\",\"invo" \
+    "ke\"]},\"pa" \
+    "th\":{\"type\":\"string\"},\"value\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"},\"targ" \
+    "et\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"},\"cmd\":{\"type\":\"string\"}},\"req" \
+    "uired\":[\"do\"]},\"node\":{\"t" \
+    "ype\":" \
+    "\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"column\",\"row\",\"label\"," \
+    "\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"spacer\",\"qrcode\",\"ch" \
+    "oice\",\"list\",\"chart\"]},\"children\":{\"type" \
+    "\":\"array\",\"items\":{\"$ref\":\"#/$defs/node\"}},\"text\":{\"type\":\"string\"},\"role\":{\"t" \
+    "ype\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"heading\",\"label\",\"" \
+    "value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"ghost\",\"plain\"" \
+    ",\"default\"]},\"bind\":{\"type\":\"string\"},\"bind_data\":{\"type\":\"string\"},\"bind_histor" \
+    "y\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"},\"item\":{\"$r" \
+    "ef\":\"#/$defs/node\"},\"empty\":{\"type\":\"string\"},\"fmt\":{\"type\":\"string\"},\"icon\":{" \
+    "\"type\":\"string\"},\"value\":{\"type\":\"number\"},\"min\":{\"type\":\"number\"},\"max\":{\"ty" \
+    "pe\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"options\":{\"type\":\"array\",\"items\":{" \
+    "\"type\":\"string\"}},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"" \
+    "accent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg" \
+    "\"]},\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"d" \
+    "im\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\":\"string\"},\"" \
+    "bg\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"size\":{\"type\":\"number\"},\"mono\":" \
+    "{\"type\":\"boolean\"},\"gap\":{\"type\":\"number\"},\"pad\":{\"type\":\"number\"},\"w\":{\"type" \
+    "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"hidden\":{\"type\":" \
+    "\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_chan" \
+    "ge\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\":\"arr" \
+    "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}},\"properties\":{\"root" \
+    "\":{\"$ref\":\"#/$defs/node\"},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\"," \
+    "\"standby\"]}" \
+    ",\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"type" \
+    "\":\"object\"},\"preset\":{\"type\":\"string\",\"enum\":[\"confirm\",\"form\",\"dashboard\",\"m" \
+    "enu\"]},\"slots\":{\"type\":\"object\"}}}"
 
 #define PI_CARD_UPDATE_DESC                                                                          \
-    "Patch a node inside a rendered card. Args {card?:'' (latest), id:'node-id', "                   \
-    "props:{text?,value?,checked?,hidden?,tone?}}. The node must have been given an \"id\" at "      \
-    "render time. If the card or node is gone (closed, TTL-expired, or a new conversation cleared "  \
-    "all cards) the failure is reported back to you asynchronously, not via this call's return."
+    "Patch a node inside a rendered card, or mutate card data. Args {card?:'' (latest), id?:"        \
+    "'node-id', props?:{text?,value?,checked?,hidden?,tone?,color?}} — give both id+props to patch " \
+    "that node (must have been given an \"id\" at render time). Or mutate card data: {card?, data:"  \
+    "{set?:{k:v,…}, append?:{key,item}, remove?:{key,index|id}, replace?:{key,index,item}}} — any "  \
+    "list bound via bind_data (or a bind_data label) re-renders from the new data. Give either "     \
+    "(id+props) or data. If the card/node is gone (closed, TTL-expired, or a new conversation "       \
+    "cleared all cards) the failure is reported back to you asynchronously, not via this call's "     \
+    "return."
 
-#define PI_CARD_UPDATE_SCHEMA                                                                        \
-    "{\"type\":\"object\",\"properties\":{\"card\":{\"type\":\"string\"},"                            \
-    "\"id\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"}},\"required\":[\"id\",\"props\"]}"
+#define PI_CARD_UPDATE_SCHEMA \
+    "{\"type\":\"object\",\"properties\":{\"card\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}" \
+    ",\"props\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"value\":{\"type" \
+    "\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"hidden\":{\"type\":\"boolean\"},\"tone\":{\"" \
+    "type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"" \
+    "card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\":\"string\"}}},\"data\":{\"type" \
+    "\":\"object\",\"properties\":{\"set\":{\"type\":\"object\"},\"append\":{\"type\":\"object\",\"p" \
+    "roperties\":{\"key\":{\"type\":\"string\"},\"item\":{}},\"required\":[\"key\",\"item\"]},\"remo" \
+    "ve\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"index\":{\"type\":\"n" \
+    "umber\"},\"id\":{\"type\":\"string\"}},\"required\":[\"key\"]},\"replace\":{\"type\":\"object\"" \
+    ",\"properties\":{\"key\":{\"type\":\"string\"},\"index\":{\"type\":\"number\"},\"item\":{}},\"r" \
+    "equired\":[\"key\",\"index\",\"item\"]}}}}}"
 
 #define PI_CARD_CLOSE_DESC "Close a rendered card. Args {card?:'' (latest)}."
 

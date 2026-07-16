@@ -72,6 +72,7 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_actions.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_cmd.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
