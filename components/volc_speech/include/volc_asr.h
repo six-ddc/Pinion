@@ -15,13 +15,20 @@
 
 #include "esp_err.h"
 
+// on_delta 的 committed_bytes 取此值表示"本帧无 definite 分句信息"（服务端未下发
+// utterances，或 sim/selftest 无此概念）：调用方应退回自己的默认高亮策略。
+#define VOLC_ASR_COMMITTED_UNKNOWN SIZE_MAX
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct {
-    // 识别中间结果（对齐参考协议 asr_delta 语义）
-    void (*on_delta)(const char* text, void* ctx);
+    // 识别中间结果（对齐参考协议 asr_delta 语义）。committed_bytes = text 中已
+    // 定稿（服务端 utterances 里 definite=true 的分句）前缀的字节数，即"不会再改"
+    // 的部分长度；[committed_bytes, strlen(text)) 是仍可能被回改的未定稿尾部。
+    // 无 definite 信息时为 VOLC_ASR_COMMITTED_UNKNOWN。
+    void (*on_delta)(const char* text, size_t committed_bytes, void* ctx);
     // 最终结果（对齐 asr_final；一次会话恰好触发一次，除非出错/中止）
     void (*on_final)(const char* text, void* ctx);
     // 错误：code 为火山错误码（本地错误为负的 esp_err_t）

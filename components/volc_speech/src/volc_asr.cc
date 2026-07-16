@@ -81,8 +81,12 @@ static void asr_emit_error(AsrSession* s, int code, const char* msg) {
     xEventGroupSetBits(s->eg, BIT_ERROR);
 }
 
-// 提取 result.text（对齐 asr.ts extractText：result.text 优先，退回顶层 text）
-static char* asr_extract_text(const uint8_t* payload, size_t len) {
+// 提取 result.text（对齐 asr.ts extractText：result.text 优先，退回顶层 text），
+// 并从 result.utterances 累加已定稿（definite=true）分句的文本字节数写入
+// *committed_out——即"不会再改"的前缀长度。无 utterances 数组时置为
+// VOLC_ASR_COMMITTED_UNKNOWN（见 volc_asr.h），由 UI 退回默认高亮策略。
+static char* asr_extract(const uint8_t* payload, size_t len, size_t* committed_out) {
+    *committed_out = VOLC_ASR_COMMITTED_UNKNOWN;
     cJSON* root = cJSON_ParseWithLength((const char*)payload, len);
     if (!root) return nullptr;
     char* out = nullptr;
@@ -91,6 +95,19 @@ static char* asr_extract_text(const uint8_t* payload, size_t len) {
                          : cJSON_GetObjectItem(root, "text");
     if (cJSON_IsString(text) && text->valuestring) {
         out = strdup(text->valuestring);
+    }
+    cJSON* utterances = result ? cJSON_GetObjectItem(result, "utterances") : nullptr;
+    if (cJSON_IsArray(utterances)) {
+        size_t committed = 0;
+        cJSON* utt = nullptr;
+        cJSON_ArrayForEach(utt, utterances) {
+            cJSON* def = cJSON_GetObjectItem(utt, "definite");
+            cJSON* utext = cJSON_GetObjectItem(utt, "text");
+            if (cJSON_IsTrue(def) && cJSON_IsString(utext) && utext->valuestring) {
+                committed += strlen(utext->valuestring);
+            }
+        }
+        *committed_out = committed;
     }
     cJSON_Delete(root);
     return out;
@@ -124,14 +141,15 @@ static void asr_handle_frame(AsrSession* s, const uint8_t* data, size_t len) {
         asr_emit_error(s, (int)f.error_code, msg);
     } else if (f.msg_type == VOLC_MSG_FULL_SERVER) {
         if (payload_len > 0 && f.serialization == VOLC_SER_JSON) {
-            char* text = asr_extract_text(payload, payload_len);
+            size_t committed = VOLC_ASR_COMMITTED_UNKNOWN;
+            char* text = asr_extract(payload, payload_len, &committed);
             if (text && text[0] &&
                 (!s->last_text || strcmp(text, s->last_text) != 0)) {
                 free(s->last_text);
                 s->last_text = text;
                 text = nullptr;
                 if (!f.is_last && s->cbs.on_delta) {
-                    s->cbs.on_delta(s->last_text, s->cbs.ctx);
+                    s->cbs.on_delta(s->last_text, committed, s->cbs.ctx);
                 }
             }
             free(text);

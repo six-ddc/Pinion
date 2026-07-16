@@ -2365,6 +2365,7 @@ int Utf8CodepointCount(const char* s) {
 // ---------------------------------------------------------------------------
 SemaphoreHandle_t s_asr_mutex = nullptr;
 std::string s_asr_live_text;   // guarded by s_asr_mutex（服务端全量文本）
+size_t s_asr_committed_bytes = VOLC_ASR_COMMITTED_UNKNOWN;  // 已定稿前缀字节数（同 s_asr_mutex）
 std::string s_asr_error_text;  // guarded by s_asr_mutex
 volatile bool s_asr_final_ready = false;
 volatile bool s_asr_failed = false;
@@ -2374,9 +2375,10 @@ std::string s_asr_rendered;        // 上次渲染的文本（LVGL 线程，去�
 void AsrLock() { xSemaphoreTake(s_asr_mutex, portMAX_DELAY); }
 void AsrUnlock() { xSemaphoreGive(s_asr_mutex); }
 
-void OnAsrDelta(const char* text, void*) {
+void OnAsrDelta(const char* text, size_t committed_bytes, void*) {
     AsrLock();
     s_asr_live_text = text;
+    s_asr_committed_bytes = committed_bytes;
     AsrUnlock();
 }
 
@@ -2538,16 +2540,32 @@ void AsrTick(lv_timer_t*) {
     }
 
     std::string text;
+    size_t committed;
     AsrLock();
     text = s_asr_live_text;
+    committed = s_asr_committed_bytes;
     AsrUnlock();
     if (text != s_asr_rendered) {
         s_asr_rendered = text;
-        // 尾部 6 个码点琥珀高亮：沿用假走带的 ".cur" 视觉，数据源换成真 delta
-        int total_cp = Utf8CodepointCount(text.c_str());
-        int hi_start = total_cp - kAsrHighlightCodepoints;
-        if (hi_start < 0) hi_start = 0;
-        int plain_bytes = Utf8PrefixBytes(text.c_str(), hi_start);
+        // 未定稿尾部琥珀高亮。有 definite 信息时高亮 [committed, end)——服务端尚
+        // 未锁定、仍可能回改的分句；无信息时（sim / 无 utterances）退回旧的尾部
+        // 固定 6 码点视觉（沿用假走带的 ".cur" 观感）。
+        int plain_bytes;
+        if (committed == VOLC_ASR_COMMITTED_UNKNOWN) {
+            int total_cp = Utf8CodepointCount(text.c_str());
+            int hi_start = total_cp - kAsrHighlightCodepoints;
+            if (hi_start < 0) hi_start = 0;
+            plain_bytes = Utf8PrefixBytes(text.c_str(), hi_start);
+        } else {
+            // committed 来自 utterances 拼接字节数，与 result.text 可能因标点/ITN
+            // 略有出入：clamp 到文本长度，再往前吸附到 UTF-8 字符边界。
+            plain_bytes = committed < text.size() ? static_cast<int>(committed)
+                                                  : static_cast<int>(text.size());
+            while (plain_bytes > 0 &&
+                   (static_cast<unsigned char>(text[plain_bytes]) & 0xC0) == 0x80) {
+                plain_bytes--;
+            }
+        }
         char hi_tag[12];
         std::snprintf(hi_tag, sizeof(hi_tag), "#%06X ",
                       static_cast<unsigned>(pi_theme::Hex(Tok::Accent)));
@@ -2570,6 +2588,7 @@ void StartListen(ViewState return_state, ListenOwner owner) {
     EnsureVoiceInfra();
     AsrLock();
     s_asr_live_text.clear();
+    s_asr_committed_bytes = VOLC_ASR_COMMITTED_UNKNOWN;
     s_asr_error_text.clear();
     AsrUnlock();
     VoiceSend(VoiceCmd::Start);  // 建连+开采集都在 voice 任务，UI 不阻塞

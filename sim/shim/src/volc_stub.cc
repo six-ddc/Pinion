@@ -82,7 +82,8 @@ void sim_asr_type(const char* utf8) {
     g_asr_text += utf8;
     g_asr_last_input_ms = NowMs();
     g_asr_force_silence = false;
-    if (g_asr_cbs.on_delta != nullptr) g_asr_cbs.on_delta(g_asr_text.c_str(), g_asr_cbs.ctx);
+    if (g_asr_cbs.on_delta != nullptr)
+        g_asr_cbs.on_delta(g_asr_text.c_str(), VOLC_ASR_COMMITTED_UNKNOWN, g_asr_cbs.ctx);
 }
 
 void sim_asr_backspace(void) {
@@ -93,7 +94,8 @@ void sim_asr_backspace(void) {
     if (n > 0) n--;
     g_asr_text.resize(n);
     g_asr_last_input_ms = NowMs();
-    if (g_asr_cbs.on_delta != nullptr) g_asr_cbs.on_delta(g_asr_text.c_str(), g_asr_cbs.ctx);
+    if (g_asr_cbs.on_delta != nullptr)
+        g_asr_cbs.on_delta(g_asr_text.c_str(), VOLC_ASR_COMMITTED_UNKNOWN, g_asr_cbs.ctx);
 }
 
 void sim_asr_end_of_speech(void) {

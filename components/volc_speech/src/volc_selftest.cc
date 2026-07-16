@@ -23,7 +23,7 @@ struct SelftestCtx {
     int error_code;
 };
 
-static void st_asr_delta(const char* text, void* /*ctx*/) {
+static void st_asr_delta(const char* text, size_t /*committed_bytes*/, void* /*ctx*/) {
     ESP_LOGI(TAG, "asr_delta: %s", text);
 }
 
