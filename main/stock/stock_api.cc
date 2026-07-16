@@ -401,6 +401,10 @@ bool FetchQuoteBatch(const std::string* syms, size_t n, StockQuote* outs,
         outs[i].turnover_rate = f.turnover_rate;
         outs[i].volume = f.volume;
         outs[i].amount = f.amount;
+        outs[i].pe = f.pe;
+        outs[i].pb = f.pb;
+        outs[i].float_cap_yi = f.float_cap_yi;
+        outs[i].total_cap_yi = f.total_cap_yi;
         outs[i].fetched_at = NowMs();
         outs[i].valid = f.valid;
         if (f.valid) valid_count++;

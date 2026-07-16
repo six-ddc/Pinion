@@ -43,6 +43,11 @@ void AddQuote(cJSON* arr, const StockQuote& q) {
     cJSON_AddNumberToObject(o, "prev_close", Round2(q.last_close));
     cJSON_AddNumberToObject(o, "vol", static_cast<double>(static_cast<long long>(q.volume)));
     cJSON_AddNumberToObject(o, "amount", static_cast<double>(static_cast<long long>(q.amount)));
+    // 估值字段缺失（HK/US 的 pb、停牌新股等）时不加键，省 token 也免得 0 值误导。
+    if (q.pe > 0) cJSON_AddNumberToObject(o, "pe", Round2(q.pe));
+    if (q.pb > 0) cJSON_AddNumberToObject(o, "pb", Round2(q.pb));
+    if (q.float_cap_yi > 0) cJSON_AddNumberToObject(o, "float_cap_yi", Round2(q.float_cap_yi));
+    if (q.total_cap_yi > 0) cJSON_AddNumberToObject(o, "total_cap_yi", Round2(q.total_cap_yi));
     cJSON_AddItemToArray(arr, o);
 }
 

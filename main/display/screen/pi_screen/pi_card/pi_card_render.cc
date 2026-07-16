@@ -439,7 +439,6 @@ lv_obj_t* MakeChoice(lv_obj_t* parent, const cJSON* node) {
         lv_label_set_text(lbl, text);
         lv_obj_center(lbl);
         lv_obj_add_event_cb(seg, ChoiceSegClickedCb, LV_EVENT_CLICKED, box);
-        screen_swipe_back_ignore(seg, true);
         ctx->btns.push_back(seg);
     }
     int value = GetInt(node, "value", 0);
@@ -469,6 +468,12 @@ void ApplyBind(lv_obj_t* obj, const char* type, const char* path, const cJSON* n
     if (std::strcmp(type, "label") == 0) {
         HubType t = HubType::Int;
         hub.TypeOf(path, t);
+        // String 绑定的值可能含中文（"1.57万亿" / SSID / "超限"），而 SafeFont 只检查过静态
+        // text——mono 字体无 CJK 会渲成豆腐块。绑定期文本未知，按"可能含中文"保守换字体。
+        if (t == HubType::String) {
+            const lv_font_t* f = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+            if (SafeFont(f, "值")) lv_obj_set_style_text_font(obj, f, LV_PART_MAIN);
+        }
         const char* fmt = GetStr(node, "fmt", t == HubType::String ? nullptr : "%d");
         // 兜底网：畸形 fmt 本应被 Validate 挡在工具期，但校验器/渲染器万一不同构时，这里
         // 回落安全默认，绝不让 %s 套 int 之类崩到 newlib vsnprintf 里（见 FmtSafeForType）。
@@ -516,7 +521,7 @@ void ApplyCommonProps(lv_obj_t* obj, const char* type, const cJSON* node, UiCard
     if (HasKey(node, "pad")) lv_obj_set_style_pad_all(obj, GetInt(node, "pad", 0), LV_PART_MAIN);
     ApplyFill(obj, node);
     if (GetBool(node, "hidden")) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    if (IsInteractive(type)) screen_swipe_back_ignore(obj, true);
+    // 卡内交互控件不再需要豁免屏级手势：edge-nav 只认屏幕边缘起手的横滑。
 }
 
 }  // namespace
@@ -1109,10 +1114,12 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
             }
         }
     }
-    // bind 路径必须已注册
+    // bind 路径必须已注册（或命中动态 provider 的合法模式）
     if (const char* path = GetStr(node, "bind")) {
         if (!DataHub::Instance().Has(path)) {
             err = std::string("unknown bind path: ") + path;
+            // 前缀对但格式错（如 stock.茅台.price）：附 provider 的用法提示教 LLM 改对。
+            if (const char* h = DataHub::Instance().HintFor(path)) err += std::string("; ") + h;
             return false;
         }
         // label 的 fmt 必须与绑定值类型相容，否则渲染时 newlib vsnprintf 会解引用坏指针崩溃

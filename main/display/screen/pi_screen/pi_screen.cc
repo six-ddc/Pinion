@@ -92,7 +92,8 @@ constexpr int32_t kHSwipeDisarmPx = 40;
 // 触屏"按住说话"阈值：按住不足此时长的轻点不进聆听（不再闪一下），与实体键一致。
 constexpr uint32_t kTouchHoldToTalkMs = 240;
 constexpr int32_t kNvsNamespaceMaxTools = 4;   // cached tool cards per turn (ZEN peek)
-constexpr int32_t kPinClockH = 300;  // 常驻组件出现时，时钟区收缩到这个高度（原 kMidH=552）
+// pin 常驻组件在场时大时钟区整体隐藏（时间/日期上移到状态栏中央迷你时钟），
+// pin host 占满状态栏以下整片区域并纵向居中承载卡片——不再收缩共存。
 
 // ----- per-view state --------------------------------------------------
 enum class ViewState { Idle, Listen, Chat };
@@ -109,6 +110,7 @@ bool s_zen = false;
 
 // idle view widgets
 lv_obj_t* s_clock_lbl = nullptr;
+lv_obj_t* s_sbar_clock_lbl = nullptr;  // pin 在场时状态栏中央的迷你时钟（默认隐藏）
 lv_obj_t* s_date_lbl = nullptr;
 lv_obj_t* s_idle_mid = nullptr;  // 时钟容器（DIM 防烧屏移位的对象；pin 出现时收缩到 kPinClockH）
 lv_obj_t* s_idle_breath = nullptr;
@@ -132,6 +134,7 @@ struct WifiWidget {               // 三条状态栏（idle/listen/chat）各持
     lv_obj_t* g4_lbl = nullptr;   // 4G 模式左侧 mono 小字
     lv_obj_t* bars[3] = {};       // 3 格信号
     lv_obj_t* err_dot = nullptr;  // 未连接/无凭据的 err 色小点
+    lv_obj_t* bat_lbl = nullptr;  // 信号后的电量百分比（充电 Ok 色 / 低电 Err 色 / 平时 Dim）
 };
 std::vector<WifiWidget> s_wifi_widgets;
 std::atomic<int> s_net_link{static_cast<int>(NetLinkState::Connecting)};
@@ -540,7 +543,6 @@ lv_obj_t* BuildIdBox(lv_obj_t* parent) {
     lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(box, 8, LV_PART_MAIN);
     lv_obj_add_flag(box, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(box, true);
 
     lv_obj_t* mark = MakeRect(box, 8, 18, Tok::Accent);
     lv_obj_remove_flag(mark, LV_OBJ_FLAG_CLICKABLE);
@@ -563,7 +565,9 @@ lv_obj_t* BuildWifi(lv_obj_t* parent) {
     screen_strip_obj_chrome(box);
     lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(box, LV_SIZE_CONTENT, 14);
+    // 高度自适应（原定高 14 为信号条调的，加入 17px 电量文字后会裁字）；纵向仍底对齐，
+    // 信号条/err 点用 margin_bottom 抬升到与文字视觉中线对齐（光学居中）。
+    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
@@ -581,12 +585,20 @@ lv_obj_t* BuildWifi(lv_obj_t* parent) {
     for (int i = 0; i < 3; i++) {
         lv_obj_t* bar = MakeRect(box, 3, kBarH[i], Tok::Faint);  // 初始全暗，刷新落真值
         lv_obj_set_style_radius(bar, 1, LV_PART_MAIN);
+        lv_obj_set_style_margin_bottom(bar, 3, LV_PART_MAIN);  // 抬到与电量文字视觉中线对齐
         w.bars[i] = bar;
     }
 
     w.err_dot = MakeCircle(box, 6, Tok::Err);
     lv_obj_set_style_margin_left(w.err_dot, 3, LV_PART_MAIN);
+    lv_obj_set_style_margin_bottom(w.err_dot, 5, LV_PART_MAIN);
     lv_obj_add_flag(w.err_dot, LV_OBJ_FLAG_HIDDEN);
+
+    // 信号后统一跟电量百分比（RefreshBatteryWidgets 周期落真值；三条状态栏同款）。
+    w.bat_lbl = lv_label_create(box);
+    lv_label_set_text(w.bat_lbl, "--%");
+    SetLabelFont(w.bat_lbl, &font_pi_mono_17, Tok::Dim);
+    lv_obj_set_style_pad_left(w.bat_lbl, 8, LV_PART_MAIN);
 
     s_wifi_widgets.push_back(w);
     return box;
@@ -641,6 +653,31 @@ void RefreshWifiWidgets(bool force = false) {
     }
 }
 
+// 状态栏电量：GetBatterySnapshot 非阻塞原子读（sysmon 1Hz 发布），渲染键
+// (level|charging|valid) 不变时跳过，避免每 tick 重排版。充电 Ok 色、≤20% Err 色。
+int s_bat_last_render = -1;
+void RefreshBatteryWidgets() {
+    int level = 0;
+    bool charging = false, discharging = false;
+    bool valid = mhal::power::GetBatterySnapshot(level, charging, discharging);
+    int render_key = valid ? ((level << 2) | (charging ? 2 : 0) | 1) : 0;
+    if (render_key == s_bat_last_render)
+        return;
+    s_bat_last_render = render_key;
+
+    char buf[8];
+    if (valid)
+        std::snprintf(buf, sizeof(buf), "%d%%", level);
+    else
+        std::snprintf(buf, sizeof(buf), "--%%");
+    Tok tok = !valid ? Tok::Faint : (charging ? Tok::Ok : (level <= 20 ? Tok::Err : Tok::Dim));
+    for (auto& w : s_wifi_widgets) {
+        if (w.bat_lbl == nullptr) continue;
+        lv_label_set_text(w.bat_lbl, buf);
+        pi_theme::ApplyText(w.bat_lbl, tok);
+    }
+}
+
 // 1s tick：事件 dirty 即刷；已连接后按模式周期轮询信号档位（WiFi RSSI 是
 // 即取即回缓存，5s 一刷；4G CSQ 走 AT 通道，15s 一刷别刷太勤）。
 void NetTick(lv_timer_t*) {
@@ -650,6 +687,7 @@ void NetTick(lv_timer_t*) {
     uint32_t period = wifi_mode ? 5 : 15;
     if (dirty || s_net_ticks % period == 0)
         RefreshWifiWidgets(dirty);
+    RefreshBatteryWidgets();  // 键控跳过，无变化零开销
 }
 
 
@@ -714,6 +752,22 @@ void UpdateIdleClock(lv_timer_t*) {
         }
         lv_label_set_text(s_date_lbl, dbuf);
     }
+
+    // pin 在场时的状态栏迷你时钟：时间 + 日期压成一行（"12:34 · THU · JUL 17"）。
+    if (s_sbar_clock_lbl != nullptr) {
+        static const char* kWd2[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+        static const char* kMo2[12] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                                        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+        char sbuf[48];
+        if (tm_info.tm_year >= 2025 - 1900) {
+            std::snprintf(sbuf, sizeof(sbuf), "%02d:%02d \xc2\xb7 %s \xc2\xb7 %s %d",
+                          tm_info.tm_hour, tm_info.tm_min, kWd2[tm_info.tm_wday],
+                          kMo2[tm_info.tm_mon], tm_info.tm_mday);
+        } else {
+            std::snprintf(sbuf, sizeof(sbuf), "--:--");
+        }
+        lv_label_set_text(s_sbar_clock_lbl, sbuf);
+    }
 }
 
 void BuildIdleView(lv_obj_t* parent) {
@@ -736,6 +790,16 @@ void BuildIdleView(lv_obj_t* parent) {
     // 显示（见 UpdateDockStat）。s_idle_ctx_* 保持 null，RenderCtxGauge/SetCtxFill
     // 均已 null-guard。与聊天页状态栏保持一致的留白。
     BuildWifi(sbar);
+
+    // pin 在场时的迷你时钟：大时钟区整体让位给 pin 卡，时间/日期上移到状态栏顶部中央
+    //（ApplyPinLayout 控制显隐，默认隐藏）。挂 s_idle_view 而非 sbar flex 行——绝对
+    // 居中，不受状态栏左右内容宽度不对称影响。
+    s_sbar_clock_lbl = lv_label_create(s_idle_view);
+    lv_label_set_text(s_sbar_clock_lbl, "--:--");
+    SetLabelFont(s_sbar_clock_lbl, &font_pi_mono_20, Tok::Tx);
+    lv_obj_set_style_text_letter_space(s_sbar_clock_lbl, 2, LV_PART_MAIN);
+    lv_obj_align(s_sbar_clock_lbl, LV_ALIGN_TOP_MID, 0, (kSbarH - 20) / 2);
+    lv_obj_add_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t* mid = lv_obj_create(s_idle_view);
     screen_strip_obj_chrome(mid);
@@ -995,6 +1059,11 @@ void ApplyModeVisual() {
         if (s_zen) lv_obj_remove_flag(s_act_line, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(s_act_line, LV_OBJ_FLAG_HIDDEN);
     }
+    // 回合中途 FLOW→ZEN：活动行上可能残留 FLOW 期间写入的 "name -> output"（含工具
+    // 输出 JSON），显示出来前先清成中性文案，别让 ZEN 第一眼就泄漏。
+    if (s_zen && s_act_text != nullptr) {
+        lv_label_set_text(s_act_text, "working...");
+    }
 }
 
 void SetZen(bool zen) {
@@ -1041,7 +1110,6 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_obj_set_style_pad_hor(mode_btn, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(mode_btn, 4, LV_PART_MAIN);
     lv_obj_add_flag(mode_btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(mode_btn, true);
     lv_obj_set_flex_flow(mode_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(mode_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(mode_btn, 8, LV_PART_MAIN);
@@ -1081,7 +1149,6 @@ lv_obj_t* BuildChatSbar(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(tts_btn, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(tts_btn, 4, LV_PART_MAIN);
     lv_obj_add_flag(tts_btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(tts_btn, true);
     lv_obj_set_flex_flow(tts_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(tts_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
@@ -1175,7 +1242,6 @@ void ShowErrorBanner(const char* message) {
         lv_label_set_text(retry, "\xe9\x87\x8d\xe8\xaf\x95");  // "重试"
         SetLabelFont(retry, &font_puhui_20_4, Tok::Accent);
         lv_obj_add_flag(retry, LV_OBJ_FLAG_CLICKABLE);
-        screen_swipe_back_ignore(retry, true);
         lv_obj_add_event_cb(
             retry, [](lv_event_t*) { RetryLastPrompt(); }, LV_EVENT_CLICKED, nullptr);
     }
@@ -1221,7 +1287,6 @@ lv_obj_t* CreateToolCard(lv_obj_t* parent, const char* name) {
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_clip_corner(card, true, LV_PART_MAIN);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(card, true);
     // head 与 body 纵向堆叠；漏掉这行时二者都落在 (0,0)，展开 body 会与
     // 标题行重叠（sim 交互测试发现的真机同现 bug）。
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
@@ -1457,10 +1522,11 @@ void OnPttPressing(lv_event_t* e) {
             PttCancelHoldTimer();
             return;
         }
-        // 横向占优且越过阈值：这是一次滑动（Idle 左滑回对话 / Chat 右滑回待机），
-        // 不是按住说话。撤销待起的聆听但**不** wait_release——否则会把随后要冒泡到
-        // screen 的 LV_EVENT_GESTURE 一并吞掉，导致左/右滑失效。松手时 OnPttReleased
-        // 因 s_ptt_tracking=false 而不发送，手势交给 OnScrGesture 处理。
+        // 横向占优且越过阈值：这是一次滑动（可能是边缘导航），不是按住说话。撤销
+        // 待起的聆听但**不** wait_release——wait_release 会让 indev 停摆到松手，
+        // 边缘导航的 GESTURE 快路径与 RELEASED 兜底会被双杀（indev 级 edge-nav 也
+        // 依赖这两个事件，见 screen_util）。松手时 OnPttReleased 因
+        // s_ptt_tracking=false 而不发送，手势交给 edge-nav 层判定。
         if (LV_ABS(dx) > kHSwipeDisarmPx && LV_ABS(dx) > LV_ABS(dy)) {
             s_ptt_tracking = false;
             PttCancelHoldTimer();
@@ -1538,7 +1604,6 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_set_style_pad_hor(s_stop_btn, 30, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(s_stop_btn, 18, LV_PART_MAIN);
     lv_obj_add_flag(s_stop_btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(s_stop_btn, true);
     lv_obj_set_flex_flow(s_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(s_stop_btn, 14, LV_PART_MAIN);
@@ -1566,7 +1631,6 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_set_style_pad_hor(s_talk_btn, 34, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(s_talk_btn, 18, LV_PART_MAIN);
     lv_obj_add_flag(s_talk_btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(s_talk_btn, true);
     lv_obj_add_flag(s_talk_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_flex_flow(s_talk_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_talk_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1921,11 +1985,18 @@ void ThinkTimerTick(lv_timer_t*) {
 }
 
 void ToolRunningTimerTick(lv_timer_t*) {
-    if (s_cur_tool_ret_lbl == nullptr) return;
     float secs = (lv_tick_get() - s_tool_start_ms) / 1000.0f;
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "RUNNING %s", FormatSecs1(secs).c_str());
-    lv_label_set_text(s_cur_tool_ret_lbl, buf);
+    if (s_cur_tool_ret_lbl != nullptr) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "RUNNING %s", FormatSecs1(secs).c_str());
+        lv_label_set_text(s_cur_tool_ret_lbl, buf);
+    }
+    // ZEN：活动行只给中性活性（无工具名/无输出——ZEN 契约是过程完全收起，事后 peek）。
+    if (s_zen && s_act_text != nullptr) {
+        char zb[48];
+        std::snprintf(zb, sizeof(zb), "working \xc2\xb7 %s", FormatSecs1(secs).c_str());
+        lv_label_set_text(s_act_text, zb);
+    }
 }
 
 // 单行消耗簇：IN 输入 token · OUT 输出 token · CTX 上下文占用率。三者都在 DONE
@@ -2039,7 +2110,9 @@ void DrainQueueTick(lv_timer_t*) {
                     lv_obj_move_to_index(s_act_line, lv_obj_get_child_count(s_feed) - 1);
                     s_cur_tool_card = card;
                 }
-                lv_label_set_text(s_act_text, name);
+                // ZEN 不透出工具名（"完全不展示工具调用"契约）；FLOW 的活动行本就隐藏，
+                // 写名字只为将来调试可见性，保持原样。
+                lv_label_set_text(s_act_text, s_zen ? "working..." : name);
                 s_tool_start_ms = lv_tick_get();
                 if (s_tool_running_timer == nullptr) {
                     s_tool_running_timer = lv_timer_create(ToolRunningTimerTick, 100, nullptr);
@@ -2077,7 +2150,15 @@ void DrainQueueTick(lv_timer_t*) {
                     }
                 }
                 char act[160];
-                std::snprintf(act, sizeof(act), "%s -> %s", name, output);
+                if (s_zen) {
+                    // ZEN 泄漏修复：原来这里无条件写 "name -> output"，而 ui_render/stock 的
+                    // output 是大段 JSON，在 ZEN 可见的活动行上整坨铺开＝工具结果照样展示。
+                    // ZEN 只给中性完成信号；完整过程仍进 s_tool_cache 供回合结束后 peek。
+                    std::snprintf(act, sizeof(act), "done \xc2\xb7 %s",
+                                  FormatSecs1(evt.i1 / 1000.0f).c_str());
+                } else {
+                    std::snprintf(act, sizeof(act), "%s -> %s", name, output);
+                }
                 lv_label_set_text(s_act_text, act);
                 s_turn_last_tool_output = output;
                 if (s_tool_cache.size() < kNvsNamespaceMaxTools) {
@@ -2263,11 +2344,24 @@ void Go(ViewState s) {
     }
 }
 
-// pin 常驻组件的待机布局：出现时收缩时钟区到 kPinClockH、隐 breath、隐"按住说话"提示条
-// （给常驻组件让位），Idle 态下显示 pin host；消失后完全复原（D2）。
+// pin 常驻组件的待机布局：出现时大时钟区整体隐藏（时间/日期上移到状态栏中央的迷你
+// 时钟），隐 breath、隐"按住说话"提示条——腾出的整片区域交给 pin host（flex 纵向居中
+// 承载卡片）；Idle 态下显示 pin host；消失后完全复原（D2）。
 void ApplyPinLayout(bool has) {
     s_has_pin = has;
-    if (s_idle_mid != nullptr) lv_obj_set_height(s_idle_mid, has ? kPinClockH : kMidH);
+    if (s_idle_mid != nullptr) {
+        if (has) lv_obj_add_flag(s_idle_mid, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_idle_mid, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_sbar_clock_lbl != nullptr) {
+        if (has) lv_obj_remove_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    // 迷你时钟占据状态栏中央，待机页模型名让位（会与之重叠；左侧 pi 标识保留）。
+    if (s_idle_model_lbl != nullptr) {
+        if (has) lv_obj_add_flag(s_idle_model_lbl, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_idle_model_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
     if (s_idle_breath != nullptr) {
         if (has) lv_obj_add_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
@@ -2711,7 +2805,6 @@ lv_obj_t* MakeSheetButton(lv_obj_t* parent, Tok border_color, lv_obj_t** out_lab
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
     pi_theme::ApplyBg(btn, Tok::Card2, LV_STATE_PRESSED);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(btn, true);
     lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t* lbl = lv_label_create(btn);
@@ -2995,50 +3088,33 @@ void OnScrPressing(lv_event_t* e) {
 
 void OnScrReleased(lv_event_t*) { s_sbar_pull_tracking = false; }
 
-// Chat 态右滑 -> 回待机、Idle 态左滑 -> 回对话（两向都只切视图、绝不销毁会话，
-// 与 Go() 的隐藏/显示模型一致）。右滑在聆听中、生成中（STOP 可见）、面板/sheet
-// 打开时不响应；左滑要求本会话已有轮次（s_session_turns>0），否则无历史可回、忽略。
-// LV_EVENT_GESTURE 默认从按压对象一路 GESTURE_BUBBLE 到 screen，无需逐子件挂标志。
-void OnScrGesture(lv_event_t* e) {
-    lv_indev_t* indev = lv_event_get_indev(e);
-    if (indev == nullptr)
-        return;
-    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-
-    // Idle 态左滑：回到隐藏着的对话。气泡与 agent 上下文从未销毁，Go(Chat) 直接
-    // 复用，且保留原滚动位置＝"最小化/还原"语义（回到离开时看的那一屏）。刚开机 /
-    // 刚新建时 s_session_turns==0，无历史可回，左滑忽略。是右滑退出的镜像入口。
-    if (dir == LV_DIR_LEFT) {
-        if (s_state != ViewState::Idle || s_session_turns <= 0)
-            return;
-        if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open || pi_settings::IsOpen())
-            return;
-        lv_indev_wait_release(indev);
-        Go(ViewState::Chat);
+// 边缘滑动导航的策略路由（机制在 screen_util 的 indev 级 edge-nav 层：只有起点
+// 落在屏幕左/右边缘带的横滑才会派发到这里，屏幕内部横滑全归控件所有，不再需要
+// 旧的逐控件 screen_swipe_back_ignore 打标）。两向都只切视图、绝不销毁会话，与
+// Go() 的隐藏/显示模型一致：
+//   左缘右滑：设置栈打开 -> 逐级返回；Chat 态 -> 回待机（生成中忽略）。
+//   右缘左滑：Idle 态 -> 回对话（要求本会话已有轮次，否则无历史可回、忽略）。
+//   快捷面板 / sheet / overlay 卡片打开时一律忽略（模态语义；overlay 此前靠
+//   scrim 打标豁免，现收进这里统一守卫）。
+void OnEdgeNav(screen_edge_nav_dir_t dir) {
+    if (pi_settings::IsOpen()) {
+        if (dir == SCREEN_EDGE_NAV_FROM_LEFT) pi_settings::Back();
         return;
     }
-
-    if (dir != LV_DIR_RIGHT)
+    if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open ||
+        pi_card::HasOpenOverlay()) {
         return;
-    if (s_state != ViewState::Chat)
-        return;
-    // 设置栈打开时右滑语义归 pi_settings（逐级返回），这里不抢
-    if (pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open || pi_settings::IsOpen())
-        return;
-    if (IsGenerating())
-        return;
-    // 按压对象落在滑块/arc/roller 或标了 screen_swipe_back_ignore 的控件（pi_card
-    // 卡片、overlay scrim…）里时，这一横拖是控件自己的语义，不当作右滑返回——否则
-    // 拖动卡片里的亮度/音量滑条会误触 Chat→Idle。注意：LV_EVENT_GESTURE 的 target
-    // 是 LVGL 沿 GESTURE_BUBBLE 链上溯的 gesture_obj，并非按压的滑块；必须用
-    // lv_indev_get_active_obj()（指针捕获下恒为真正按压的控件）来判定归属。
-    lv_obj_t* scr = lv_event_get_current_target_obj(e);
-    lv_obj_t* pressed = lv_indev_get_active_obj();
-    if (pressed == nullptr) pressed = lv_event_get_target_obj(e);
-    if (screen_event_in_drag_owner(pressed, scr))
-        return;
-    lv_indev_wait_release(indev);
-    Go(ViewState::Idle);
+    }
+    if (dir == SCREEN_EDGE_NAV_FROM_LEFT) {
+        if (s_state != ViewState::Chat || IsGenerating()) return;
+        Go(ViewState::Idle);
+    } else {
+        // Idle 右缘左滑：回到隐藏着的对话。气泡与 agent 上下文从未销毁，Go(Chat)
+        // 直接复用且保留原滚动位置＝"最小化/还原"语义。刚开机/刚新建时
+        // s_session_turns==0，无历史可回，忽略。
+        if (s_state != ViewState::Idle || s_session_turns <= 0) return;
+        Go(ViewState::Chat);
+    }
 }
 
 void EnableEventBubbleRecursive(lv_obj_t* obj) {
@@ -3164,10 +3240,12 @@ void OnScreenUnloaded(lv_event_t*) {
     s_scr = s_idle_view = s_listen_view = s_chat_view = s_ptt_layer = nullptr;
     s_feed = s_act_line = s_act_dot = s_act_text = s_act_peek = s_peek_container = nullptr;
     s_feed_stick = true;  // 别把脱离态泄漏给下一次 Create（屏卸载/重载）
+    s_sbar_clock_lbl = nullptr;
     s_clock_lbl = s_date_lbl = s_idle_mid = s_idle_breath = s_idle_ctx_fill = s_idle_ctx_lbl =
         nullptr;
     s_wifi_widgets.clear();
     s_net_last_render = -1;
+    s_bat_last_render = -1;
     s_idle_model_lbl = s_chat_model_lbl = nullptr;
     s_wave_row = s_asr_lbl = s_rec_lbl = nullptr;
     s_listen_pill = s_listen_pill_lbl = s_listen_cancel_hint = nullptr;
@@ -3240,10 +3318,8 @@ lv_obj_t* PiScreen::Create() {
     // Persistent PTT touch target, y:[kSbarH, kH). Built last so it sits on
     // top of the idle/listen content in z-order; hidden while in Chat so
     // the feed's scroll/tap and the dock buttons receive touches directly.
-    // Deliberately NOT tagged screen_swipe_back_ignore(): a clear rightward
-    // swipe across it should still exit to the home menu (a plain
-    // press-and-hold in place has dx~0 and never crosses the swipe-back
-    // threshold, so the two gestures don't collide in practice).
+    // 与边缘导航天然共存：edge-nav 是 indev 级、不依赖对象冒泡，PTT 层收走按压
+    // 不影响它；纯按住 dx~0 永不越导航阈值，两手势不冲突。
     s_ptt_layer = lv_obj_create(scr);
     screen_strip_obj_chrome(s_ptt_layer);
     lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_SCROLLABLE);
@@ -3263,8 +3339,12 @@ lv_obj_t* PiScreen::Create() {
     screen_strip_obj_chrome(s_pin_host);
     lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(s_pin_host, kW, kH - kSbarH - kPinClockH);
-    lv_obj_set_pos(s_pin_host, 0, kSbarH + kPinClockH);
+    lv_obj_set_size(s_pin_host, kW, kH - kSbarH);
+    lv_obj_set_pos(s_pin_host, 0, kSbarH);
+    // 卡片 wrapper（宽 100%、高自适应）在整片区域内纵向居中——大时钟已让位，居中展示。
+    lv_obj_set_flex_flow(s_pin_host, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_pin_host, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_bg_opa(s_pin_host, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
 
@@ -3288,14 +3368,18 @@ lv_obj_t* PiScreen::Create() {
     st_hooks.set_zen = [](bool zen) { SetZen(zen); };
     pi_settings::SetHooks(st_hooks);
 
-    // 状态栏下拉（呼出快捷面板）与 Chat 态右滑回待机：追踪器挂在 screen 上；
-    // 三个 sbar 子树打开 EVENT_BUBBLE，让 IdBox 等可点击子件上的按压也可追踪。
+    // 状态栏下拉（呼出快捷面板）：追踪器挂在 screen 上；三个 sbar 子树打开
+    // EVENT_BUBBLE，让 IdBox 等可点击子件上的按压也可追踪。
     lv_obj_add_event_cb(scr, OnScrPressed, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(scr, OnScrPressing, LV_EVENT_PRESSING, nullptr);
     lv_obj_add_event_cb(scr, OnScrReleased, LV_EVENT_RELEASED, nullptr);
-    lv_obj_add_event_cb(scr, OnScrGesture, LV_EVENT_GESTURE, nullptr);
     for (lv_obj_t* sbar : s_sbars)
         EnableEventBubbleRecursive(sbar);
+    // 边缘滑动导航：indev 级手势层（机制），路由策略在 OnEdgeNav。须在 indev
+    // 已创建后初始化（mhal::Init 的 LVGL 适配器早于 pi_screen Create，满足）。
+    // 不变量：screen 保持默认 CLICKABLE——空白背景按压靠它兜底命中，indev 事件
+    // 才会派发（见 screen_util.h 说明）。
+    screen_edge_nav_init(OnEdgeNav);
 
     // P1：状态栏网络真状态。分发层一处订阅 mhal::network::OnEvent、多处
     // 监听（pi_settings 网络页共用），这里必须在 main.cc 的 StartAsync()
@@ -3328,7 +3412,9 @@ lv_obj_t* PiScreen::Create() {
         s_net_dirty = true;
     });
     s_net_last_render = -1;
+    s_bat_last_render = -1;
     RefreshWifiWidgets(true);
+    RefreshBatteryWidgets();  // 建屏立即落一次电量，不等首个 tick
     s_net_timer = lv_timer_create(NetTick, 1000, nullptr);
 
     // P2：主题切换重涂钩子。静态配色全在 pi_theme 共享样式里自动翻转；这里
@@ -3611,8 +3697,8 @@ lv_obj_t* PiScreen::Create() {
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);
     s_pickup_timer = lv_timer_create(PickupWatchTick, 150, nullptr);  // P4-b 拿起唤醒轮询
 
-    // 单 App 固件：无 home 菜单可返回；Chat 态右滑是 Go(Idle)（见
-    // OnScrGesture），不走 screen_attach_swipe_back 的卸载语义。
+    // 单 App 固件：无 home 菜单可返回；视图切换全部经边缘导航路由 OnEdgeNav，
+    // 只切视图不卸载 screen。
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
 
     return scr;

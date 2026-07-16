@@ -278,10 +278,73 @@ constexpr const char* kCardP4cGps =
     "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"启用 GPS\","
     "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"gps.enable\"}]}]}]}}";
 
+// 一行多列标签测试（用户反馈设备端 LLM 始终写不对）：上半部分 = 无 grow 的朴素多列
+//（列宽随内容、各行不对齐）；下半部分 = 每列 grow:1 的表格式多列（列对齐）。
+constexpr const char* kCardMultiCol =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"多列标签\"},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"A. row 直排(无 grow, 列不对齐)\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"text\":\"北京\"},{\"type\":\"label\",\"text\":\"32C\"},"
+    "{\"type\":\"label\",\"text\":\"晴\"}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"text\":\"乌鲁木齐\"},{\"type\":\"label\",\"text\":\"28C\"},"
+    "{\"type\":\"label\",\"text\":\"多云\"}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"B. 每列 grow:1(表格式对齐)\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"城市\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"温度\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"天气\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"text\":\"北京\",\"grow\":1},"
+    "{\"type\":\"label\",\"text\":\"32C\",\"grow\":1},"
+    "{\"type\":\"label\",\"text\":\"晴\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"text\":\"乌鲁木齐\",\"grow\":1},"
+    "{\"type\":\"label\",\"text\":\"28C\",\"grow\":1},"
+    "{\"type\":\"label\",\"text\":\"多云\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"text\":\"上海\",\"grow\":1},"
+    "{\"type\":\"label\",\"mono\":true,\"text\":\"30C\",\"grow\":1},"
+    "{\"type\":\"label\",\"tone\":\"ok\",\"text\":\"小雨\",\"grow\":1}]}]}}";
+
+// Phase4 stock 动态绑定验收卡（临时）：两 symbol 各绑若干 stock.<sym>.<field> 路径，
+// 覆盖 price/pct（±号）、pe/pb（HK 的 pb 应显 "--"）、market_cap（万亿 CJK → 验 SafeFont
+// mono 兜底）、amount 人性化、time。渲染先全 "--"，报价落地（~1-3s）后经 subject 自动填。
+constexpr const char* kCardStockBind =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STOCK BIND\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"动态行情绑定\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"贵州茅台\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.sh600519.price\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.sh600519.pct\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"PE / PB\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.sh600519.pe\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.sh600519.pb\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"市值/换手\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.sh600519.market_cap\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.sh600519.turnover\",\"grow\":1}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"腾讯控股\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.hk00700.price\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.hk00700.pct\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"市值/PB\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.hk00700.market_cap\",\"grow\":1},"
+    "{\"type\":\"label\",\"bind\":\"stock.hk00700.pb\",\"grow\":1}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"stock.sh600519.time\"}]}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
-                                  kCardP4aChart, kCardP4bSensors, kCardP4cGps};
+                                  kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
+                                  kCardStockBind};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。

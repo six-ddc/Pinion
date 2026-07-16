@@ -89,6 +89,8 @@ const char *pi_card_system_prompt(void);
     "…}],submit?}; dashboard{title,metrics:[{label,bind,kind?,fmt?,icon?}]}; menu{title,items:"       \
     "[{text,report?}],style?}. Icons (representative): volume|battery|wifi|gear|check|close. "        \
     "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
+    "Table-style columns: stack rows and give EVERY label in each row grow:1 — without grow the "     \
+    "labels hug their text and columns won't line up across rows. "                                   \
     "Example: {\"root\":{\"type\":\"column\",\"gap\":14,\"children\":[{\"type\":\"row\","       \
     "\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio."   \
     "volume\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]}"  \

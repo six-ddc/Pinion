@@ -234,7 +234,6 @@ lv_obj_t* MakeSliderRow(lv_obj_t* parent, const char* name, int32_t min, int32_t
     lv_obj_set_style_pad_all(slider, 14, LV_PART_KNOB);
     lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 22);
-    screen_swipe_back_ignore(slider, true);  // 滑条拥有横向拖拽语义
     *out_slider = slider;
 
     lv_obj_t* val = lv_label_create(row);
@@ -309,7 +308,6 @@ lv_obj_t* MakeGridBtn(lv_obj_t* parent, const char* text_utf8) {
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
     pi_theme::ApplyBg(btn, Tok::Card2, LV_STATE_PRESSED);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-    screen_swipe_back_ignore(btn, true);
     lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(btn, 10, LV_PART_MAIN);

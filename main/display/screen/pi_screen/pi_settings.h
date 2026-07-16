@@ -38,6 +38,10 @@ void Close();
 
 bool IsOpen();
 
+// 逐级返回一层（栈空则整栈关闭）；确认 sheet 打开时先收 sheet。未打开时 no-op。
+// 供 pi_screen 的边缘导航路由（左缘右滑）调用，与页头返回按钮同一语义。
+void Back();
+
 // 屏卸载时清理定时器/回调注册与静态指针（widget 树由 LVGL 随 screen 删除）。
 void OnScreenUnloaded();
 

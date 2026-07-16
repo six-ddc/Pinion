@@ -30,4 +30,16 @@ bool ValidateNode(const cJSON* node, std::string& err);
 // 返回控件根（column）；分配失败返回 nullptr（Validate 已过的 spec 不会走到）。
 lv_obj_t* Create(lv_obj_t* parent, const cJSON* node);
 
+// ---- Phase4：stock.<symbol>.<field> 动态数据绑定 ----
+// 向 DataHub 注册 "stock." 动态路径 provider（pi_card::Init 调，幂等）。任意 label 可
+// bind "stock.sh600519.price" 这类路径：首个绑定按 symbol 建无控件的报价订阅（复用本
+// 模块 timer/worker/policy，盘中 5s），结果推回 DataHub subject 经 observer 自动刷新；
+// 卡片删除释放路径 → 该 symbol 无绑定时退订。同时订阅 symbol 数有上限（超限路径显
+// "超限"）。字段：price|chg|pct|open|high|low|last_close|avg_price|amplitude|turnover|
+// volume|amount|pe|pb|float_cap|market_cap|time（推送侧已格式化，String 只读）。
+void RegisterBindProvider();
+
+// ui_render DESC 用的动态路径说明片段（常驻指针；字段清单与 provider 同源）。
+const char* BindPathsDesc();
+
 }  // namespace pi_card_stock

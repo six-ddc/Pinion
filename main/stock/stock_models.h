@@ -25,6 +25,10 @@ struct StockQuote {
     float turnover_rate = 0; // 换手率 %
     double volume = 0;       // 成交量（统一为"股"；A 股原始"手" ×100）
     double amount = 0;       // 成交额（货币原单位；A 股原始"万元" ×10000）
+    float pe = 0;            // 市盈率 TTM（缺失 0）
+    float pb = 0;            // 市净率（仅 A 股；HK/US 缺失 0）
+    float float_cap_yi = 0;  // 流通市值（亿，币种随市场；缺失 0）
+    float total_cap_yi = 0;  // 总市值（亿；缺失 0）
     uint32_t fetched_at = 0; // esp_timer 毫秒
     bool valid = false;
 };

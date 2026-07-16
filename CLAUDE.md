@@ -107,8 +107,11 @@ backlight restore) → load pi_screen under `mhal::display::Lock()` with `screen
 (the LOAD hook starts `pi_agent_task` and registers the PWR_KEY click) → `network::StartAsync()`.
 
 Interaction shell around the chat UI: PWR_KEY long-press or status-bar pull-down opens
-`pi_quick_panel` (brightness/volume sliders, theme ◐, gear → `pi_settings` six-page stack with
-swipe-right-back); swiping right in Chat returns to standby (new-conversation confirm sheet);
+`pi_quick_panel` (brightness/volume sliders, theme ◐, gear → `pi_settings` six-page stack);
+view navigation is **edge-swipe only** (indev-level layer in `screen_util`, no per-widget
+opt-out tagging): swiping right from the left screen edge exits Chat to standby (or pops one
+settings page), swiping left from the right edge returns Idle → Chat — interior horizontal
+drags always belong to the widget under the finger;
 `pi_sleep` dims then blanks the screen after the configured idle time (touch/PWR_KEY wakes, first
 input is swallowed). `pi_theme::Init()` must run before any widget is built.
 

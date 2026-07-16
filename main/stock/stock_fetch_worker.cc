@@ -5,6 +5,7 @@
 #include "stock_api.h"
 
 #include "esp_log.h"
+#include "metalio_hal/network.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -39,7 +40,16 @@ void WorkerTask(void*) {
         res.mode = req.mode;
         std::memcpy(res.symbol, req.symbol, sizeof(res.symbol));
         std::string err;
-        if (req.kind == Kind::Quote) {
+        // boot 竞态根修：NVS 里 pin 的股票卡在 RehydratePin（load pi_screen）时就会提交
+        // 请求，而 lwip/esp_netif 要到之后的 network::StartAsync() 才初始化——未就绪时
+        // esp_http_client 里的 getaddrinfo 直接命中 lwip assert（tcpip_send_msg_wait_sem
+        // Invalid mbox）→ panic 重启 → rehydrate 再崩，真机开机死循环。IsConnected() 是
+        // 纯状态读（StartAsync 前恒 false，状态栏 NetTick 同窗口反复调用已验证安全），
+        // 未连网一律拒绝本轮；stock_chart 的自适应调度稍后自会重试。
+        if (!mhal::network::IsConnected()) {
+            res.ok = false;
+            SetErr(res, "network not ready");
+        } else if (req.kind == Kind::Quote) {
             auto* q = new StockQuote();
             std::string sym(req.symbol);
             res.ok = stock_api::FetchQuoteBatch(&sym, 1, q, err) && q->valid;

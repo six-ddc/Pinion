@@ -12,32 +12,41 @@ void screen_make_input_passive(lv_obj_t* obj);
 // from a generic container that we are using purely for layout.
 void screen_strip_obj_chrome(lv_obj_t* obj);
 
-// Attach a right-swipe-to-back gesture to `scr`. When the user presses on
-// the screen and releases at least `kSwipeBackThreshold` px to the right
-// (with smaller vertical movement than horizontal), `on_back` is invoked.
-// `on_back` is responsible for whatever navigation should happen.
-typedef void (*screen_swipe_back_cb_t)();
-void screen_attach_swipe_back(lv_obj_t* scr, screen_swipe_back_cb_t on_back);
-
-// Mark `obj` (and by default all of its descendants) so that any touch event
-// that originates inside it is *not* counted as a candidate for the
-// right-swipe-back gesture. Use this on widgets that own horizontal drag
-// semantics themselves (slider, arc, custom carousels, scroll views, ...)
-// to keep their internal drag from being misinterpreted as a back gesture.
+// ---------------------------------------------------------------------------
+// Edge-swipe navigation (进程唯一的 indev 级手势层)
 //
-// `recursive=true` -- also tag every descendant. Defaults to true because
-// the typical caller is "the whole slider widget including its knob".
-void screen_swipe_back_ignore(lv_obj_t* obj, bool recursive = true);
+// 手机式边缘导航：只有**起始点落在屏幕左/右边缘带**的横滑才算导航手势，屏幕
+// 内部的横向拖拽（滑条、图表平移、横向滚动……）几何上自动归控件所有——这替代
+// 了旧的 screen_swipe_back_ignore 逐控件打标机制（已删除）。
+//
+// 实现挂在 **indev 级**（lv_indev_add_event_cb）：LVGL 的 send_event() 会把
+// PRESSED/RELEASED（转发白名单）与单指 GESTURE 先发给 indev 本身，完全不依赖
+// 对象树的事件冒泡/GESTURE_BUBBLE——按压落在任意控件上都全局可见。前提不变量：
+// **根 screen 必须保持 CLICKABLE**（LVGL base 对象默认即是），这样空白背景的
+// 按压才有兜底命中对象（indev_obj_act 非空，indev 事件才会发）。
+//
+// 三段式状态机（indev 回调收不到 PRESSING，这是 LVGL 转发白名单决定的）：
+//   PRESSED  记起点 + 判 arm（边缘带内且 y 不在状态栏区）；
+//   GESTURE  快甩路径（LVGL 手势：≥3px/帧速度累计 50px），命中即派发并
+//            wait_release（底下控件收 PRESS_LOST，不会误 CLICK）；
+//   RELEASED 慢拖兜底（不满足手势速度阈值时按位移判定），按 arm 的边分正负号。
+// 守卫（免打标的最后两道）：indev 正在滚动某对象 → 弃（服务兜底路径；GESTURE
+// 与 scroll 在 LVGL 内部本就互斥）；按压对象是 slider/arc/roller → 弃（滑条可能
+// 横跨边缘带）。
+//
+// 派发只报告"哪条边起手"；把它翻译成哪个视图切换/返回是 pi_screen 路由回调的
+// 职责（settings 返回 / Chat↔Idle / 模态打开时忽略），机制与策略分层。
+// ---------------------------------------------------------------------------
+typedef enum {
+    SCREEN_EDGE_NAV_FROM_LEFT,   // 左缘起手右滑（返回/回主页语义）
+    SCREEN_EDGE_NAV_FROM_RIGHT,  // 右缘起手左滑（前进/回对话语义）
+} screen_edge_nav_dir_t;
 
-// True if `from` or any ancestor up to (but excluding) `top` owns horizontal
-// drag semantics -- a built-in slider / arc / roller, or anything tagged via
-// screen_swipe_back_ignore(). Any screen-level right-swipe handler (whether it
-// uses screen_attach_swipe_back() or rolls its own LV_EVENT_GESTURE callback)
-// must consult this before treating a rightward drag as a back gesture, so
-// that dragging a slider knob isn't misread as swipe-back. Pass the gesture's
-// origin widget (lv_event_get_target_obj) as `from` and the screen
-// (lv_event_get_current_target_obj) as `top`.
-bool screen_event_in_drag_owner(lv_obj_t* from, lv_obj_t* top);
+typedef void (*screen_edge_nav_cb_t)(screen_edge_nav_dir_t dir);
+
+// 初始化：对当前存在的所有 LV_INDEV_TYPE_POINTER indev 挂回调（sim 有 mouse +
+// vtouch 两个，真机一个）。幂等；须在 indev 创建之后调用（pi_screen Create 末尾）。
+void screen_edge_nav_init(screen_edge_nav_cb_t cb);
 
 // ---------------------------------------------------------------------------
 // Screen lifecycle hooks

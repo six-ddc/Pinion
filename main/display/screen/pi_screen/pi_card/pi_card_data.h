@@ -119,6 +119,30 @@ class DataHub {
     // subject，绑定控件经 observer 自动更新。StartLiveRefresh 幂等建进程级 lv_timer。
     void StartLiveRefresh();
 
+    // ---- Phase4：动态路径 provider（stock.<symbol>.<field> 行情绑定）----
+    // 与静态路径的根本差异：路径集合无法预注册（symbol 是开放集），值是异步拉取的推模型
+    // （无同步 getter）。为不破坏「entries_ 在 Register 后只读 → worker 线程无锁查询」的
+    // 线程契约，动态路径分两层：
+    //   * 元数据（Has/TypeOf）走 provider 的 match **纯函数**——不碰任何可变态，worker 线程
+    //     安全；动态路径恒 String / 只读 / 无量程 / worker 不可读（ReadForWorker 恒 false）。
+    //   * Entry（subject + refcount）存独立的 dyn_entries_，只在 LVGL 线程被 Acquire/Release/
+    //     Push 触碰，无锁。subject 与静态路径同样「一经创建永生」——refcount 归 0 不销毁
+    //     （root 的 DELETE 先 Release 后删子控件，子控件卸 observer 时 subject 必须还活着）。
+    struct DynProvider {
+        const char* prefix;  // 如 "stock."；HintFor 按它定位「前缀对但格式错」的路径
+        const char* hint;    // 校验失败时回给 LLM 的用法提示（格式教学）
+        bool (*match)(const std::string& path);  // 纯函数：格式是否合法（任意线程）
+        std::function<void(const std::string&)> on_first_acquire;  // refcount 0→1（LVGL 线程）
+        std::function<void(const std::string&)> on_last_release;   // refcount →0（LVGL 线程）
+    };
+    // Create() 期一次性注册（LVGL 线程，先于 agent 首次校验）。幂等：同 prefix 忽略。
+    void RegisterDynProvider(const DynProvider& p);
+    // path 前缀命中某 provider 但 match 失败时返回其 hint，否则 nullptr。校验报错文案用。
+    const char* HintFor(const std::string& path) const;
+    // 推送动态路径的新值（LVGL 线程；数据源拉取落地时调）。entry 不存在（从未被绑定
+    // 或超上限被拒）则静默忽略。
+    void Push(const std::string& path, const char* value);
+
     // ---- Phase3：chart 历史缓冲（worker 安全元数据 + LVGL 线程读写）----
     // 该路径是否声明了 keep_history（worker 线程安全：Register 后只读）。chart 校验用。
     bool HasHistory(const std::string& path) const;
@@ -150,14 +174,27 @@ class DataHub {
         std::vector<int16_t> hist;      // 环形历史（下标 0 最旧），上限 kHistMax
     };
 
+    // ---- Phase4：动态路径的运行态（LVGL 线程独占，见 DynProvider 注释）----
+    struct DynEntry {
+        lv_subject_t subject{};
+        char str_buf[64] = {0};
+        char str_prev[64] = {0};
+        int refcount = 0;
+        size_t provider_idx = 0;
+    };
+    static constexpr size_t kDynMax = 64;  // 动态 entry 总上限（subject 永生，防无限累积）
+
     const Entry* Find(const std::string& path) const;
     Entry* Find(const std::string& path);
     void Seed(Entry* e);  // 读 getter 写 subject（LVGL 线程）
     void PublishLive();   // 1Hz 定时器回调：只读且有绑定的路径重跑 getter → Seed
+    const DynProvider* MatchProvider(const std::string& path, size_t* out_idx) const;
 
     static constexpr size_t kHistMax = 120;
 
     std::map<std::string, Entry> entries_;
+    std::vector<DynProvider> providers_;
+    std::map<std::string, DynEntry> dyn_entries_;
     bool inited_ = false;
     int active_live_count_ = 0;  // 当前 refcount>0 && !setter 的路径数，==0 时 PublishLive 早退
     int history_count_ = 0;      // 当前 keep_history 路径数，两者都为 0 时 PublishLive 早退

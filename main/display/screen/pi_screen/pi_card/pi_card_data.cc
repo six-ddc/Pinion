@@ -38,13 +38,33 @@ DataHub::Entry* DataHub::Find(const std::string& path) {
     return it == entries_.end() ? nullptr : &it->second;
 }
 
-bool DataHub::Has(const std::string& path) const { return Find(path) != nullptr; }
+// 动态 provider 匹配：纯函数链（不碰 dyn_entries_），worker 线程安全。providers_ 在
+// Create() 期注册后只读，与 entries_ 同一线程契约。
+const DataHub::DynProvider* DataHub::MatchProvider(const std::string& path, size_t* out_idx) const {
+    for (size_t i = 0; i < providers_.size(); i++) {
+        if (providers_[i].match && providers_[i].match(path)) {
+            if (out_idx) *out_idx = i;
+            return &providers_[i];
+        }
+    }
+    return nullptr;
+}
+
+bool DataHub::Has(const std::string& path) const {
+    return Find(path) != nullptr || MatchProvider(path, nullptr) != nullptr;
+}
 
 bool DataHub::TypeOf(const std::string& path, HubType& out) const {
     const Entry* e = Find(path);
-    if (!e) return false;
-    out = e->type;
-    return true;
+    if (e) {
+        out = e->type;
+        return true;
+    }
+    if (MatchProvider(path, nullptr)) {
+        out = HubType::String;  // 动态路径恒 String（推送侧已格式化好展示文本）
+        return true;
+    }
+    return false;
 }
 
 bool DataHub::Writable(const std::string& path) const {
@@ -98,8 +118,26 @@ void DataHub::Seed(Entry* e) {
 lv_subject_t* DataHub::Acquire(const std::string& path) {
     Entry* e = Find(path);
     if (!e) {
-        ESP_LOGW(TAG, "acquire unknown path: %s", path.c_str());
-        return nullptr;
+        size_t pidx = 0;
+        const DynProvider* p = MatchProvider(path, &pidx);
+        if (!p) {
+            ESP_LOGW(TAG, "acquire unknown path: %s", path.c_str());
+            return nullptr;
+        }
+        auto it = dyn_entries_.find(path);
+        if (it == dyn_entries_.end()) {
+            if (dyn_entries_.size() >= kDynMax) {
+                ESP_LOGW(TAG, "dyn path cap (%d) reached, reject %s", (int)kDynMax, path.c_str());
+                return nullptr;  // 渲染器按 unknown path 处理：该控件不绑定，卡片其余照常
+            }
+            it = dyn_entries_.try_emplace(path).first;
+            DynEntry& de = it->second;
+            de.provider_idx = pidx;
+            lv_subject_init_string(&de.subject, de.str_buf, de.str_prev, sizeof(de.str_buf), "--");
+        }
+        DynEntry& de = it->second;
+        if (de.refcount++ == 0 && p->on_first_acquire) p->on_first_acquire(path);
+        return &de.subject;
     }
     if (e->refcount++ == 0) {
         Seed(e);  // 首个绑定：读一次硬件快照
@@ -110,9 +148,40 @@ lv_subject_t* DataHub::Acquire(const std::string& path) {
 
 void DataHub::Release(const std::string& path) {
     Entry* e = Find(path);
-    if (e && e->refcount > 0) {
-        if (--e->refcount == 0 && !e->setter) active_live_count_--;
+    if (e) {
+        if (e->refcount > 0 && --e->refcount == 0 && !e->setter) active_live_count_--;
+        return;
     }
+    auto it = dyn_entries_.find(path);
+    if (it != dyn_entries_.end() && it->second.refcount > 0) {
+        if (--it->second.refcount == 0) {
+            // entry（含 subject）留着不销毁——见头文件 DynProvider 注释的删除顺序约束；
+            // 只通知 provider 停掉背后的数据订阅。
+            const DynProvider& p = providers_[it->second.provider_idx];
+            if (p.on_last_release) p.on_last_release(path);
+        }
+    }
+}
+
+void DataHub::RegisterDynProvider(const DynProvider& p) {
+    if (!p.prefix || !p.match) return;
+    for (const auto& q : providers_) {
+        if (std::strcmp(q.prefix, p.prefix) == 0) return;  // 幂等
+    }
+    providers_.push_back(p);
+}
+
+const char* DataHub::HintFor(const std::string& path) const {
+    for (const auto& p : providers_) {
+        if (path.rfind(p.prefix, 0) == 0 && !p.match(path)) return p.hint;
+    }
+    return nullptr;
+}
+
+void DataHub::Push(const std::string& path, const char* value) {
+    auto it = dyn_entries_.find(path);
+    if (it == dyn_entries_.end()) return;
+    lv_subject_copy_string(&it->second.subject, value ? value : "--");
 }
 
 void DataHub::Write(const std::string& path, int value) {

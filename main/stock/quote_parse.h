@@ -61,8 +61,12 @@ namespace TencentQuoteFields {
     constexpr size_t kVolume        = 33;  // 成交量（A 股原始单位"手"，需 ×100 转股）
     constexpr size_t kAmount        = 34;  // 成交额（A 股原始单位"万元"，需 ×10000 转元）
     constexpr size_t kTurnoverRate  = 35;  // 换手率 %（A 股有；港/美股可能 0）
-    // 36..39: 市盈率 / 总市值 / 流通市值 等
+    constexpr size_t kPe            = 36;  // 市盈率 TTM（三市一致，2026-07 实测；缺失为空 → 0）
+    // 37..39: 中间字段
     constexpr size_t kAmplitude     = 40;  // 振幅 %（A 股直给；其它市场缺失则由 high/low/last_close 算）
+    constexpr size_t kFloatCap      = 41;  // 流通市值（单位亿，币种随市场；三市一致，实测）
+    constexpr size_t kTotalCap      = 42;  // 总市值（单位亿；三市一致，实测）
+    constexpr size_t kPb            = 43;  // 市净率 — **仅 A 股**；HK/US 此位是名字串，strtof 安全回 0
 
     constexpr size_t kMinFieldCount = 32;  // < 此值视为响应畸形拒绝
 }
@@ -81,6 +85,10 @@ struct QuoteFields {
     double volume       = 0;   // 已统一到"股"（A 股 ×100）
     double amount       = 0;   // 已统一到"元"（A 股 ×10000）
     float avg_price     = 0;   // amount / volume，volume>0 才填
+    float pe            = 0;   // 市盈率 TTM（缺失 0）
+    float pb            = 0;   // 市净率（仅 A 股；缺失 0）
+    float float_cap_yi  = 0;   // 流通市值（亿，币种随市场；缺失 0）
+    float total_cap_yi  = 0;   // 总市值（亿；缺失 0）
     bool valid          = false;
 };
 
@@ -186,6 +194,12 @@ inline bool parseQuote(const char* body, int bodyStart, int bodyEnd,
     if (out.volume > 0) {
         out.avg_price = (float)(out.amount / out.volume);
     }
+
+    out.pe = fieldFloat(kPe);
+    out.float_cap_yi = fieldFloat(kFloatCap);
+    out.total_cap_yi = fieldFloat(kTotalCap);
+    // kPb 在 HK/US 是名字串（"TENCENT" / "Apple Inc."），strtof 天然回 0 → 视为缺失。
+    out.pb = isAShare(m) ? fieldFloat(kPb) : 0.0f;
 
     out.valid = (out.current > 0 && out.last_close > 0);
     return out.valid;

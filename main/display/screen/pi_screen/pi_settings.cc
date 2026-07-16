@@ -45,7 +45,6 @@ constexpr int32_t kHeaderH = 56;
 constexpr int32_t kHintH = 84;    // Hub 底部提示条
 constexpr int32_t kHubRowH = 96;  // 触点 >= 96（6 行 + 5 条细线 ~ 581px，可微滚）
 constexpr int32_t kSegH = 96;     // 分段按钮行高
-constexpr int32_t kSwipePopThreshold = 80;
 constexpr uint32_t kAutoCloseMs = 30 * 1000;
 constexpr uint32_t kTickMs = 500;
 constexpr uint32_t kSliderApplyGapMs = 150;  // 拖动中节流写入（同快捷面板）
@@ -64,9 +63,6 @@ std::vector<PageEntry> s_stack;
 lv_timer_t* s_tick_timer = nullptr;
 uint32_t s_ticks = 0;
 
-// 右滑返回追踪（挂在 s_root 上；页面子树递归开 EVENT_BUBBLE）
-bool s_swipe_tracking = false;
-lv_point_t s_swipe_start = {0, 0};
 
 // Hub 行值摘要（六行）与右上电量
 lv_obj_t* s_hub_val[6] = {};
@@ -297,7 +293,6 @@ lv_obj_t* MakeBigSliderRow(lv_obj_t* parent, int32_t min, int32_t max, lv_obj_t*
     lv_obj_set_style_pad_all(slider, 16, LV_PART_KNOB);
     lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 24);
-    screen_swipe_back_ignore(slider, true);  // 滑条拥有横向拖拽语义（也豁免右滑返回）
     *out_slider = slider;
 
     lv_obj_t* val = lv_label_create(row);
@@ -309,14 +304,6 @@ lv_obj_t* MakeBigSliderRow(lv_obj_t* parent, int32_t min, int32_t max, lv_obj_t*
     return row;
 }
 
-void EnableEventBubbleRecursive(lv_obj_t* obj) {
-    if (obj == nullptr)
-        return;
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
-    const uint32_t count = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < count; ++i)
-        EnableEventBubbleRecursive(lv_obj_get_child(obj, i));
-}
 
 // ----- 蓝牙最近连接缓存（NVS ns "bt"：last_name / last_addr） ---------------
 // BT 模组协议拿不到"当前已连接设备"（CONNECT SUCCESS 不带地址，也无查询
@@ -412,7 +399,7 @@ lv_obj_t* MakePage(PageId id, const char* title_utf8, lv_obj_t** out_page,
     lv_obj_t* page = lv_obj_create(s_root);
     screen_strip_obj_chrome(page);
     lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);  // 承接空白区按压（右滑返回追踪）
+    lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);  // 承接空白区按压（edge-nav 兜底命中）
     lv_obj_set_size(page, kW, kH);
     lv_obj_set_pos(page, 0, 0);
     pi_theme::ApplyBg(page, Tok::Bg);
@@ -588,10 +575,10 @@ void BuildHubPage(lv_obj_t** out_page) {
     lv_obj_set_flex_align(hint, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(hint, 16, LV_PART_MAIN);
     lv_obj_t* h1 = lv_label_create(hint);
-    lv_label_set_text(h1, "\xe5\x8f\xb3\xe6\xbb\x91\xe8\xbf\x94\xe5\x9b\x9e");  // "右滑返回"
+    lv_label_set_text(h1, "左缘右滑返回");
     SetLabelFont(h1, &font_puhui_20_4, Tok::Faint);
     lv_obj_t* h2 = lv_label_create(hint);
-    lv_label_set_text(h2, "SWIPE > BACK \xc2\xb7 30S AUTO");
+    lv_label_set_text(h2, "EDGE SWIPE > BACK · 30S AUTO");
     SetLabelFont(h2, &font_pi_mono_14, Tok::Faint);
     lv_obj_set_style_text_letter_space(h2, 2, LV_PART_MAIN);
 
@@ -1084,7 +1071,6 @@ void AppendBtDeviceRow(const mhal::bt::Device& dev) {
     lv_obj_set_style_pad_column(row, 16, LV_PART_MAIN);
     lv_obj_add_event_cb(row, OnBtDeviceRowClicked, LV_EVENT_CLICKED,
                         reinterpret_cast<void*>(static_cast<intptr_t>(idx)));
-    EnableEventBubbleRecursive(row);  // 新行也要参与右滑返回追踪
 
     lv_obj_t* name = lv_label_create(row);
     lv_label_set_text(name, dev.name.empty() ? "(unknown)" : dev.name.c_str());
@@ -1685,9 +1671,6 @@ void Push(PageId id) {
     if (!s_stack.empty())
         lv_obj_add_flag(s_stack.back().obj, LV_OBJ_FLAG_HIDDEN);
     s_stack.push_back({id, page});
-    // 页面子树全开 EVENT_BUBBLE：让任意位置起手的按压到达 s_root 的右滑
-    // 返回追踪器（s_root 自身不再向 screen 冒泡，pi_screen 的手势不受扰）。
-    EnableEventBubbleRecursive(page);
 }
 
 void Pop() {
@@ -1707,59 +1690,6 @@ void Pop() {
     if (s_stack.back().id == PageId::Hub)
         RefreshHub();
 }
-
-// ----- 右滑返回（s_root 上的手动追踪；滑条等横向拖拽件豁免） -----------------
-constexpr lv_obj_flag_t kSwipeIgnoreFlag = LV_OBJ_FLAG_USER_1;  // 与 screen_util 同一位
-
-bool OriginatesInDragOwner(lv_obj_t* from) {
-    for (lv_obj_t* obj = from; obj != nullptr && obj != s_root; obj = lv_obj_get_parent(obj)) {
-        if (lv_obj_has_flag(obj, kSwipeIgnoreFlag))
-            return true;
-        if (lv_obj_check_type(obj, &lv_slider_class))
-            return true;
-    }
-    return false;
-}
-
-void OnRootPressed(lv_event_t* e) {
-    lv_indev_t* indev = lv_event_get_indev(e);
-    if (indev == nullptr)
-        return;
-    if (OriginatesInDragOwner(lv_event_get_target_obj(e))) {
-        s_swipe_tracking = false;
-        return;
-    }
-    lv_indev_get_point(indev, &s_swipe_start);
-    s_swipe_tracking = true;
-}
-
-// 阈值判定放在 PRESSING（同 pi_screen 的状态栏下拉/PTT 上滑取消模式）：
-// 命中即 lv_indev_wait_release 抑制原按压目标的 CLICKED —— 若等到 RELEASED
-// 再判，扫过可点行（Hub 行/设备行）的右滑会同时把那一行"点"了。
-void OnRootPressing(lv_event_t* e) {
-    if (!s_swipe_tracking)
-        return;
-    lv_indev_t* indev = lv_event_get_indev(e);
-    if (indev == nullptr)
-        return;
-    lv_point_t p;
-    lv_indev_get_point(indev, &p);
-    int32_t dx = p.x - s_swipe_start.x;
-    int32_t dy = p.y - s_swipe_start.y;
-    if (dx > kSwipePopThreshold && std::abs(dy) < dx) {
-        s_swipe_tracking = false;
-        lv_indev_wait_release(indev);
-        // 确认 sheet 打开时右滑先收 sheet，不动页栈
-        if (s_net_confirm_root != nullptr &&
-            !lv_obj_has_flag(s_net_confirm_root, LV_OBJ_FLAG_HIDDEN)) {
-            CloseNetConfirm();
-            return;
-        }
-        RequestPop();
-    }
-}
-
-void OnRootReleased(lv_event_t*) { s_swipe_tracking = false; }
 
 // ----- tick：30s 无操作自动退、跨线程快照落地、周期刷新 ---------------------
 void TickCb(lv_timer_t*) {
@@ -1822,7 +1752,6 @@ void CloseAll() {
     }
     lv_obj_delete(s_root);  // 整棵删除；栈全空即露出进入前的 ViewState
     s_root = nullptr;
-    s_swipe_tracking = false;
 }
 
 }  // namespace
@@ -1845,11 +1774,10 @@ void Open(lv_obj_t* parent) {
     lv_obj_set_pos(s_root, 0, 0);
     pi_theme::ApplyBg(s_root, Tok::Bg);
     lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(s_root, LV_OBJ_FLAG_CLICKABLE);  // 承接按压（右滑返回追踪）
+    lv_obj_add_flag(s_root, LV_OBJ_FLAG_CLICKABLE);  // 承接空白区按压（edge-nav 兜底命中）
     lv_obj_add_flag(s_root, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_add_event_cb(s_root, OnRootPressed, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_event_cb(s_root, OnRootPressing, LV_EVENT_PRESSING, nullptr);
-    lv_obj_add_event_cb(s_root, OnRootReleased, LV_EVENT_RELEASED, nullptr);
+    // 逐级返回手势不再自带追踪：屏级 edge-nav 层（screen_util）检测左缘右滑，
+    // pi_screen 路由到 pi_settings::Back()。
 
     // 订阅网络事件（经 pi_net_events 分发层，与 pi_screen 状态栏共存；回调
     // 仍在网络栈任务线程：只写快照）。配网热点起来时把 "ssid|url" 回填到
@@ -1873,6 +1801,18 @@ void Close() { CloseAll(); }
 
 bool IsOpen() { return s_root != nullptr; }
 
+// 逐级返回（edge-nav 左缘右滑由 pi_screen 路由到这里；语义与页头返回按钮一致）。
+// 确认 sheet 打开时先收 sheet、不动页栈——与旧的右滑返回追踪同款优先级。
+void Back() {
+    if (s_root == nullptr)
+        return;
+    if (s_net_confirm_root != nullptr && !lv_obj_has_flag(s_net_confirm_root, LV_OBJ_FLAG_HIDDEN)) {
+        CloseNetConfirm();
+        return;
+    }
+    RequestPop();
+}
+
 void OnScreenUnloaded() {
     // widget 树由 LVGL 随 screen 删除，这里只清理定时器/订阅与静态指针
     if (s_tick_timer != nullptr) {
@@ -1891,7 +1831,6 @@ void OnScreenUnloaded() {
         PageWillClose(entry.id);
     s_stack.clear();
     s_root = nullptr;
-    s_swipe_tracking = false;
 }
 
 }  // namespace pi_settings

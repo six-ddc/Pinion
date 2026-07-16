@@ -16,6 +16,7 @@
 #include "pi_card_data.h"
 #include "pi_card_icons.h"
 #include "pi_card_render.h"
+#include "pi_card_stock.h"
 #include "pi_card_tools.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
@@ -122,7 +123,6 @@ lv_obj_t* BuildOverlay(lv_obj_t** out_wrapper) {
     pi_theme::ApplyScrim(scrim);
     lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);  // 吞底层
-    screen_swipe_back_ignore(scrim, true);          // 别触发 Chat→Idle 右滑
 
     lv_obj_t* wrap = lv_obj_create(scrim);
     screen_strip_obj_chrome(wrap);
@@ -149,7 +149,6 @@ void AddOverlayCloseButton(lv_obj_t* wrapper, UiCard* card) {
     lv_obj_t* icon = MakeIcon(btn, "close", 18, pi_theme::Tok::Dim);
     lv_obj_center(icon);
     lv_obj_add_event_cb(btn, OverlayCloseCb, LV_EVENT_CLICKED, card);
-    screen_swipe_back_ignore(btn, true);
 }
 
 // 唯一清理通道：root 被删（ClearFeed / 新会话 / 屏卸载 / close / ttl）都到这里。
@@ -198,7 +197,6 @@ void AddPinRemoveButton(lv_obj_t* wrapper) {
     lv_obj_t* icon = MakeIcon(btn, "close", 16, pi_theme::Tok::Dim);
     lv_obj_center(icon);
     lv_obj_add_event_cb(btn, PinRemoveCb, LV_EVENT_CLICKED, nullptr);
-    screen_swipe_back_ignore(btn, true);
 }
 
 // NVS "ui"/"pin" 的封套（cJSON_PrintUnformatted 单行——sim 的 settings shim 按行存，换行
@@ -226,6 +224,7 @@ void PersistPin(const std::string& envelope) {
 void Init() {
     DataHub::Instance().RegisterBuiltins();
     CommandRegistry::Instance().RegisterBuiltins();
+    pi_card_stock::RegisterBindProvider();  // stock.<symbol>.<field> 动态绑定（Phase4）
 }
 
 void SetFeedHooks(const FeedHooks& hooks) { s_feed = hooks; }
@@ -322,7 +321,8 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         screen_strip_obj_chrome(wrapper);
         lv_obj_remove_flag(wrapper, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(wrapper, LV_OBJ_FLAG_CLICKABLE);  // 空白区按压穿透回 PTT（D3）
-        lv_obj_set_width(wrapper, LV_PCT(100));
+        // 大时钟让位后 pin 独占待机屏：收到 75% 宽（host flex 居中），全宽视觉太满。
+        lv_obj_set_width(wrapper, LV_PCT(75));
         lv_obj_set_height(wrapper, LV_SIZE_CONTENT);
         lv_obj_set_style_bg_opa(wrapper, LV_OPA_TRANSP, LV_PART_MAIN);
         delete_root = wrapper;
@@ -396,7 +396,6 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         // max_height + SIZE_CONTENT 的详细说明）。
         card->overlay_tree = tree;
         ReflowOverlay(card.get());
-        screen_swipe_back_ignore(tree, true);  // 内部竖滑归卡片，不误触屏级手势
         AddOverlayCloseButton(wrapper, card.get());
         // 保底 TTL：无 ttl（0）或 LLM 给的超长 ttl 一律封顶到 kOverlayMaxTtlMs，避免浮层
         // 永久阻止息屏。显式 ttl 在封顶内则照用。
@@ -1180,7 +1179,8 @@ std::string BuildPathsClause(bool full) {
     }
     return "Bind targets (live registry). WRITABLE slider/arc (range overrides your min/max): " +
           sliders + ". WRITABLE switch (0/1): " + switches +
-          ". READ-ONLY (dimmed; label+fmt shows it live): " + ro + ".";
+          ". READ-ONLY (dimmed; label+fmt shows it live): " + ro + ". " +
+          pi_card_stock::BindPathsDesc();
 }
 
 // 动态 ui_render 工具描述：静态 HEAD/TAIL 骨架之间插 BuildPathsClause(true)。construct-once，
@@ -1222,6 +1222,10 @@ extern "C" const char* pi_card_system_prompt(void) {
         "related rows. Exactly ONE primary (amber) button -- theme already paints slider/arc fill, "
         "on-switch and selected choice amber, so don't also color text amber (keep tx/dim). Use "
         "semantic tone/fill tokens (accent/ok/err/tx/dim/...), not raw hex.\n\n"
+        "COMPACT -- the window is small; dense beats tall. Lay data out as multi-column table rows "
+        "(one row per record, one label per field, grow:1 on EVERY label so columns align), 2-4 "
+        "columns per row. Never stack one short fact per line, never dump long prose into a card -- "
+        "keep labels to 1-3 words, put the value right of its label, clamp lists with max.\n\n"
         "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
         "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
         "generate new content or a NEW decision -- it costs a full round-trip and shows as a user "
