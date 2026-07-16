@@ -1,7 +1,10 @@
 #ifndef BQ27220_GAUGE_H
 #define BQ27220_GAUGE_H
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+
 #include <driver/i2c_master.h>
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,10 @@ public:
     // 把新电压拉低。一般不需要主动调。
     void ResetFilter();
 
+    // 非阻塞读上一次采样(任一 GetBatteryLevel 调用发布的)快照。无 I2C、无滤波器改写。
+    // 返回 valid（从未成功采样过则 false，level=0）。任意线程安全（原子读）。
+    bool GetCachedSnapshot(int& level, bool& charging, bool& discharging) const;
+
 private:
     Bq27220Gauge() = default;
     Bq27220Gauge(const Bq27220Gauge&) = delete;
@@ -99,6 +106,9 @@ private:
     int   filter_count_    = 0;
     float filter_sum_      = 0.0f;
     bool  filter_primed_   = false;
+
+    std::mutex sample_mu_;                 // 串行化 GetBatteryLevel 的滤波器/重试改写
+    std::atomic<uint32_t> snapshot_{0};    // 位[0..7]=level [8]=chg [9]=dis [10]=valid
 };
 
 #endif  // BQ27220_GAUGE_H

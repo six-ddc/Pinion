@@ -52,6 +52,23 @@ bool DataHub::Writable(const std::string& path) const {
     return e && static_cast<bool>(e->setter);
 }
 
+bool DataHub::ReadForWorker(const std::string& path, HubValue& out) const {
+    const Entry* e = Find(path);
+    if (!e || !e->worker_safe || !e->getter) return false;
+    out = e->getter();
+    return true;
+}
+
+std::string DataHub::WritablePathsJoined() const {
+    std::string out;
+    for (const auto& [path, e] : entries_) {
+        if (!e.setter) continue;
+        if (!out.empty()) out += '|';
+        out += path;
+    }
+    return out;
+}
+
 bool DataHub::RangeOf(const std::string& path, int& lo, int& hi) const {
     const Entry* e = Find(path);
     if (!e || !e->has_range) return false;
@@ -84,13 +101,18 @@ lv_subject_t* DataHub::Acquire(const std::string& path) {
         ESP_LOGW(TAG, "acquire unknown path: %s", path.c_str());
         return nullptr;
     }
-    if (e->refcount++ == 0) Seed(e);  // 首个绑定：读一次硬件快照
+    if (e->refcount++ == 0) {
+        Seed(e);  // 首个绑定：读一次硬件快照
+        if (!e->setter) active_live_count_++;
+    }
     return &e->subject;
 }
 
 void DataHub::Release(const std::string& path) {
     Entry* e = Find(path);
-    if (e && e->refcount > 0) e->refcount--;
+    if (e && e->refcount > 0) {
+        if (--e->refcount == 0 && !e->setter) active_live_count_--;
+    }
 }
 
 void DataHub::Write(const std::string& path, int value) {
@@ -111,17 +133,24 @@ void DataHub::Write(const std::string& path, int value) {
 // lo>hi 表示无量程（如 net.rssi）。Int 可写路径务必给量程，让写入与绑定控件都被收口到
 // 硬件真实区间。幂等：路径已存在则忽略。
 void DataHub::Register(const std::string& path, HubType type, std::function<HubValue()> getter,
-                       std::function<void(const HubValue&)> setter, int lo, int hi) {
+                       std::function<void(const HubValue&)> setter, WorkerRead worker_read, int lo,
+                       int hi, bool keep_history) {
     auto [it, ok] = entries_.try_emplace(path);
     if (!ok) return;
     Entry& e = it->second;
     e.type = type;
     e.getter = std::move(getter);
     e.setter = std::move(setter);
+    e.worker_safe = worker_read == WorkerRead::Safe;
     if (lo <= hi) {
         e.has_range = true;
         e.vmin = lo;
         e.vmax = hi;
+    }
+    e.keep_history = keep_history;
+    if (keep_history) {
+        e.hist.reserve(kHistMax);
+        history_count_++;
     }
     if (type == HubType::String) {
         lv_subject_init_string(&e.subject, e.str_buf, e.str_prev, sizeof(e.str_buf), "");
@@ -136,9 +165,11 @@ void DataHub::RegisterBuiltins() {
 
     // ---- audio.volume（可读写；纯内存缓存读，SetVolume 内部恒持久化 NVS）----
     // 量程 0–100：SetOutputVolume 本身不钳，越界值会直灌编解码器，故在此收口。
+    // worker 可读：GetVolume 是 audio_codec 的纯 int 成员读，无内部状态。
     Register("audio.volume", HubType::Int,
              []() -> HubValue { return mhal::audio::GetVolume(); },
-             [](const HubValue& v) { mhal::audio::SetVolume(std::get<int>(v), true); }, 0, 100);
+             [](const HubValue& v) { mhal::audio::SetVolume(std::get<int>(v), true); },
+             WorkerRead::Safe, 0, 100);
 
     // ---- display.brightness（可读写；持久化）----
     // 量程 5–100：与 backlight::Restore 的下限、quick_panel BRT 滑条(min=5) 一致，
@@ -148,64 +179,150 @@ void DataHub::RegisterBuiltins() {
              [](const HubValue& v) {
                  mhal::backlight::SetBrightness(static_cast<uint8_t>(std::get<int>(v)), true);
              },
-             5, 100);
+             WorkerRead::Safe, 5, 100);
 
-    // ---- battery.level（只读；Acquire 时读一次，走阻塞 I2C）----
+    // ---- battery.level（只读；读 sysmon 1Hz 发布的原子快照，非阻塞、无 I2C、
+    // 与 charging 共享同一次采样）----
+    // worker 可读：GetBatterySnapshot 只做一次 atomic load + 解包，无 I2C、无滤波器改写。
+    // keep_history=true（Phase3）：待机常驻卡的 chart 要显示"过去"，只在绑定时记会让
+    // 新建的图表没有历史——故 1Hz tick 总是记，不依赖是否有活跃绑定。
     Register("battery.level", HubType::Int,
              []() -> HubValue {
                  int level = 0;
                  bool chg = false, dis = false;
-                 mhal::power::GetBatteryLevel(level, chg, dis);
+                 mhal::power::GetBatterySnapshot(level, chg, dis);
                  return level;
              },
-             nullptr, 0, 100);
+             nullptr, WorkerRead::Safe, 0, 100, /*keep_history=*/true);
 
-    // ---- battery.charging（只读）----
+    // ---- battery.charging（只读；同 battery.level 读原子快照）----
+    // worker 可读：同 battery.level。
     Register("battery.charging", HubType::Bool,
              []() -> HubValue {
                  int level = 0;
                  bool chg = false, dis = false;
-                 mhal::power::GetBatteryLevel(level, chg, dis);
+                 mhal::power::GetBatterySnapshot(level, chg, dis);
                  return chg;
              },
-             nullptr);
+             nullptr, WorkerRead::Safe);
 
     // ---- net.type（只读；wifi / 4g）----
     // 红线：网络类型切换在 pi_settings 里是「持久化 NVS + esp_restart」且带二次确认
     // 弹窗（「切换网络通道将重启设备」）。这里刻意只读——绝不能给它加 setter 把重启
     // 类操作变成 LLM 一句话的静默副作用。将来若要放开，必须复用 settings 的确认+重启
     // 路径，而非在 DataHub 里挂 setter。
+    // worker 可读：CachedType() 读函数内 static，Create 期就已定型。
     Register("net.type", HubType::String,
              []() -> HubValue {
                  bool wifi = mhal::network::GetType() == mhal::network::Type::WiFi;
                  return std::string(wifi ? "wifi" : "4g");
              },
-             nullptr);
+             nullptr, WorkerRead::Safe);
 
     // ---- net.rssi（只读；WiFi=dBm，4G=CSQ）----
+    // worker 可读：WiFi 分支 GetWifiRssi 已改直调 esp_wifi_sta_get_ap_info 并检查返回码，
+    // 无 ESP_ERROR_CHECK abort、无 TOCTOU；4G 分支 GetSignalStrength 读原子 cached_csq_。
     Register("net.rssi", HubType::Int,
              []() -> HubValue {
                  bool wifi = mhal::network::GetType() == mhal::network::Type::WiFi;
                  return wifi ? mhal::network::GetWifiRssi() : mhal::network::GetSignalStrength();
              },
-             nullptr);
+             nullptr, WorkerRead::Safe, 0, -1, /*keep_history=*/true);
 
     // ---- net.ssid（只读；当前 WiFi 名，4G 时为空）----
+    // worker 可读：GetWifiSsid 返回 mutex 保护的门面缓存副本。
     Register("net.ssid", HubType::String,
-             []() -> HubValue { return mhal::network::GetWifiSsid(); }, nullptr);
+             []() -> HubValue { return mhal::network::GetWifiSsid(); }, nullptr,
+             WorkerRead::Safe);
 
     // ---- net.connected（只读；是否已联网）----
+    // worker 可读：WiFi 走 xEventGroupGetBits（FreeRTOS 线程安全），4G 走 std::atomic<bool>。
     Register("net.connected", HubType::Bool,
-             []() -> HubValue { return mhal::network::IsConnected(); }, nullptr);
+             []() -> HubValue { return mhal::network::IsConnected(); }, nullptr, WorkerRead::Safe);
 
     // ---- ui.theme（可读写；0=深 1=浅；Set 内部立即全 UI 翻转 + NVS 持久化）----
     // 无重启、无破坏性，纯样式开关——可安全交给 LLM（"帮我切浅色"）。pi_theme 是 pi_card
     // 可直接依赖的同层模块，故这里直接内置，无需上层注册。
+    // worker 可读：IsLight() 只读一个全局 bool（NVS 只在 pi_theme::Init 读一次）。碰 LVGL 的是
+    // Set()（lv_obj_report_style_change），与 getter 无关——而 setter 只会从 LVGL 线程被调。
     Register("ui.theme", HubType::Bool,
              []() -> HubValue { return pi_theme::IsLight(); },
-             [](const HubValue& v) { pi_theme::Set(std::get<bool>(v)); });
+             [](const HubValue& v) { pi_theme::Set(std::get<bool>(v)); }, WorkerRead::Safe);
 
     ESP_LOGI(TAG, "registered %d builtin data paths", static_cast<int>(entries_.size()));
 }
+
+std::vector<DataHub::PathMeta> DataHub::ListPaths() const {
+    std::vector<PathMeta> out;
+    out.reserve(entries_.size());
+    for (const auto& [path, e] : entries_) {
+        PathMeta m;
+        m.path = path;
+        m.type = e.type;
+        m.writable = static_cast<bool>(e.setter);
+        m.worker_safe = e.worker_safe;
+        m.has_range = e.has_range;
+        m.vmin = e.vmin;
+        m.vmax = e.vmax;
+        m.has_history = e.keep_history;
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+void DataHub::PublishLive() {
+    if (active_live_count_ == 0 && history_count_ == 0) return;  // 无活跃只读绑定亦无历史路径，早退
+    for (auto& [path, e] : entries_) {
+        if (e.refcount > 0 && !e.setter && e.getter) {
+            Seed(&e);
+        }
+        if (e.keep_history && e.getter) {
+            HubValue v = e.getter();
+            int iv = 0;
+            if (const auto* i = std::get_if<int>(&v)) {
+                iv = *i;
+            } else if (const auto* b = std::get_if<bool>(&v)) {
+                iv = *b ? 1 : 0;
+            } else {
+                continue;  // String 路径不支持历史（chart 只画数值）
+            }
+            iv = ClampRange(iv, e.has_range, e.vmin, e.vmax);
+            if (e.hist.size() >= kHistMax) e.hist.erase(e.hist.begin());
+            e.hist.push_back(static_cast<int16_t>(iv));
+            for (const auto& [id, sink] : sinks_) {
+                if (sink.path == path && sink.cb) sink.cb(iv);
+            }
+        }
+    }
+}
+
+void DataHub::StartLiveRefresh() {
+    static lv_timer_t* timer = nullptr;
+    if (timer != nullptr) return;  // 幂等：进程级只建一次
+    timer = lv_timer_create(
+        [](lv_timer_t*) { DataHub::Instance().PublishLive(); }, 1000, nullptr);
+}
+
+bool DataHub::HasHistory(const std::string& path) const {
+    const Entry* e = Find(path);
+    return e && e->keep_history;
+}
+
+void DataHub::HistorySnapshot(const std::string& path, std::vector<int>& out) const {
+    out.clear();
+    const Entry* e = Find(path);
+    if (!e) return;
+    out.reserve(e->hist.size());
+    for (int16_t v : e->hist) out.push_back(v);
+}
+
+int DataHub::AddHistorySink(const std::string& path, std::function<void(int)> cb) {
+    if (!Find(path)) return -1;
+    int id = next_sink_id_++;
+    sinks_[id] = HistSink{path, std::move(cb)};
+    return id;
+}
+
+void DataHub::RemoveHistorySink(int handle) { sinks_.erase(handle); }
 
 }  // namespace pi_card

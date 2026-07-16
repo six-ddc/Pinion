@@ -3,6 +3,7 @@
 // key 同名（"audio"/"output_volume"、"display"/"brightness"）；电量固定假值；
 // ForcePowerOff 打日志后退出进程（设备上是整机断电，不返回）。
 #include <sys/stat.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -73,6 +74,17 @@ namespace mhal::power {
 
 bool GetBatteryLevel(int& level, bool& charging, bool& discharging) {
     level = 78;
+    charging = true;
+    discharging = false;
+    return true;
+}
+
+bool GetBatterySnapshot(int& level, bool& charging, bool& discharging) {
+    // sim 演示活性：随秒缓慢摆动 60..90，真机是原子快照
+    long s = std::chrono::duration_cast<std::chrono::seconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+                 .count();
+    level = 60 + static_cast<int>(s % 31);
     charging = true;
     discharging = false;
     return true;

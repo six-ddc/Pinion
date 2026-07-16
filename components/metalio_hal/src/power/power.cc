@@ -136,6 +136,10 @@ bool GetBatteryLevel(int& level, bool& charging, bool& discharging) {
     return Bq27220Gauge::GetInstance().GetBatteryLevel(level, charging, discharging);
 }
 
+bool GetBatterySnapshot(int& level, bool& charging, bool& discharging) {
+    return Bq27220Gauge::GetInstance().GetCachedSnapshot(level, charging, discharging);
+}
+
 bool GetVoltageMv(uint16_t& mv) { return Bq27220Gauge::GetInstance().GetVoltageMv(mv); }
 
 bool GetCurrentMa(int16_t& ma) { return Bq27220Gauge::GetInstance().ReadCurrentMa(ma); }

@@ -18,6 +18,11 @@ constexpr int      kProbeTimeoutMs = 50;
 // 单节锂电典型：3.3V≈0%，4.2V≈100%。
 constexpr float kBatteryEmptyV = 3.3f;
 constexpr float kBatteryFullV  = 4.2f;
+
+// 把电量快照打包进一个 uint32：位[0..7]=level [8]=charging [9]=discharging [10]=valid。
+inline uint32_t PackBat(int lv, bool c, bool d, bool valid) {
+    return (uint32_t)(lv & 0xFF) | (c ? 1u << 8 : 0) | (d ? 1u << 9 : 0) | (valid ? 1u << 10 : 0);
+}
 }  // namespace
 
 bool Bq27220Gauge::Begin(i2c_master_bus_handle_t bus, uint8_t addr) {
@@ -82,6 +87,9 @@ bool Bq27220Gauge::ReadCurrentMa(int16_t& current_ma) {
 }
 
 bool Bq27220Gauge::GetBatteryLevel(int& level, bool& charging, bool& discharging) {
+    // 串行化滤波器/重试计数器的改写：sysmon 1Hz 任务与其它调用方（开机保护、
+    // DataHub 等）都经此函数，加锁根治既有的无锁数据竞争。
+    std::lock_guard<std::mutex> lk(sample_mu_);
     if (dev_ == nullptr) {
         // 没挂上则节流自愈重试（~10s/次），避免 1Hz 走 i2c_master_probe
         // 的 timeout 拖慢调用方。
@@ -117,6 +125,10 @@ bool Bq27220Gauge::GetBatteryLevel(int& level, bool& charging, bool& discharging
     (void)ReadCurrentMa(current_ma);   // 失败时按 0 mA 处理
     charging    = (current_ma >  5);   // 留 5mA 死区，避免空载抖动
     discharging = (current_ma < -5);
+
+    // 发布快照供 GetCachedSnapshot 无锁读取：本次是唯一成功路径，失败早退
+    // （dev_ 未挂上 / 读电压失败）都不写，保留上次好值。
+    snapshot_.store(PackBat(level, charging, discharging, /*valid=*/true), std::memory_order_release);
 
     return true;
 }
@@ -164,4 +176,12 @@ float Bq27220Gauge::FilterPush(float sample) {
     filter_idx_ = (filter_idx_ + 1) % kFilterSize;
     if (filter_count_ < kFilterSize) filter_count_++;
     return filter_sum_ / filter_count_;
+}
+
+bool Bq27220Gauge::GetCachedSnapshot(int& level, bool& charging, bool& discharging) const {
+    uint32_t v = snapshot_.load(std::memory_order_acquire);
+    level       = static_cast<int>(v & 0xFF);
+    charging    = (v & (1u << 8)) != 0;
+    discharging = (v & (1u << 9)) != 0;
+    return (v & (1u << 10)) != 0;
 }

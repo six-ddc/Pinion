@@ -5,11 +5,13 @@
 #include "metalio_hal/network.h"
 
 #include <atomic>
+#include <mutex>
 
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_netif_sntp.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -35,6 +37,9 @@ std::atomic<bool> s_wifi_started{false};   // WifiStation::Start() 已成功调�
 std::atomic<bool> s_portal_active{false};  // WifiConfigurationAp 正在跑
 std::string s_portal_ssid;                 // 配网热点 SSID（s_portal_active 为 true 期间有效）
 Nt26Modem* s_modem = nullptr;
+
+std::mutex s_ssid_mu;     // 叶子锁：临界区仅 std::string 赋值/拷贝
+std::string s_wifi_ssid;  // 门面侧缓存，由 OnConnected 回调写入，GetWifiSsid() 加锁读副本
 
 void Emit(Event e, const std::string& data = "") {
     if (s_event_cb) {
@@ -77,7 +82,13 @@ bool StartWifiStationAndWait() {
     auto& wifi_station = WifiStation::GetInstance();
     wifi_station.OnScanBegin([]() { Emit(Event::WifiScanning); });
     wifi_station.OnConnect([](const std::string& ssid) { Emit(Event::WifiConnecting, ssid); });
-    wifi_station.OnConnected([](const std::string& ssid) { Emit(Event::WifiConnected, ssid); });
+    wifi_station.OnConnected([](const std::string& ssid) {
+        {
+            std::lock_guard<std::mutex> lk(s_ssid_mu);
+            s_wifi_ssid = ssid;
+        }
+        Emit(Event::WifiConnected, ssid);
+    });
     wifi_station.Start();
     s_wifi_started = true;
 
@@ -174,16 +185,20 @@ std::string GetWifiSsid() {
     if (CachedType() != Type::WiFi) {
         return "";
     }
-    auto& station = WifiStation::GetInstance();
-    return station.IsConnected() ? station.GetSsid() : "";
+    if (!WifiStation::GetInstance().IsConnected()) {
+        return "";
+    }
+    std::lock_guard<std::mutex> lk(s_ssid_mu);
+    return s_wifi_ssid;
 }
 
 int GetWifiRssi() {
     if (CachedType() != Type::WiFi) {
         return 0;
     }
-    auto& station = WifiStation::GetInstance();
-    return station.IsConnected() ? station.GetRssi() : 0;
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;  // 未连/未init→0，不 abort，无 TOCTOU
+    return ap.rssi;
 }
 
 std::string GetIpAddress() {

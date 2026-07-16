@@ -9,6 +9,12 @@
 namespace mhal::power {
 
 bool GetBatteryLevel(int& level, bool& charging, bool& discharging);
+
+// 非阻塞、原子读上一次成功采样发布的快照（由 1Hz sysmon 任务或任一调用
+// GetBatteryLevel 的调用方顺带发布），无 I2C、无滤波器改写。从未成功采样过
+// 时返回 false（level=0）。
+bool GetBatterySnapshot(int& level, bool& charging, bool& discharging);
+
 bool GetVoltageMv(uint16_t& mv);
 bool GetCurrentMa(int16_t& ma);
 

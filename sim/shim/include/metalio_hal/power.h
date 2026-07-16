@@ -8,6 +8,7 @@
 namespace mhal::power {
 
 bool GetBatteryLevel(int& level, bool& charging, bool& discharging);
+bool GetBatterySnapshot(int& level, bool& charging, bool& discharging);
 bool GetVoltageMv(uint16_t& mv);
 void ForcePowerOff();
 
