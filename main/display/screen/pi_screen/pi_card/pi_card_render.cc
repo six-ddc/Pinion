@@ -14,6 +14,7 @@
 #include "pi_card_cmd.h"  // CommandRegistry（invoke 的 Lint 提示）
 #include "pi_card_data.h"
 #include "pi_card_icons.h"
+#include "pi_card_stock.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "screen_util.h"
@@ -755,6 +756,14 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
                 },
                 LV_EVENT_DELETE, handle_box);
         }
+    } else if (std::strcmp(type, "stock_chart") == 0) {
+        // 行情卡叶子控件（pi_card_stock）：symbol 声明式，行情数据设备侧直取直画、
+        // 自适应刷新、点击切周期；生命周期（注册表/canvas 缓冲/timer）全部自管。
+        obj = pi_card_stock::Create(parent, node);
+        if (obj == nullptr) {
+            err = "stock_chart alloc failed";
+            return nullptr;
+        }
     } else if (std::strcmp(type, "list") == 0) {
         // data 驱动的行模板重复器：item 是一个节点模板，按 card->data[bind_data] 数组的每个
         // 元素克隆+替换{i}/{n}/{item.*}后各渲一份。行数计入 64 节点预算（Validate 已按
@@ -1011,7 +1020,7 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
     }
     static const char* kTypes[] = {"column", "row",   "label", "button", "slider", "arc",
                                    "switch", "bar",   "icon",  "divider", "spacer", "qrcode",
-                                   "choice", "list",  "chart"};
+                                   "choice", "list",  "chart", "stock_chart"};
     bool known = false;
     for (auto* t : kTypes)
         if (std::strcmp(t, type) == 0) known = true;
@@ -1066,6 +1075,9 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
                   "' has no history; available: " + avail;
             return false;
         }
+    }
+    if (std::strcmp(type, "stock_chart") == 0) {
+        if (!pi_card_stock::ValidateNode(node, err)) return false;
     }
     if (std::strcmp(type, "qrcode") == 0) {
         const char* txt = GetStr(node, "text");

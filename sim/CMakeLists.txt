@@ -73,6 +73,13 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_cmd.cc
+    # 股票行情（腾讯财经数据层 + stock tool + stock_chart 控件；HTTP 用 libcurl shim）
+    ${CLAW_ROOT}/main/stock/stock_api.cc
+    ${CLAW_ROOT}/main/stock/stock_tool.cc
+    ${CLAW_ROOT}/main/stock/stock_fetch_worker.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_stock.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/stock_chart_renderer.cc
+    shim/src/stock_http_curl.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
@@ -89,6 +96,8 @@ add_executable(pi_sim
 
 target_include_directories(pi_sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include   # must precede everything ESP-flavored
+    ${CLAW_ROOT}/main                          # stock/…（行情数据层）
+    ${CLAW_ROOT}/main/stock
     ${CLAW_ROOT}/main/display/screen
     ${CLAW_ROOT}/main/display/screen/pi_screen
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card

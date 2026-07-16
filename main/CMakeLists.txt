@@ -15,6 +15,12 @@ set(SOURCES "display/screen/screen_util.cc"
             "display/screen/pi_screen/pi_card/pi_card_render.cc"
             "display/screen/pi_screen/pi_card/pi_card_host.cc"
             "display/screen/pi_screen/pi_card/pi_card_cmd.cc"
+            "stock/stock_api.cc"
+            "stock/stock_http_esp.cc"
+            "stock/stock_tool.cc"
+            "stock/stock_fetch_worker.cc"
+            "display/screen/pi_screen/pi_card/pi_card_stock.cc"
+            "display/screen/pi_screen/pi_card/stock_chart_renderer.cc"
             "display/font/font_pi_mono_14.c"
             "display/font/font_pi_mono_17.c"
             "display/font/font_pi_mono_20.c"
@@ -25,7 +31,7 @@ set(SOURCES "display/screen/screen_util.cc"
             )
 
 set(INCLUDE_DIRS "." "display" "display/font" "display/screen" "display/screen/pi_screen"
-                 "display/screen/pi_screen/pi_card")
+                 "display/screen/pi_screen/pi_card" "stock")
 
 idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}

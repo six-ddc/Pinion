@@ -43,6 +43,7 @@
 
 #include "pi/pi.h"
 #include "pi_card/pi_card_tools.h"
+#include "stock/stock_tool.h"
 #include "pi_esp32.h"
 #include "pi_models_data.h"
 #include "volc_tts.h"
@@ -401,6 +402,14 @@ static int ui_close_exec(const pi_alloc_t *alloc, const char *id, const cJSON *a
     (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
     return card_tool_run(pi_card_tool_close, alloc, args, out);
 }
+/* stock 行情查询：worker 线程同步阻塞抓取（每次 HTTP 6s 超时）——模型本来就在等
+ * tool 结果，且 TTS/ASR 在独立任务，阻塞只延迟 agent 循环自身。 */
+static int stock_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
+                      volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
+                      void *user, pi_tool_result_t *out) {
+    (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
+    return card_tool_run(pi_stock_tool_run, alloc, args, out);
+}
 
 /* 非 const：ui_render 项的 description 在 pi_agent_task_start 里由 pi_card_render_desc()
  * （动态生成，见 pi_card_tools.h）运行时回填，替掉这里的占位空串。 */
@@ -422,6 +431,12 @@ static pi_agent_tool_t TOOLS[] = {
                 .description = PI_CARD_CLOSE_DESC,
                 .parameters_schema_json = PI_CARD_CLOSE_SCHEMA},
         .execute = ui_close_exec,
+    },
+    {
+        .def = {.name = "stock",
+                .description = PI_STOCK_TOOL_DESC,
+                .parameters_schema_json = PI_STOCK_TOOL_SCHEMA},
+        .execute = stock_exec,
     },
 };
 
