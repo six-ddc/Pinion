@@ -185,8 +185,102 @@ constexpr const char* kCardPatch =
     "\"props\":{\"text\":\"{v}%\"}}]},"
     "{\"type\":\"label\",\"role\":\"value\",\"id\":\"lbl\",\"text\":\"0%\"}]}]}}";
 
-constexpr const char* kCards[] = {kCard0,     kCard1,      kCard2,     kCard3,     kCard4, kCard5,
-                                  kCardBadFmt, kCardArc,   kCardQr,    kCardChoice, kCardPatch};
+// P4-a 数据面扩容验收卡（临时）：绑定新增只读遥测路径，核验 Register→bind→subject→
+// render→活性刷新全链路。信息卡（电池扩展/网络/存储）+ chart 卡（功耗/性能历史曲线）。
+constexpr const char* kCardP4aInfo =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"TELEMETRY\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"系统遥测\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"温度\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.temp_c10\",\"fmt\":\"%d x0.1C\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"健康\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\","
+    "\"bind\":\"battery.soh_pct\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"续航\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.tte_min\","
+    "\"fmt\":\"%d min\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"循环\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"battery.cycles\",\"fmt\":\"%d\"}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"运营商\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.operator\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"IP\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"net.ip\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"SD 剩余\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"storage.free_mb\","
+    "\"fmt\":\"%d MB\"}]}]}}";
+constexpr const char* kCardP4aChart =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"CHARTS\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"功耗 / 性能\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"电压 mV\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"battery.voltage_mv\",\"fmt\":\"%d\"}]},"
+    "{\"type\":\"chart\",\"bind_history\":\"battery.voltage_mv\",\"points\":60,\"h\":120},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"CPU %\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"sys.cpu\",\"fmt\":\"%d%%\"}]},"
+    "{\"type\":\"chart\",\"bind_history\":\"sys.cpu\",\"points\":60,\"h\":120}]}}";
+
+// P4-b 事件与触觉验收卡（临时）：imu 姿态路径 + usb/无线充在场路径 + device.vibrate invoke 按钮。
+// 按钮能渲染即证明 device.vibrate 已注册且过 ValidateActions（真机是否真震动另需设备烟测）。
+constexpr const char* kCardP4bSensors =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"SENSORS\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"传感器 / 触觉\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"俯仰\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"imu.pitch\","
+    "\"fmt\":\"%d deg\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"横滚\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"imu.roll\","
+    "\"fmt\":\"%d deg\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"USB 插入\"},{\"type\":\"spacer\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\",\"bind\":\"power.usb_in\",\"fmt\":\"%d\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"无线充\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"power.wireless_charging\",\"fmt\":\"%d\"}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"震动一下\","
+    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"device.vibrate\"}]}]}}";
+
+// P4-c GPS 验收卡（临时）：定位路径 + 启用/停用 invoke。默认门控关时全 --/0；
+// PI_SIM_GPS=1 跑 sim 可见上海演示坐标（验证 gps.lat/lon 的 FormatDegE5 手动格式化）。
+constexpr const char* kCardP4cGps =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
+    "{\"type\":\"column\",\"gap\":2,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"LOCATION\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"卫星定位\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"定位\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\","
+    "\"bind\":\"gps.fix\",\"fmt\":\"%d\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"纬度\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.lat\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"经度\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.lon\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"海拔\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
+    "\"bind\":\"gps.alt_m\",\"fmt\":\"%d m\"}]},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"卫星\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.sats\",\"fmt\":\"%d 颗\"}]},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"row\",\"gap\":12,\"children\":["
+    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"停用\","
+    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"gps.disable\"}]},"
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"启用 GPS\","
+    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"gps.enable\"}]}]}]}}";
+
+constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
+                                  kCard4,        kCard5,          kCardBadFmt,  kCardArc,
+                                  kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
+                                  kCardP4aChart, kCardP4bSensors, kCardP4cGps};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。
@@ -1070,8 +1164,8 @@ void ExecCmd(const std::string& line) {
         const char* desc = pi_card_render_desc();
         size_t sys_len = std::strlen(sysp);
         size_t desc_len = std::strlen(desc);
-        std::fprintf(stderr, "[sim][budget] sys=%zu desc=%zu sum=%zu (limit 8192) %s\n", sys_len,
-                     desc_len, sys_len + desc_len, (sys_len + desc_len <= 8192) ? "OK" : "OVER!");
+        std::fprintf(stderr, "[sim][budget] sys=%zu desc=%zu sum=%zu (limit 9216) %s\n", sys_len,
+                     desc_len, sys_len + desc_len, (sys_len + desc_len <= 9216) ? "OK" : "OVER!");
     } else if (cmd == "sysprompt") {  // Phase2 T9: 打印完整 system prompt 供目视核对
         std::fprintf(stderr, "[sim][sysprompt] %s\n", pi_card_system_prompt());
     } else if (cmd == "shot") {

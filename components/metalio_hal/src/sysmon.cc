@@ -1,6 +1,8 @@
 // 系统监控任务，原样自 metalio-claw-4.cc 板级构造函数内的匿名 lambda。
 #include "metalio_hal/sysmon.h"
 
+#include <mutex>
+
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -14,6 +16,19 @@ namespace {
 
 uint32_t s_period_ms = 1000;
 bool s_started = false;
+
+// CPU 占用率 / 内部 RAM 水位快照：MonitorTask 每周期算完发布，getter 非阻塞读。
+// 数据面(DataHub)与调试侧共用，短锁保护（读多写少，1Hz 写）。
+struct SysSnap {
+    bool     valid       = false;
+    int      core0       = 0;
+    int      core1       = 0;
+    int      avg         = 0;
+    unsigned free_kb     = 0;
+    unsigned min_free_kb = 0;
+};
+std::mutex s_snap_mu;
+SysSnap    s_snap;
 
 void MonitorTask(void*) {
     auto& gauge = Bq27220Gauge::GetInstance();
@@ -65,6 +80,17 @@ void MonitorTask(void*) {
         ESP_LOGI(kMonitorTag, "@@@内存  | 剩余: %6u KB | 历史最小: %6u KB", free_kb,
                  min_free_kb);
 
+        // 发布 CPU/heap 快照供数据面非阻塞读。
+        {
+            std::lock_guard<std::mutex> lk(s_snap_mu);
+            s_snap.core0       = usage[0];
+            s_snap.core1       = core1_usage;
+            s_snap.avg         = avg_usage;
+            s_snap.free_kb     = free_kb;
+            s_snap.min_free_kb = min_free_kb;
+            s_snap.valid       = true;
+        }
+
         int battery_level;
         bool charging, discharging;
         if (gauge.GetBatteryLevel(battery_level, charging, discharging)) {
@@ -80,6 +106,17 @@ void MonitorTask(void*) {
                          battery_level, charging ? "是" : "否", discharging ? "是" : "否");
             }
         }
+
+        // 扩展电池遥测：温度/剩余续航/健康度/满充容量/循环次数，发布快照供数据面读。
+        // 温度按 0.1℃ 整数打印（规避 newlib-nano 浮点格式坑）。
+        if (gauge.SampleExtended()) {
+            Bq27220Gauge::ExtTelemetry et;
+            gauge.GetExtTelemetry(et);
+            ESP_LOGI(kMonitorTag,
+                     "@@@电池+ | 温度: %d(0.1℃) | 剩余续航: %d min | 健康: %d%% | "
+                     "满充: %d mAh | 循环: %d | 剩余: %d mAh",
+                     et.temp_c10, et.tte_min, et.soh_pct, et.fcc_mah, et.cycles, et.remcap_mah);
+        }
     }
 }
 
@@ -92,6 +129,27 @@ void Start(uint32_t period_ms) {
     s_started = true;
     s_period_ms = period_ms;
     xTaskCreate(MonitorTask, "_task", 8192, nullptr, 5, nullptr);
+}
+
+bool GetCpuUsage(int& core0, int& core1, int& avg) {
+    std::lock_guard<std::mutex> lk(s_snap_mu);
+    if (!s_snap.valid) {
+        return false;
+    }
+    core0 = s_snap.core0;
+    core1 = s_snap.core1;
+    avg   = s_snap.avg;
+    return true;
+}
+
+bool GetHeapKb(unsigned& free_kb, unsigned& min_free_kb) {
+    std::lock_guard<std::mutex> lk(s_snap_mu);
+    if (!s_snap.valid) {
+        return false;
+    }
+    free_kb     = s_snap.free_kb;
+    min_free_kb = s_snap.min_free_kb;
+    return true;
 }
 
 }  // namespace mhal::sysmon

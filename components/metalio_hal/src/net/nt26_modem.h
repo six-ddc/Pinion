@@ -55,6 +55,9 @@ public:
     // 非阻塞：同 GetSignalStrength，返回缓存的注册态并触发异步刷新。
     Nt26CeregState GetRegistrationState();
 
+    // 运营商名（来自 AT+COPS? 解析）；modem 未实例化返回 ""。
+    std::string GetCarrierName() const;
+
     // 4G netif 只读句柄（iot_eth 起网后有效；未起网/未初始化返回 nullptr）。
     // 供 network.cc 取 IP 等 netif 级信息用，不转移所有权。
     esp_netif_t* GetNetif() const { return modem_ ? modem_->GetNetif() : nullptr; }

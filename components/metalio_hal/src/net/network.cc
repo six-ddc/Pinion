@@ -320,4 +320,11 @@ std::string GetRegistrationStateJson() {
     return s_modem->GetRegistrationState().ToString();
 }
 
+std::string GetOperator() {
+    if (s_modem == nullptr) {
+        return "";
+    }
+    return s_modem->GetCarrierName();
+}
+
 }  // namespace mhal::network

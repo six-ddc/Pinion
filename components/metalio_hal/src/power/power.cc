@@ -144,6 +144,45 @@ bool GetVoltageMv(uint16_t& mv) { return Bq27220Gauge::GetInstance().GetVoltageM
 
 bool GetCurrentMa(int16_t& ma) { return Bq27220Gauge::GetInstance().ReadCurrentMa(ma); }
 
+namespace {
+// ⚠️ 极性待真机/原理图确认（IOExpander.hpp: "电平含义见原理图"）。暂按"高电平=有效"。
+// 真机验证时若发现相反，把对应常量改 false 即可，调用点无需动。
+constexpr bool kUsbInsertActiveHigh = true;
+constexpr bool kWirelessActiveHigh = true;
+}  // namespace
+
+bool IsUsbInserted() {
+    bool high = false;
+    if (IOExpander::getInstance().readLevel(IOExpander::Pin::USB_INSERT_DET, &high) != ESP_OK) {
+        return false;
+    }
+    return kUsbInsertActiveHigh ? high : !high;
+}
+
+bool IsWirelessCharging() {
+    bool high = false;
+    if (IOExpander::getInstance().readLevel(IOExpander::Pin::WIRELESS_CHARGE_DET, &high) != ESP_OK) {
+        return false;
+    }
+    return kWirelessActiveHigh ? high : !high;
+}
+
+bool GetBatteryExt(BatteryExt& out) {
+    Bq27220Gauge::ExtTelemetry t;
+    if (!Bq27220Gauge::GetInstance().GetExtTelemetry(t)) {
+        return false;
+    }
+    out.voltage_mv = t.voltage_mv;
+    out.current_ma = t.current_ma;
+    out.temp_c10   = t.temp_c10;
+    out.tte_min    = t.tte_min;
+    out.soh_pct    = t.soh_pct;
+    out.fcc_mah    = t.fcc_mah;
+    out.remcap_mah = t.remcap_mah;
+    out.cycles     = t.cycles;
+    return true;
+}
+
 void ForcePowerOff() {
     auto& io = IOExpander::getInstance();
     constexpr int kPulseHalfMs = 100;

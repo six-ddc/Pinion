@@ -13,6 +13,7 @@
 #include "config.h"
 #include "hal_internal.h"
 #include "metalio_hal/backlight.h"
+#include "metalio_hal/imu.h"
 
 #define TAG "mhal"
 
@@ -63,6 +64,10 @@ esp_err_t Init(const InitOptions& opts) {
     if (opts.battery_boot_guard) {
         internal::BatteryBootGuard();
     }
+
+    // 加速度计（SC7A20H）与电量计共用同一条 I2C 总线，须在总线就绪后再探测；
+    // 未焊接/probe NACK 只记日志，不阻断开机。
+    (void)imu::Init();
 
     internal::InitBtModule(opts.bt_default_mode);
 

@@ -3,6 +3,8 @@
 #include "esp_log.h"
 
 #include "metalio_hal/bluetooth.h"
+#include "metalio_hal/gps.h"
+#include "metalio_hal/motor.h"
 #include "metalio_hal/network.h"
 #include "settings.h"
 
@@ -89,6 +91,10 @@ void CommandRegistry::RegisterBuiltins() {
     Register("net.reconnect", "reconnect network", CmdLevel::Safe,
              []() { mhal::network::StartAsync(); });
 
+    // device.vibrate：短促振动反馈，无副作用（Safe）。
+    Register("device.vibrate", "buzz the vibration motor briefly", CmdLevel::Safe,
+             []() { mhal::motor::Buzz(200); });
+
     // bt.reconnect：重连上次配对成功的音箱；无记录/失败均 no-op（Safe，可逆）。
     Register("bt.reconnect", "reconnect last-paired BT speaker", CmdLevel::Safe, []() {
         Settings bt("bt", false);
@@ -100,6 +106,15 @@ void CommandRegistry::RegisterBuiltins() {
     Register("net.switch_type", "switch WiFi/4G, reboots", CmdLevel::Confirm,
              []() { mhal::network::SwitchType(); }, "切换网络通道将重启设备", "切换后设备会重启，期间无法使用",
              "切换并重启");
+
+    // gps.enable：启用 GPS（占用 UART0 + 给模块上电）。有真机风险（UART0 可能是控制台、
+    // 模块是否贴料未定，见 gps.h），故走固件确认而非让 LLM 直接开。
+    Register("gps.enable", "power on GPS module (uses UART0)", CmdLevel::Confirm,
+             []() { mhal::gps::Enable(true); }, "启用 GPS 模块？", "将占用 UART0 并给模块上电；若该口用作日志会冲突",
+             "启用 GPS");
+    // gps.disable：停解析 + 断电，可逆（Safe）。
+    Register("gps.disable", "power off GPS module", CmdLevel::Safe,
+             []() { mhal::gps::Enable(false); });
 
     ESP_LOGI(TAG, "registered %d builtin commands", static_cast<int>(entries_.size()));
 }

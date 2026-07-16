@@ -81,6 +81,29 @@ public:
     // 返回 valid（从未成功采样过则 false，level=0）。任意线程安全（原子读）。
     bool GetCachedSnapshot(int& level, bool& charging, bool& discharging) const;
 
+    // ---- 扩展遥测（BQ27220 standard commands，见 TI 手册 Table 2-1）----
+    // 温度 / 剩余续航 / 健康度 / 满充容量 / 循环次数等。1Hz 由 sysmon 任务调
+    // SampleExtended() 采集并发布快照，其它线程（DataHub/agent worker）用
+    // GetExtTelemetry() 非阻塞读。数据面走这一路，绝不在 UI 线程直接做 I2C。
+    struct ExtTelemetry {
+        bool     valid       = false;  // 从未成功采样过则 false
+        uint16_t voltage_mv  = 0;
+        int16_t  current_ma  = 0;      // + 充电 / - 放电
+        int16_t  temp_c10    = 0;      // 0.1 ℃（寄存器 0.1K 转算）
+        int16_t  tte_min     = -1;     // 剩余续航分钟；非放电/未知(0xFFFF) = -1
+        uint16_t soh_pct     = 0;      // 健康度 %（0x2E 低字节）
+        uint16_t fcc_mah     = 0;      // 满充容量 mAh
+        uint16_t remcap_mah  = 0;      // 剩余容量 mAh
+        uint16_t cycles      = 0;      // 循环次数
+    };
+
+    // 采一次扩展遥测（做 I2C 读多个寄存器，与 GetBatteryLevel 串行化）。成功则
+    // 发布到内部快照并返回 true；device 未挂上 / 电压读失败返回 false（不覆盖旧快照）。
+    bool SampleExtended();
+
+    // 非阻塞读上一次扩展遥测快照（短锁）。从未成功采样过返回 false。
+    bool GetExtTelemetry(ExtTelemetry& out) const;
+
 private:
     Bq27220Gauge() = default;
     Bq27220Gauge(const Bq27220Gauge&) = delete;
@@ -107,8 +130,11 @@ private:
     float filter_sum_      = 0.0f;
     bool  filter_primed_   = false;
 
-    std::mutex sample_mu_;                 // 串行化 GetBatteryLevel 的滤波器/重试改写
+    std::mutex sample_mu_;                 // 串行化 GetBatteryLevel/SampleExtended 的 I2C 与状态改写
     std::atomic<uint32_t> snapshot_{0};    // 位[0..7]=level [8]=chg [9]=dis [10]=valid
+
+    mutable std::mutex ext_mu_;            // 保护扩展遥测快照（读多写少，短锁）
+    ExtTelemetry       ext_snapshot_;
 };
 
 #endif  // BQ27220_GAUGE_H

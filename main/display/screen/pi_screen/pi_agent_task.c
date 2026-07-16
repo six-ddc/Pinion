@@ -606,6 +606,9 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
          * can just send another prompt to retry. */
         if (ev->message && ev->message->stop_reason == PI_STOP_ERROR) {
             const char *msg = ev->message->error_message ? ev->message->error_message : "error";
+            /* 诊断：真正的网络/HTTP/API 错误详情原样打串口（原来只 enqueue 到屏、串口看不到，
+             * 只剩一个 pi_agent_prompt rc=-100）。真机排障靠这一条看清是 HTTP 4xx/传输失败/超时等。 */
+            ESP_LOGE(TAG, "AGENT ERROR (stop_reason=ERROR): %s", msg);
             enqueue(UI_ERROR, strdup(msg), NULL, 0, 0);
             /* 出错停播由 UI 侧在 UI_ERROR 里调 pi_agent_task_tts_cancel。 */
         }
@@ -765,10 +768,14 @@ void pi_agent_task_start(void) {
      * sim 的 "budget" 命令是本地核验；这里在真机启动路径上补一道只告警不 fail 的信号，
      * 免得越界只能靠人工偶尔想起来去跑 sim 才发现。 */
     {
+        /* 预算基线 P4 上调 8192->9216：P4-a/b 有意扩容数据面（新增 ~20 条遥测/传感器
+         * 只读路径，域 battery / net / storage / sys / bt / imu / power），READ-ONLY 清单
+         * 随之长约 600B，并给 P4-c 的 gps 域预留头寸。仍是软告警不 fail，越过新线即提示
+         * 该重新审视路径清单是否需要收敛。 */
         size_t sys_len = strlen(pi_card_system_prompt());
         size_t desc_len = strlen(pi_card_render_desc());
-        if (sys_len + desc_len > 8192) {
-            ESP_LOGW(TAG, "pi_card system_prompt(%u)+ui_render desc(%u)=%u bytes, over 8192 budget",
+        if (sys_len + desc_len > 9216) {
+            ESP_LOGW(TAG, "pi_card system_prompt(%u)+ui_render desc(%u)=%u bytes, over 9216 budget",
                      (unsigned)sys_len, (unsigned)desc_len, (unsigned)(sys_len + desc_len));
         }
     }

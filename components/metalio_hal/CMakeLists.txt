@@ -1,9 +1,12 @@
 set(SRCS
     "src/hal.cc"
+    "src/gps.cc"
+    "src/imu.cc"
     "src/settings.cc"
     "src/storage.cc"
     "src/sysmon.cc"
     "src/backlight.cc"
+    "src/motor.cc"
     "src/backlight_facade.cc"
     "src/audio/audio_codec.cc"
     "src/audio/bt_audio_codec.cc"

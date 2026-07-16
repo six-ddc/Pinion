@@ -213,6 +213,13 @@ Nt26CeregState Nt26Modem::GetRegistrationState() {
     return state;
 }
 
+std::string Nt26Modem::GetCarrierName() const {
+    if (modem_ == nullptr) {
+        return "";
+    }
+    return modem_->GetCarrierName();
+}
+
 void Nt26Modem::StartSignalWorker() {
     signal_nudge_ = xSemaphoreCreateBinary();
     if (signal_nudge_ == nullptr) {

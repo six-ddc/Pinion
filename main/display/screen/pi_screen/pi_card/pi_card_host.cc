@@ -1008,29 +1008,36 @@ cJSON* ExpandPreset(const char* preset, const cJSON* slots, std::string& err) {
 extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     Init();  // 幂等，保证校验器可查 DataHub 路径
     *is_error = false;
+    // 诊断日志（真机 validation 排障）：任一失败路径都把「哪一步 stage + 回给 LLM 的原因 err
+    // + LLM 实际产出的整张卡 JSON」打到串口 ESP_LOGE；成功则末尾打一条 ESP_LOGI trace。
+    // 这样真机串口一眼可见「哪条校验、因为什么、拒了哪张卡」，不必靠 LLM 侧回显猜。
+    auto reject = [&](const char* stage, const std::string& e) -> char* {
+        char* dump = cJSON_PrintUnformatted(args);
+        ESP_LOGE(TAG, "ui_render REJECT [%s]: %s | card=%s", stage, e.c_str(), dump ? dump : "(null)");
+        cJSON_free(dump);
+        *is_error = true;
+        return Dup(e);
+    };
     cJSON* built_root = nullptr;  // preset 展开产物（owned），用完即删——root 走 Validate/序列化拷贝
     const cJSON* root = nullptr;
     if (const cJSON* pj = cJSON_GetObjectItem(args, "preset"); cJSON_IsString(pj)) {
         std::string perr;
         built_root = ExpandPreset(pj->valuestring, cJSON_GetObjectItem(args, "slots"), perr);
         if (!built_root) {
-            *is_error = true;
-            return Dup(perr);
+            return reject("preset", perr);
         }
         root = built_root;
     } else {
         root = cJSON_GetObjectItem(args, "root");
         if (!cJSON_IsObject(root)) {
-            *is_error = true;
-            return Dup("spec missing 'root' object (or use preset+slots)");
+            return reject("no-root", "spec missing 'root' object (or use preset+slots)");
         }
     }
     const cJSON* data = cJSON_GetObjectItem(args, "data");  // object|null，卡级 data 模型
     std::string err;
     if (!Validate(root, data, err)) {
-        *is_error = true;
         cJSON_Delete(built_root);
-        return Dup(err);
+        return reject("validate", err);
     }
     const cJSON* disp = cJSON_GetObjectItem(args, "display");
     int mode = 0;
@@ -1050,10 +1057,9 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     char* root_json = cJSON_PrintUnformatted(root);  // cJSON_Malloc == malloc（drain 侧 free）
     char* data_json = cJSON_IsObject(data) ? cJSON_PrintUnformatted(data) : nullptr;  // 可为 NULL
     if (!root_json) {
-        *is_error = true;
         free(data_json);
         cJSON_Delete(built_root);
-        return Dup("out of memory");
+        return reject("oom", "out of memory");
     }
     // standby 封套尺寸的权威判定：必须在这里（入队之前）挡住，不能留到 drain 侧（LVGL 线程）
     // 才发现超限——那时既有 pin 早已被 id 撞车分支同步删掉，超限卡又被回滚，会落得「NVS 还
@@ -1062,18 +1068,16 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     if (mode == 2) {
         std::string envelope = BuildPinEnvelope(root_json, data_json);
         if (!PinEnvelopeFits(envelope)) {
-            *is_error = true;
             free(root_json);
             free(data_json);
             cJSON_Delete(built_root);
-            return Dup("home widget too large to pin (~3KB); simplify the card");
+            return reject("pin-size", "home widget too large to pin (~3KB); simplify the card");
         }
     }
     // data 走 s3（Enqueue 早已支持）；OnRenderEvent(spec,card_id,display,ttl,data_json) 消费。
     if (!Enqueue(UI_CARD_RENDER, root_json, Dup(id), data_json, mode, ttl_ms)) {
-        *is_error = true;
         cJSON_Delete(built_root);
-        return Dup("UI busy (event queue full), retry shortly");
+        return reject("queue-full", "UI busy (event queue full), retry shortly");
     }
     // state 在入队之后才读：让快照尽量贴近真正建控件的时刻。
     // hints：非阻断设计建议（Validate 已通过），为空则不带该键。
@@ -1090,33 +1094,41 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     }
     std::string ret = std::string("{\"card\":\"") + id + "\"" + BindStateJson(root) + hints_json + "}";
     cJSON_Delete(built_root);
+    ESP_LOGI(TAG, "ui_render OK: card=%s display=%d%s", id.c_str(), mode,
+             hints.empty() ? "" : " (+lint hints)");
     return Dup(ret);
 }
 
 extern "C" char* pi_card_tool_update(const cJSON* args, bool* is_error) {
     *is_error = false;
+    auto reject = [&](const char* stage, const std::string& e) -> char* {
+        char* dump = cJSON_PrintUnformatted(args);
+        ESP_LOGE(TAG, "ui_update REJECT [%s]: %s | args=%s", stage, e.c_str(), dump ? dump : "(null)");
+        cJSON_free(dump);
+        *is_error = true;
+        return Dup(e);
+    };
     const cJSON* idj = cJSON_GetObjectItem(args, "id");
     const cJSON* propsj = cJSON_GetObjectItem(args, "props");
     const cJSON* dataj = cJSON_GetObjectItem(args, "data");
     bool node_patch = cJSON_IsString(idj) && cJSON_IsObject(propsj);
     bool data_ops = cJSON_IsObject(dataj);
     if (!node_patch && !data_ops) {
-        *is_error = true;
-        return Dup("update needs either (id + props) to patch a node, or data:{set/append/remove/"
-                   "replace} to mutate card data");
+        return reject("shape", "update needs either (id + props) to patch a node, or data:{set/append/"
+                               "remove/replace} to mutate card data");
     }
     const cJSON* cardj = cJSON_GetObjectItem(args, "card");
     std::string card = cJSON_IsString(cardj) ? cardj->valuestring : "";
     // 整份 args 序列化进 s3：OnUpdateEvent(card_id, payload_json) 里再分流节点 patch / data ops。
     char* payload = cJSON_PrintUnformatted(args);
     if (!payload) {
-        *is_error = true;
-        return Dup("out of memory");
+        return reject("oom", "out of memory");
     }
     if (!Enqueue(UI_CARD_UPDATE, Dup(card), nullptr, payload, 0, 0)) {
-        *is_error = true;
-        return Dup("UI busy (event queue full), retry shortly");
+        return reject("queue-full", "UI busy (event queue full), retry shortly");
     }
+    ESP_LOGI(TAG, "ui_update OK: card=%s%s%s", card.empty() ? "(active)" : card.c_str(),
+             node_patch ? " +node" : "", data_ops ? " +data" : "");
     return Dup("ok");
 }
 
@@ -1126,8 +1138,10 @@ extern "C" char* pi_card_tool_close(const cJSON* args, bool* is_error) {
     std::string card = cJSON_IsString(cardj) ? cardj->valuestring : "";
     if (!Enqueue(UI_CARD_CLOSE, Dup(card), nullptr, nullptr, 0, 0)) {
         *is_error = true;
+        ESP_LOGE(TAG, "ui_close REJECT [queue-full]: card=%s", card.empty() ? "(active)" : card.c_str());
         return Dup("UI busy (event queue full), retry shortly");
     }
+    ESP_LOGI(TAG, "ui_close OK: card=%s", card.empty() ? "(active)" : card.c_str());
     return Dup("ok");
 }
 

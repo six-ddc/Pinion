@@ -11,4 +11,11 @@ namespace mhal::sysmon {
 // 幂等；重复调用忽略。
 void Start(uint32_t period_ms = 1000);
 
+// 非阻塞读上一次采样发布的 CPU 占用率快照（%）。Start() 后首个采样周期完成前、
+// 或未 Start 时返回 false（输出参数不改写）。
+bool GetCpuUsage(int& core0, int& core1, int& avg);
+
+// 非阻塞读上一次采样发布的内部 RAM 水位快照（KB）。同上，无数据返回 false。
+bool GetHeapKb(unsigned& free_kb, unsigned& min_free_kb);
+
 }  // namespace mhal::sysmon

@@ -7,8 +7,16 @@
 namespace {
 // BQ27220 standard 寄存器（参考 TI 数据手册 Table 2-1 Standard Commands）。
 // 读取均为 little-endian uint16。
+constexpr uint8_t  kRegTemperature = 0x06;  // 0.1 K
 constexpr uint8_t  kRegVoltage     = 0x08;  // mV
 constexpr uint8_t  kRegCurrent     = 0x0C;  // int16, mA (+ 充电 / - 放电)
+constexpr uint8_t  kRegRemainingCap= 0x10;  // mAh
+constexpr uint8_t  kRegFullChargeCap = 0x12;  // mAh
+constexpr uint8_t  kRegTimeToEmpty = 0x16;  // 分钟，0xFFFF=非放电/未知
+constexpr uint8_t  kRegCycleCount  = 0x2A;  // 次
+constexpr uint8_t  kRegStateOfHealth = 0x2E;  // 低字节=健康度%，高字节=状态
+// 0.1K → 0.1℃ 偏移：0℃ = 273.15K = 2731.5(0.1K)，取整 2732。
+constexpr int      kKelvinC10Offset = 2732;
 constexpr uint32_t kI2cSpeedHz     = 100 * 1000;  // 100 kHz, 上限 400 kHz
 constexpr int      kI2cTimeoutMs   = 50;
 constexpr int      kProbeTimeoutMs = 50;
@@ -184,4 +192,46 @@ bool Bq27220Gauge::GetCachedSnapshot(int& level, bool& charging, bool& dischargi
     charging    = (v & (1u << 8)) != 0;
     discharging = (v & (1u << 9)) != 0;
     return (v & (1u << 10)) != 0;
+}
+
+bool Bq27220Gauge::SampleExtended() {
+    // 与 GetBatteryLevel 共用 sample_mu_ 串行化 I2C 与 consecutive_err_ 改写：
+    // sysmon 顺序调用二者，其它线程(开机保护/DataHub)经此加锁避免 ReadU16 数据竞争。
+    std::lock_guard<std::mutex> lk(sample_mu_);
+    if (dev_ == nullptr) {
+        // 未挂上不重复探测：GetBatteryLevel 的节流自愈(10s/次)负责重挂，这里直接放弃本帧。
+        return false;
+    }
+
+    ExtTelemetry t;
+    uint16_t v = 0;
+    if (!ReadU16(kRegVoltage, &v)) {
+        return false;  // 电压这一路读失败视作整帧失败，保留旧快照
+    }
+    t.voltage_mv = v;
+
+    // 其余寄存器逐个 best-effort：单个读失败保留该字段默认值，不影响整帧发布。
+    uint16_t raw = 0;
+    if (ReadU16(kRegCurrent, &raw)) t.current_ma = static_cast<int16_t>(raw);
+    if (ReadU16(kRegTemperature, &raw))
+        t.temp_c10 = static_cast<int16_t>(static_cast<int>(raw) - kKelvinC10Offset);
+    if (ReadU16(kRegRemainingCap, &raw)) t.remcap_mah = raw;
+    if (ReadU16(kRegFullChargeCap, &raw)) t.fcc_mah = raw;
+    if (ReadU16(kRegTimeToEmpty, &raw))
+        t.tte_min = (raw == 0xFFFF) ? static_cast<int16_t>(-1) : static_cast<int16_t>(raw);
+    if (ReadU16(kRegCycleCount, &raw)) t.cycles = raw;
+    if (ReadU16(kRegStateOfHealth, &raw)) t.soh_pct = static_cast<uint16_t>(raw & 0xFF);
+    t.valid = true;
+
+    {
+        std::lock_guard<std::mutex> el(ext_mu_);
+        ext_snapshot_ = t;
+    }
+    return true;
+}
+
+bool Bq27220Gauge::GetExtTelemetry(ExtTelemetry& out) const {
+    std::lock_guard<std::mutex> lk(ext_mu_);
+    out = ext_snapshot_;
+    return ext_snapshot_.valid;
 }

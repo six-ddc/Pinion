@@ -96,5 +96,7 @@ esp_err_t SendAtCommand(const std::string& cmd, std::string& response,
 int GetSignalStrength();
 // AT+CEREG 注册状态 JSON（{"stat":1,...}；stat 1/5=已注册）。
 std::string GetRegistrationStateJson();
+// 4G 运营商名（来自 AT+COPS? 解析）；WiFi 模式或 modem 未就绪返回 ""。
+std::string GetOperator();
 
 }  // namespace mhal::network

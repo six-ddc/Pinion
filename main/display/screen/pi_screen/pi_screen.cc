@@ -24,7 +24,13 @@
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "metalio_hal/audio_pipeline.h"
+#include "metalio_hal/bluetooth.h"
+#include "metalio_hal/gps.h"
+#include "metalio_hal/imu.h"
 #include "metalio_hal/network.h"
+#include "metalio_hal/power.h"
+#include "metalio_hal/storage.h"
+#include "metalio_hal/sysmon.h"
 #include "pi_fonts.h"
 #include "pi_net_events.h"
 #include "pi_quick_panel.h"
@@ -227,6 +233,52 @@ lv_timer_t* s_think_timer = nullptr;
 lv_timer_t* s_tool_running_timer = nullptr;
 lv_timer_t* s_cursor_blink_timer = nullptr;
 lv_timer_t* s_drain_timer = nullptr;
+lv_timer_t* s_pickup_timer = nullptr;  // P4-b 拿起唤醒：息屏时轮询 imu 检测运动
+
+// P4-b 拿起唤醒：仅在息屏（非 Awake）时看加速度计，检测到明显运动即像 PWR_KEY 一样唤醒。
+// imu 未焊/未采到（GetSnapshot 返回 false）时空转，绝不误唤醒（优雅降级）。阈值需真机整定。
+void PickupWatchTick(lv_timer_t*) {
+    static bool have_base = false;
+    static int base_x = 0, base_y = 0, base_z = 0;
+    if (pi_sleep::IsAwake()) {
+        have_base = false;  // 醒着不监测，出息屏即丢基线
+        return;
+    }
+    int x = 0, y = 0, z = 0, pitch = 0, roll = 0;
+    if (!mhal::imu::GetSnapshot(x, y, z, pitch, roll)) {
+        have_base = false;  // 无 imu 数据：不动作
+        return;
+    }
+    if (!have_base) {  // 息屏后首帧设基线
+        base_x = x;
+        base_y = y;
+        base_z = z;
+        have_base = true;
+        return;
+    }
+    const int dx = x - base_x, dy = y - base_y, dz = z - base_z;
+    const long mag2 = (long)dx * dx + (long)dy * dy + (long)dz * dz;
+    constexpr long kPickupThreshMg2 = 300L * 300L;  // ~300mg 合成位移；真机整定
+    if (mag2 > kPickupThreshMg2) {
+        have_base = false;
+        pi_sleep::ConsumeKeyWake();  // 与按键唤醒同路：唤醒 + 重置无操作计时
+    } else {
+        base_x += dx / 4;  // 缓慢跟随基线，抵消姿态漂移，避免桌面微动累积成误唤醒
+        base_y += dy / 4;
+        base_z += dz / 4;
+    }
+}
+
+// P4-c GPS：十进制度格式化到 5 位小数。规避 newlib-nano 无 %f 浮点打印——手动整数
+// 拆分（180*1e5 < 2^31，long 安全），只用整数格式化。供 gps.lat / gps.lon String 路径。
+std::string FormatDegE5(double deg) {
+    bool neg = deg < 0;
+    if (neg) deg = -deg;
+    long scaled = static_cast<long>(deg * 100000.0 + 0.5);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%s%ld.%05ld", neg ? "-" : "", scaled / 100000, scaled % 100000);
+    return std::string(buf);
+}
 
 struct ToolCacheEntry {
     std::string name;
@@ -3080,6 +3132,7 @@ void OnScreenUnloaded(lv_event_t*) {
         s_cursor_blink_timer = nullptr;
     }
     if (s_drain_timer != nullptr) { lv_timer_delete(s_drain_timer); s_drain_timer = nullptr; }
+    if (s_pickup_timer != nullptr) { lv_timer_delete(s_pickup_timer); s_pickup_timer = nullptr; }
 
     // Drain and free anything still in flight so agent-thread mallocs never
     // leak just because the screen went away mid-turn.
@@ -3323,6 +3376,197 @@ lv_obj_t* PiScreen::Create() {
                          pi_sleep::ReloadConfig();  // 立即重读，别等 ~5s tick
                      },
                      pi_card::WorkerRead::Safe, 0, 3600);
+
+        // ---- P4-a 数据面扩容：只读遥测路径 ----
+        // 全部只读（setter=nullptr），getter 一律走非阻塞快照 / 缓存读，绝不在
+        // getter 里做阻塞 I2C/UART——因为 1Hz PublishLive 在 LVGL 线程也会调它。
+        // WorkerRead::Safe：agent 渲染卡片时同步读快照，无 I2C 副作用。
+
+        // 电池扩展遥测（BQ27220 standard commands，sysmon 1Hz 采样发布快照）。
+        // 电压/电流带历史 → 直接喂 chart 做功耗曲线。
+        hub.Register("battery.voltage_mv", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);  // 未采样时 e 为默认值(占位)
+                         return static_cast<int>(e.voltage_mv);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 3000, 4300, /*keep_history=*/true);
+        hub.Register("battery.current_ma", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.current_ma);  // + 充 / - 放，无量程保留符号
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, -1, /*keep_history=*/true);
+        hub.Register("battery.temp_c10", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.temp_c10);  // 0.1 ℃
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("battery.tte_min", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.tte_min);  // 剩余续航分钟，-1=未知
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("battery.soh_pct", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.soh_pct);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, 100);
+        hub.Register("battery.fcc_mah", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.fcc_mah);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("battery.cycles", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         return static_cast<int>(e.cycles);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+
+        // 网络：IP / 运营商 / 4G 注册态（CEREG TAC/CI/AcT，JSON 原样透出供 LLM 解析）。
+        // 三者门面内部均为缓存读+异步刷新，非阻塞。
+        hub.Register("net.ip", pi_card::HubType::String,
+                     []() -> pi_card::HubValue { return mhal::network::GetIpAddress(); },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("net.operator", pi_card::HubType::String,
+                     []() -> pi_card::HubValue { return mhal::network::GetOperator(); },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("net.cell", pi_card::HubType::String,
+                     []() -> pi_card::HubValue { return mhal::network::GetRegistrationStateJson(); },
+                     nullptr, pi_card::WorkerRead::Safe);
+
+        // 存储：SD 是否挂载 + 剩余空间（MB）。free_mb 走 statvfs，未挂载返回 0。
+        hub.Register("storage.sd", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue {
+                         return static_cast<bool>(mhal::storage::IsSdMounted());
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("storage.free_mb", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         uint64_t total = 0, freeb = 0;
+                         if (!mhal::storage::GetSdFreeBytes(total, freeb)) return static_cast<int>(0);
+                         return static_cast<int>(freeb / (1024ULL * 1024ULL));
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+
+        // 系统：CPU 平均占用 % + 内部 RAM 剩余 KB（sysmon 1Hz 快照）。均带历史 → 性能面板 chart。
+        hub.Register("sys.cpu", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         int c0 = 0, c1 = 0, avg = 0;
+                         mhal::sysmon::GetCpuUsage(c0, c1, avg);
+                         return static_cast<int>(avg);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, 100, /*keep_history=*/true);
+        hub.Register("sys.heap_kb", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         unsigned free_kb = 0, min_kb = 0;
+                         mhal::sysmon::GetHeapKb(free_kb, min_kb);
+                         return static_cast<int>(free_kb);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, -1, /*keep_history=*/true);
+
+        // 蓝牙：连接态 + 当前模式字符串——让 LLM 不再是盲盒式盲连。
+        hub.Register("bt.connected", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue {
+                         return static_cast<bool>(mhal::bt::GetConnState() ==
+                                                  mhal::bt::ConnState::Connected);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("bt.mode", pi_card::HubType::String,
+                     []() -> pi_card::HubValue {
+                         switch (mhal::bt::GetMode()) {
+                             case mhal::bt::Mode::Rx: return std::string("rx");
+                             case mhal::bt::Mode::Tx: return std::string("tx");
+                             case mhal::bt::Mode::MusicRx: return std::string("music");
+                             default: return std::string("none");
+                         }
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+
+        // ---- P4-b 事件与触觉：传感器只读路径 ----
+        // 姿态：加速度计算出的俯仰/横滚（整数度，imu 5Hz 采样快照，非阻塞读）。
+        hub.Register("imu.pitch", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         int x = 0, y = 0, z = 0, pitch = 0, roll = 0;
+                         mhal::imu::GetSnapshot(x, y, z, pitch, roll);
+                         return static_cast<int>(pitch);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, -90, 90);
+        hub.Register("imu.roll", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         int x = 0, y = 0, z = 0, pitch = 0, roll = 0;
+                         mhal::imu::GetSnapshot(x, y, z, pitch, roll);
+                         return static_cast<int>(roll);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, -180, 180);
+        // 电源在场检测：USB 插入 / 无线充电（TCA9555 P10/P11 输入脚，极性待真机确认）。
+        // 主动性卡片的理想触发源（插上充电器弹充电面板）；本轮先透出只读状态。
+        hub.Register("power.usb_in", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue {
+                         return static_cast<bool>(mhal::power::IsUsbInserted());
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("power.wireless_charging", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue {
+                         return static_cast<bool>(mhal::power::IsWirelessCharging());
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+
+        // ---- P4-c GPS：只读定位路径（门控默认关，未启用/未定位一律优雅回落）----
+        // GPS 默认沉睡（见 gps.h：UART0 占用/贴料未定，需真机确认），故这些路径在启用前
+        // 恒为 no-fix：fix=false、sats/alt/speed=0、lat/lon="--"。启用后由 gps.enable invoke。
+        hub.Register("gps.fix", pi_card::HubType::Bool,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         return static_cast<bool>(mhal::gps::GetFix(f) && f.valid);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("gps.sats", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         mhal::gps::GetFix(f);
+                         return static_cast<int>(f.sats);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, 40);
+        hub.Register("gps.alt_m", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         mhal::gps::GetFix(f);
+                         return static_cast<int>(f.alt_m);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("gps.speed_kmh", pi_card::HubType::Int,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         mhal::gps::GetFix(f);
+                         return static_cast<int>(f.speed_kmh);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe, 0, 300);
+        hub.Register("gps.lat", pi_card::HubType::String,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         if (!mhal::gps::GetFix(f) || !f.valid) return std::string("--");
+                         return FormatDegE5(f.lat);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
+        hub.Register("gps.lon", pi_card::HubType::String,
+                     []() -> pi_card::HubValue {
+                         mhal::gps::Fix f;
+                         if (!mhal::gps::GetFix(f) || !f.valid) return std::string("--");
+                         return FormatDegE5(f.lon);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
     }
     pi_card::FeedHooks card_hooks;
     card_hooks.begin_row = CardBeginRow;
@@ -3346,6 +3590,7 @@ lv_obj_t* PiScreen::Create() {
 
     s_drain_timer = lv_timer_create(DrainQueueTick, 80, nullptr);
     s_cursor_blink_timer = lv_timer_create(CursorBlinkTick, 500, nullptr);
+    s_pickup_timer = lv_timer_create(PickupWatchTick, 150, nullptr);  // P4-b 拿起唤醒轮询
 
     // 单 App 固件：无 home 菜单可返回；Chat 态右滑是 Go(Idle)（见
     // OnScrGesture），不走 screen_attach_swipe_back 的卸载语义。

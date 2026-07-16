@@ -60,5 +60,6 @@ esp_err_t SendAtCommand(const std::string& cmd, std::string& response, uint32_t 
                         bool bypass_init_check = false);
 int GetSignalStrength();
 std::string GetRegistrationStateJson();
+std::string GetOperator();
 
 }  // namespace mhal::network

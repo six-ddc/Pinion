@@ -169,4 +169,6 @@ int GetSignalStrength() { return g_connected ? 26 : -1; }
 
 std::string GetRegistrationStateJson() { return "{\"stat\":1,\"tac\":\"1A2B\",\"ci\":\"01F3\"}"; }
 
+std::string GetOperator() { return "CHINA MOBILE"; }
+
 }  // namespace mhal::network
