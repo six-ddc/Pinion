@@ -40,6 +40,7 @@
 #include "IOExpander.hpp"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_tools.h"
+#include "stock/stock_tool.h"
 #include "pi_screen.h"
 #include "screen_util.h"
 #include "sim_hooks.h"
@@ -1168,6 +1169,41 @@ void ExecCmd(const std::string& line) {
                      desc_len, sys_len + desc_len, (sys_len + desc_len <= 9216) ? "OK" : "OVER!");
     } else if (cmd == "sysprompt") {  // Phase2 T9: 打印完整 system prompt 供目视核对
         std::fprintf(stderr, "[sim][sysprompt] %s\n", pi_card_system_prompt());
+    } else if (cmd == "stockcard") {  // 股票: stockcard <symbol> [name] — 注入 stock_chart chat 卡
+        std::string sym, name;
+        ss >> sym;
+        std::getline(ss, name);
+        if (!name.empty() && name[0] == ' ') name.erase(0, 1);
+        cJSON* args = cJSON_CreateObject();
+        cJSON* root = cJSON_AddObjectToObject(args, "root");
+        cJSON_AddStringToObject(root, "type", "stock_chart");
+        cJSON_AddStringToObject(root, "symbol", sym.c_str());
+        if (!name.empty()) cJSON_AddStringToObject(root, "name", name.c_str());
+        bool is_err = false;
+        char* res = pi_card_tool_render(args, &is_err);
+        std::fprintf(stderr, "[sim] stockcard render: %s (%s)\n", res ? res : "(null)", is_err ? "ERROR" : "ok");
+        free(res);
+        cJSON_Delete(args);
+    } else if (cmd == "stockq") {  // 股票: stockq <查询词|symbol,...> — 直调 stock tool（阻塞 ≤6s/请求）
+        std::string q;
+        std::getline(ss, q);
+        if (!q.empty() && q[0] == ' ') q.erase(0, 1);
+        cJSON* args = cJSON_CreateObject();
+        if (q.find(',') != std::string::npos || (q.size() > 2 && std::isdigit((unsigned char)q[2]))) {
+            cJSON* arr = cJSON_AddArrayToObject(args, "symbols");
+            std::stringstream qs(q);
+            std::string sym;
+            while (std::getline(qs, sym, ',')) {
+                if (!sym.empty()) cJSON_AddItemToArray(arr, cJSON_CreateString(sym.c_str()));
+            }
+        } else {
+            cJSON_AddStringToObject(args, "query", q.c_str());
+        }
+        bool is_err = false;
+        char* res = pi_stock_tool_run(args, &is_err);
+        std::fprintf(stderr, "[sim][stockq] %s -> %s\n", is_err ? "ERR" : "OK", res ? res : "(null)");
+        free(res);
+        cJSON_Delete(args);
     } else if (cmd == "shot") {
         std::string p;
         ss >> p;

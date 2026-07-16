@@ -63,7 +63,9 @@ const char *pi_card_system_prompt(void);
     "(repeats item once per element of data[key]; inside item strings use {i}=0-based index, "       \
     "{n}=1-based, {item.FIELD}=that record's field; row actions may be report/set/close only, not "  \
     "toggle/patch); chart{bind_history:'path',points?,w?,h?} (LINE chart of a history-enabled "      \
-    "path); qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "        \
+    "path); stock_chart{symbol,name?,mode?:'min'|'5d'|'day'|'week'} (live CN/HK/US stock "            \
+    "quote+chart card, self-refreshing, tap cycles timeframe; symbol from the stock tool); "          \
+    "qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "               \
     "eyebrow|kicker|section|title|heading|label|value|caption. variant (button): primary(the ONE "   \
     "amber CTA)|ghost|plain|default. Common props: id,w,h,grow,pad,gap,size,mono,tone,fill,color,bg," \
     "hidden. tone(text)/fill(bg) take a semantic token auto-adapting to light/dark: accent|"          \
@@ -102,7 +104,8 @@ const char *pi_card_system_prompt(void);
     "ype\":" \
     "\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"column\",\"row\",\"label\"," \
     "\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"spacer\",\"qrcode\",\"ch" \
-    "oice\",\"list\",\"chart\"]},\"children\":{\"type" \
+    "oice\",\"list\",\"chart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\"" \
+    ":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"min\",\"5d\",\"day\",\"week\"]},\"children\":{\"type" \
     "\":\"array\",\"items\":{\"$ref\":\"#/$defs/node\"}},\"text\":{\"type\":\"string\"},\"role\":{\"t" \
     "ype\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"heading\",\"label\",\"" \
     "value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"ghost\",\"plain\"" \
@@ -120,7 +123,7 @@ const char *pi_card_system_prompt(void);
     "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"hidden\":{\"type\":" \
     "\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_chan" \
     "ge\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\":\"arr" \
-    "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}},\"properties\":{\"root" \
+    "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}}},\"properties\":{\"root" \
     "\":{\"$ref\":\"#/$defs/node\"},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\"," \
     "\"standby\"]}" \
     ",\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"type" \
