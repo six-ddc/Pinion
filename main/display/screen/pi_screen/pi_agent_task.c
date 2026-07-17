@@ -42,9 +42,11 @@
 #include "freertos/task.h"
 
 #include "pi/pi.h"
+#include "pi_card/pi_card_media.h"
 #include "pi_card/pi_card_tools.h"
 #include "stock/stock_tool.h"
 #include "pi_esp32.h"
+#include "pi_media_focus.h"
 #include "pi_models_data.h"
 #include "volc_tts.h"
 
@@ -183,6 +185,20 @@ static bool g_tts_overflow_warned = false; /* 每 run 只告警一次溢出 */
 
 static void tts_cancel_run(void);
 
+/* Stage D 焦点仲裁：首帧音频即将出声 → 立即 Suspend 音乐；本次播报排空/出错结束 →
+ * 安排一次去抖 Resume 检查（见 pi_media_focus.h/.cc，回合级兜底另在 pi_screen 的
+ * UI_DONE/UI_ERROR 里补）。两个回调都跑在 volc_tts 内部任务上下文，必须非阻塞——
+ * pi_media_focus 的实现只是原子计数 + detach 一个短睡眠线程，满足这一点。 */
+static void tts_on_audio_start(void *ctx) {
+    (void)ctx;
+    pi_media_focus_tts_audio_start();
+}
+
+static void tts_on_finished(void *ctx) {
+    (void)ctx;
+    pi_media_focus_tts_ended();
+}
+
 static void tts_on_error(int code, const char *msg, void *ctx) {
     (void)ctx;
     ESP_LOGW(TAG, "tts error %d: %s", code, msg);
@@ -191,10 +207,11 @@ static void tts_on_error(int code, const char *msg, void *ctx) {
      * stop 的话已缓冲的几秒音频会一直播到下一次 speak_begin 才被清；且 pump 私有
      * 的 session_open 也要靠这里翻代次才会复位，否则后续 feed 会打到死会话上。 */
     tts_cancel_run();
+    pi_media_focus_tts_ended(); /* 出错也是"本次播报结束"，别让音乐永久停在让路态 */
 }
 
-static const volc_tts_callbacks_t TTS_CBS = {.on_audio_start = NULL,
-                                             .on_finished = NULL,
+static const volc_tts_callbacks_t TTS_CBS = {.on_audio_start = tts_on_audio_start,
+                                             .on_finished = tts_on_finished,
                                              .on_error = tts_on_error,
                                              .ctx = NULL};
 
@@ -410,6 +427,14 @@ static int stock_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args
     (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
     return card_tool_run(pi_stock_tool_run, alloc, args, out);
 }
+/* media 播放查询/起播：worker 线程同步扫盘/建表后 StagePlaylist（几十 ms 内返回，
+ * 解码/播放在 MediaController 后台线程）。绝不碰 LVGL。 */
+static int media_exec(const pi_alloc_t *alloc, const char *id, const cJSON *args,
+                      volatile bool *abort_flag, pi_tool_update_cb on_update, void *update_user,
+                      void *user, pi_tool_result_t *out) {
+    (void)id; (void)abort_flag; (void)on_update; (void)update_user; (void)user;
+    return card_tool_run(pi_media_tool_run, alloc, args, out);
+}
 
 /* 非 const：ui_render 项的 description 在 pi_agent_task_start 里由 pi_card_render_desc()
  * （动态生成，见 pi_card_tools.h）运行时回填，替掉这里的占位空串。 */
@@ -437,6 +462,12 @@ static pi_agent_tool_t TOOLS[] = {
                 .description = PI_STOCK_TOOL_DESC,
                 .parameters_schema_json = PI_STOCK_TOOL_SCHEMA},
         .execute = stock_exec,
+    },
+    {
+        .def = {.name = "media",
+                .description = PI_MEDIA_TOOL_DESC,
+                .parameters_schema_json = PI_MEDIA_TOOL_SCHEMA},
+        .execute = media_exec,
     },
 };
 
@@ -906,3 +937,5 @@ void pi_agent_tts_set_enabled(bool enable) {
     g_tts_enabled = enable;
     if (!enable) tts_cancel_run();
 }
+
+bool pi_agent_task_is_running(void) { return g_running; }

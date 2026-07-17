@@ -27,6 +27,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 #include "sim_hooks.h"
 
 namespace mhal::audio_pipeline {
@@ -100,6 +104,7 @@ struct PlaybackState {
     std::atomic<bool> had_data{false};  // 本轮是否播放过数据（排空回调条件）
     std::atomic<bool> prebuffering{true};
     std::atomic<int> feeding{0};  // 在途 FeedPlayback 数（Flush 竞态收口）
+    std::atomic<uint32_t> gen{0};  // 播放代次：每次 FlushPlayback 进入自增（同真机）
     std::mutex drained_mutex;
     std::function<void()> drained_cb;
 };
@@ -108,7 +113,8 @@ PlaybackState s_play;
 
 size_t CapacitySamples() { return s_play.cfg.queue_bytes / sizeof(int16_t); }
 
-size_t PlaybackFilled() {
+// 内部：当前排队样本数（prestart 低水位比较用，量纲=样本）。
+size_t QueuedSamples() {
     std::lock_guard<std::mutex> lock(s_play.mu);
     return s_play.queue.size();
 }
@@ -125,11 +131,21 @@ void FireDrainedCb() {
 }
 
 void PlaybackTask() {
+#ifdef __APPLE__
+    // 背景 QoS 的定时器合并会把本线程的实时 sleep 拉长（同 main.cc 里对 LVGL 线程的处理），
+    // 使"按 16k 配速消费"跑出亚实时速率。钉到交互级 QoS 让消费贴近真实 16k 节拍。
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    // 用"虚拟播放时钟"截止时间配速（sleep_until 而非按块 sleep_for）：macOS 对本进程后台
+    // 线程的定时器合并会把每次 sleep_for 唤醒拖后一个固定量，逐块累加成显著亚实时（实测
+    // 128ms 块 → 0.4x）。以累积截止时间为基准、唤醒抖动由下一块的更短睡眠吸收，平均回到 16k
+    // 实时；大脱节（flush/暂停后长空闲）再重同步。
+    auto next_deadline = std::chrono::steady_clock::now();
     while (true) {
         // 低水位预启动：空转后首批数据到达时，先积累 prestart_ms 再开播。
-        if (s_play.prebuffering && PlaybackFilled() > 0 && !s_play.flushing) {
+        if (s_play.prebuffering && QueuedSamples() > 0 && !s_play.flushing) {
             const size_t prestart_samples = (size_t)s_play.cfg.prestart_ms * SampleRate() / 1000;
-            for (uint32_t waited = 0; PlaybackFilled() < prestart_samples &&
+            for (uint32_t waited = 0; QueuedSamples() < prestart_samples &&
                                       waited < s_play.cfg.prestart_ms * 3 && !s_play.flushing;
                  waited += 10) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -153,10 +169,15 @@ void PlaybackTask() {
             if (!s_play.flushing) {
                 s_play.writing = true;
                 s_play.had_data = true;
-                // 真机在此写 I2S（受硬件节拍约束）；sim 用等时长 sleep 复现同样
-                // 的实时消费速率，让背压/排空时序与真机同构。
-                std::this_thread::sleep_for(
-                    std::chrono::microseconds(chunk.size() * 1000000ULL / SampleRate()));
+                // 真机在此写 I2S（受硬件节拍约束）；sim 用截止时间配速复现同样的 16k 实时
+                // 消费速率，让背压/排空时序与真机同构。
+                next_deadline += std::chrono::microseconds(chunk.size() * 1000000ULL / SampleRate());
+                auto now = std::chrono::steady_clock::now();
+                if (now - next_deadline > std::chrono::milliseconds(500)) {
+                    next_deadline = now;  // 大脱节（flush/长空闲）后重同步，不追赶历史
+                } else if (next_deadline > now) {
+                    std::this_thread::sleep_until(next_deadline);
+                }  // 否则(落后 0..500ms)：不睡，让后续块把节拍追回，平均维持实时
                 s_play.writing = false;
             }
             continue;
@@ -166,6 +187,7 @@ void PlaybackTask() {
         if (s_play.had_data) {
             s_play.had_data = false;
             s_play.prebuffering = true;
+            next_deadline = std::chrono::steady_clock::now();  // 空闲后重置节拍基准
             FireDrainedCb();
         }
     }
@@ -220,6 +242,7 @@ size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms) {
 void FlushPlayback() {
     if (!s_play.ensured)
         return;
+    s_play.gen++;  // 播放代次自增（同真机）：带 expected_gen 的喂入据此丢弃打断残帧
     s_play.flushing = true;
     {
         std::lock_guard<std::mutex> lock(s_play.mu);
@@ -279,7 +302,22 @@ void OnPlaybackDrained(std::function<void()> cb) {
 bool IsPlaybackIdle() {
     if (!s_play.ensured)
         return true;
-    return PlaybackFilled() == 0 && !s_play.writing;
+    return QueuedSamples() == 0 && !s_play.writing;
 }
+
+uint32_t PlaybackGen() { return s_play.gen.load(); }
+
+// 带期望代次的喂入：代次不等（其间发生过 FlushPlayback）则按已消费丢弃（同真机语义，
+// sim 在入口粗校验代次，足以复现"打断残音被丢弃"的时序）。
+size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms, uint32_t expected_gen) {
+    if (!s_play.ensured || samples == 0)
+        return 0;
+    if (s_play.gen.load() != expected_gen)
+        return samples;  // 已被打断：静默丢弃
+    return FeedPlayback(pcm, samples, timeout_ms);
+}
+
+// 已占用字节数（= 队列样本数 * 2）。供上游按播放进度节流（同真机）。
+size_t PlaybackFilled() { return QueuedSamples() * sizeof(int16_t); }
 
 }  // namespace mhal::audio_pipeline

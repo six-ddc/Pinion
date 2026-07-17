@@ -61,6 +61,8 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_screen.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_quick_panel.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_settings.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media_focus.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_net_events.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_sleep.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_theme.cc
@@ -80,6 +82,14 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_stock.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/stock_chart_renderer.cc
     shim/src/stock_http_curl.cc
+    # media_player AI 集成层（media 工具 + media.* 路径/命令）
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_media.cc
+    # media_player 媒体播放核心（可移植源 device/sim 同源；HTTP 流用 libcurl shim）
+    ${CLAW_ROOT}/components/media_player/src/media_controller.cc
+    ${CLAW_ROOT}/components/media_player/src/media_pump.cc
+    ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
+    ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
+    shim/src/media_http_curl.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
@@ -103,6 +113,8 @@ target_include_directories(pi_sim PRIVATE
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
     ${CLAW_ROOT}/components/volc_speech/include # real volc headers, stub impls
     ${CLAW_ROOT}/components/lv_markdown/include
+    ${CLAW_ROOT}/components/media_player/include # media_player 公开契约
+    ${CLAW_ROOT}/components/media_player/src     # minimp3.h / media_resampler.h / media_internal.h（私有）
 )
 
 target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2)

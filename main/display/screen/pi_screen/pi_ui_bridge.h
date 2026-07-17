@@ -76,6 +76,12 @@ uint32_t pi_agent_context_window(void); /* model.context_window（deepseek=10000
 bool pi_agent_tts_enabled(void);
 void pi_agent_tts_set_enabled(bool enable);
 
+/* 是否有一轮 pi_agent_prompt() 正挂在 worker 栈上（Stage D 的 pi_media_focus 用它
+ * 压住 ASR 结束后到 TTS 真正出声前的"思考间隙"里被误 Resume 的那次去抖检查——那
+ * 段间隙里没人在说话，但马上就会有，不该趁空当把音乐续上又立刻打断）。volatile
+ * bool 读，非阻塞、任意线程可调。 */
+bool pi_agent_task_is_running(void);
+
 /* 打断当前播报并作废本次回答尚未播出的文本缓冲（barge-in / 用户开口 / STOP）。
    内部异步停播、不阻塞调用线程，可从任意任务调用。UI 侧 barge-in 必须走它而非
    裸 volc_tts_stop()——否则 TTS pump 会继续念缓冲里的旧文本。 */

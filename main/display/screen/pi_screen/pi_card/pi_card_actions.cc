@@ -1,5 +1,6 @@
 #include "pi_card_actions.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "esp_log.h"
@@ -264,6 +265,11 @@ std::vector<Action> ParseActions(const cJSON* arr) {
         if (valj && cJSON_IsNumber(valj)) {
             a.has_value = true;
             a.value = valj->valueint;
+        } else if (valj && cJSON_IsString(valj) && valj->valuestring) {
+            // list 行模板里 {i}/{n} 替换后是字符串（如 set media.play_index value:"{i}" → "0"）：
+            // atoi 转整数，让「行 tap 切曲」这类 set 生效。非数字串 atoi 得 0，无害。
+            a.has_value = true;
+            a.value = std::atoi(valj->valuestring);
         }
         const cJSON* pathj = cJSON_GetObjectItem(item, "path");
         if (pathj && cJSON_IsString(pathj)) a.path = pathj->valuestring;

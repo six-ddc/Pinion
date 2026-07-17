@@ -42,8 +42,11 @@ struct PlaybackConfig {
 
 bool EnsurePlayback(const PlaybackConfig& cfg = {});
 size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms);
+uint32_t PlaybackGen();
+size_t FeedPlayback(const int16_t* pcm, size_t samples, uint32_t timeout_ms, uint32_t expected_gen);
 void FlushPlayback();
 void OnPlaybackDrained(std::function<void()> cb);
 bool IsPlaybackIdle();
+size_t PlaybackFilled();  // 已占用字节数（= 队列样本数 * 2）
 
 }  // namespace mhal::audio_pipeline

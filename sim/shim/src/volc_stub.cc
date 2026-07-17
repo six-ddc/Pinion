@@ -7,15 +7,27 @@
 //
 // TTS: collects the streamed text deltas and prints the finished utterance to
 // the console; PI_SIM_SAY=1 additionally speaks it via macOS `say`.
+//
+// Stage D: on_audio_start/on_finished are now fired (previously stubbed out as
+// no-ops), so pi_media_focus's TTS<->media focus arbitration is exercisable in
+// sim. on_audio_start fires on the first non-empty feed_text of a session
+// (approximates "first audio frame about to play" without a real decode
+// pipeline). on_finished fires from a detached thread after a duration
+// estimated from the spoken text length (~70ms/UTF-8 char, clamped to
+// [400ms, 4000ms]) so there's an observable "TTS speaking" window in logs to
+// verify Suspend-before/Resume-after timing against, independent of whether
+// `say` itself is actually running (PI_SIM_SAY unset -> still fires on time).
 #include <signal.h>
 #include <spawn.h>
 #include <sys/time.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "sim_hooks.h"
 #include "volc_asr.h"
@@ -48,6 +60,20 @@ std::mutex g_tts_mu;
 bool g_tts_open = false;
 std::string g_tts_text;
 pid_t g_say_pid = -1;
+volc_tts_callbacks_t g_tts_cbs{};
+bool g_tts_audio_started = false;  // 本会话是否已触发过 on_audio_start（只触发一次）
+uint32_t g_tts_session_gen = 0;    // 每次 speak_begin ++；on_finished 的延迟线程据此判断
+                                    // 会话是否已被新一场 speak_begin/stop 顶掉，避免误触发
+
+// 粗略估算朗读这段文本需要的时长：中英文都按 ~70ms/UTF-8 字节估，夹在
+// [400ms, 4000ms] 之间——只为让 on_finished 有一个可观测的延迟窗口用来验证
+// Suspend/Resume 时序，不追求跟 macOS `say` 实际发声时长精确对齐。
+int EstimateSpeakMs(size_t utf8_len) {
+    int64_t ms = (int64_t)utf8_len * 70;
+    if (ms < 400) ms = 400;
+    if (ms > 4000) ms = 4000;
+    return (int)ms;
+}
 
 void SayKillLocked() {
     if (g_say_pid > 0) {
@@ -159,32 +185,69 @@ bool volc_asr_is_active(void) {
 // ---------------- volc_tts ----------------
 
 esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
-    (void)cbs; /* on_audio_start/on_finished are never fired by the stub */
     std::lock_guard<std::mutex> lk(g_tts_mu);
     if (g_tts_open) return ESP_ERR_INVALID_STATE;
     g_tts_open = true;
     g_tts_text.clear();
+    g_tts_cbs = (cbs != nullptr) ? *cbs : volc_tts_callbacks_t{};
+    g_tts_audio_started = false;
+    g_tts_session_gen++;
     return ESP_OK;
 }
 
 esp_err_t volc_tts_feed_text(const char* text_utf8) {
-    std::lock_guard<std::mutex> lk(g_tts_mu);
-    if (!g_tts_open) return ESP_ERR_INVALID_STATE;
-    if (text_utf8 != nullptr) g_tts_text += text_utf8;
+    volc_tts_callbacks_t cbs{};
+    bool fire_audio_start = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tts_mu);
+        if (!g_tts_open) return ESP_ERR_INVALID_STATE;
+        if (text_utf8 != nullptr) g_tts_text += text_utf8;
+        // 首次真正拿到非空文本：近似真机"第一帧音频即将播放"（on_audio_start）。
+        if (!g_tts_audio_started && !g_tts_text.empty()) {
+            g_tts_audio_started = true;
+            fire_audio_start = true;
+            cbs = g_tts_cbs;
+        }
+    }
+    if (fire_audio_start && cbs.on_audio_start != nullptr) cbs.on_audio_start(cbs.ctx);
     return ESP_OK;
 }
 
 esp_err_t volc_tts_speak_end(void) {
-    std::lock_guard<std::mutex> lk(g_tts_mu);
-    if (!g_tts_open) return ESP_ERR_INVALID_STATE;
-    g_tts_open = false;
-    if (!g_tts_text.empty()) {
-        fprintf(stderr, "[sim][TTS] %s\n", g_tts_text.c_str());
+    volc_tts_callbacks_t cbs{};
+    std::string text;
+    uint32_t my_gen;
+    {
+        std::lock_guard<std::mutex> lk(g_tts_mu);
+        if (!g_tts_open) return ESP_ERR_INVALID_STATE;
+        g_tts_open = false;
+        text = g_tts_text;
+        cbs = g_tts_cbs;
+        my_gen = g_tts_session_gen;
+    }
+    if (!text.empty()) {
+        fprintf(stderr, "[sim][TTS] %s\n", text.c_str());
         const char* say = getenv("PI_SIM_SAY");
         if (say != nullptr && say[0] == '1') {
+            std::lock_guard<std::mutex> lk(g_tts_mu);
             SayKillLocked();
-            SaySpawnLocked(g_tts_text);
+            SaySpawnLocked(text);
         }
+    }
+    // on_finished 延迟触发，模拟"文本已喂完，音频还要放一会儿才排空"的真机时序
+    // （见 EstimateSpeakMs）。用会话代次收口：若期间发生了新一场 speak_begin 或
+    // volc_tts_stop（都会 ++gen 或已经把 cbs 清了），这次延迟回调直接放弃，不会
+    // 误把新会话的音乐让路状态提前解除，也不会调用悬空的旧 ctx。
+    if (cbs.on_finished != nullptr) {
+        int delay_ms = EstimateSpeakMs(text.size());
+        std::thread([cbs, my_gen, delay_ms] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            {
+                std::lock_guard<std::mutex> lk(g_tts_mu);
+                if (g_tts_session_gen != my_gen) return;  // 已被新会话/stop 顶掉
+            }
+            cbs.on_finished(cbs.ctx);
+        }).detach();
     }
     return ESP_OK;
 }
@@ -198,6 +261,7 @@ void volc_tts_stop(void) {
     std::lock_guard<std::mutex> lk(g_tts_mu);
     g_tts_open = false;
     g_tts_text.clear();
+    g_tts_session_gen++;  // 让任何在途的 on_finished 延迟线程放弃（会话已被打断收尾）
     SayKillLocked();
 }
 

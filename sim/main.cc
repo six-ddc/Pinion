@@ -38,7 +38,9 @@
 
 #include "cJSON.h"
 #include "IOExpander.hpp"
+#include "media_player/media_player.h"
 #include "pi_card/pi_card_host.h"
+#include "pi_card/pi_card_media.h"
 #include "pi_card/pi_card_tools.h"
 #include "stock/stock_tool.h"
 #include "pi_screen.h"
@@ -340,11 +342,33 @@ constexpr const char* kCardStockBind =
     "{\"type\":\"row\",\"children\":[{\"type\":\"spacer\"},"
     "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"stock.sh600519.time\"}]}]}}";
 
+// Stage B（media）：正在播放 + 进度条 + 控制排 + 曲目列表 的媒体控制卡。title/state/进度
+// 全 bind media.* 路径（1Hz PublishLive 自动刷新）；三个按钮 invoke media.prev/toggle/next；
+// list 行 tap → set media.play_index {i} 切曲（value 用字符串 "{i}"，行替换后 atoi）。
+constexpr const char* kCardMediaCtl =
+    "{\"display\":\"overlay\",\"data\":{\"tracks\":[{\"title\":\"曲目 1\"},{\"title\":\"曲目 2\"},"
+    "{\"title\":\"曲目 3\"}]},\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"MEDIA\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"bind\":\"media.title\"},"
+    "{\"type\":\"row\",\"gap\":10,\"children\":["
+    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"media.state\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"media.position_s\",\"fmt\":\"%ds\","
+    "\"mono\":true,\"grow\":1}]},"
+    "{\"type\":\"bar\",\"min\":0,\"max\":100,\"bind\":\"media.progress_pct\"},"
+    "{\"type\":\"row\",\"gap\":8,\"children\":["
+    "{\"type\":\"button\",\"text\":\"上一\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.prev\"}]},"
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"播放/暂停\",\"on_click\":[{\"do\":"
+    "\"invoke\",\"cmd\":\"media.toggle\"}]},"
+    "{\"type\":\"button\",\"text\":\"下一\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.next\"}]}]},"
+    "{\"type\":\"list\",\"bind_data\":\"tracks\",\"max\":8,\"item\":{\"type\":\"button\",\"text\":"
+    "\"{item.title}\",\"on_click\":[{\"do\":\"set\",\"path\":\"media.play_index\",\"value\":"
+    "\"{i}\"}]}}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
                                   kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
-                                  kCardStockBind};
+                                  kCardStockBind, kCardMediaCtl};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。
@@ -1136,6 +1160,23 @@ void ExecCmd(const std::string& line) {
         g_touch.x = x0;
         g_touch.y = y0;
         g_touch.release_at = 0;
+    } else if (cmd == "mediadump") {  // Stage B: 打印 MediaController 快照，观察 invoke/set 联动
+        auto& mc = media::MediaController::Instance();
+        const char* st = "stopped";
+        switch (mc.state()) {
+            case media::MediaState::Loading: st = "loading"; break;
+            case media::MediaState::Playing: st = "playing"; break;
+            case media::MediaState::Paused: st = "paused"; break;
+            case media::MediaState::Error: st = "error"; break;
+            default: break;
+        }
+        std::fprintf(stderr, "[sim][mediadump] state=%s index=%d pos=%ds title=%s\n", st, mc.index(),
+                     mc.position_s(), mc.current().title.c_str());
+    } else if (cmd == "shot") {  // Stage B: shot <path> — 立即截图到指定路径
+        std::string p;
+        std::getline(ss, p);
+        if (!p.empty() && p[0] == ' ') p.erase(0, 1);
+        TakeScreenshot(p.empty() ? ShotPath() : p.c_str());
     } else if (cmd == "growcard") {  // TEMP SCAFFOLD: render the reflow re-entrancy test card
         RenderGrowCard();
     } else if (cmd == "showrows") {  // TEMP SCAFFOLD: showrows <n> — real ui_update, drives reflow
@@ -1312,6 +1353,59 @@ void Pump() {
     if (card_ms > 0 && !card_done && now > card_ms) {
         card_done = true;
         RenderDemoCard();
+    }
+
+    // Stage A 媒体管线无头测试钩子：PI_SIM_MEDIA_FILE / PI_SIM_MEDIA_URL 启动即
+    // StagePlaylist 单曲播放（WAV dump 由 PI_SIM_MEDIA_WAV 在 pump 内部激活）。
+    static const char* media_file = std::getenv("PI_SIM_MEDIA_FILE");
+    static const char* media_url = std::getenv("PI_SIM_MEDIA_URL");
+    static bool media_started = false;
+    if (!media_started && now > 800 && ((media_file && media_file[0]) || (media_url && media_url[0]))) {
+        media_started = true;
+        media::MediaItem item;
+        if (media_url && media_url[0]) {
+            item.title = "sim stream";
+            item.path_or_url = media_url;
+            item.is_stream = true;
+        } else {
+            item.title = "sim file";
+            item.path_or_url = media_file;
+            item.is_stream = false;
+        }
+        std::vector<media::MediaItem> pl{item};
+        std::fprintf(stderr, "[sim] media start: %s (%s)\n", item.path_or_url.c_str(),
+                     item.is_stream ? "stream" : "file");
+        media::MediaController::Instance().StagePlaylist(std::move(pl), 0);
+    }
+
+    // Stage D 硬化验收钩子：PI_SIM_MEDIA_STOP_MS=<ms> 在该时刻调 Stop()（多半命中
+    // reader 线程正阻塞在文件/网络 Read 里的中途），Stop() 内部已记录 teardown 耗时
+    // （"Stop: teardown took Xms" 日志），本处只负责在正确时刻触发。
+    static const uint32_t stop_ms = EnvMs("PI_SIM_MEDIA_STOP_MS");
+    static bool stop_done = false;
+    if (stop_ms > 0 && !stop_done && now > stop_ms) {
+        stop_done = true;
+        std::fprintf(stderr, "[sim] media stop triggered at wall=%ums\n", now);
+        media::MediaController::Instance().Stop();
+    }
+
+    // Stage B media 工具无头直测：PI_SIM_MEDIA_TOOL = 一段 args JSON（如
+    // {"mode":"search"}），启动后调 pi_media_tool_run 一次并打印返回 JSON。
+    static const char* media_tool = std::getenv("PI_SIM_MEDIA_TOOL");
+    static bool media_tool_done = false;
+    if (!media_tool_done && media_tool && media_tool[0] && now > 900) {
+        media_tool_done = true;
+        cJSON* args = cJSON_Parse(media_tool);
+        if (args) {
+            bool is_err = false;
+            char* res = pi_media_tool_run(args, &is_err);
+            std::fprintf(stderr, "[sim] media tool (%s) -> %s\n", is_err ? "ERROR" : "ok",
+                         res ? res : "(null)");
+            free(res);
+            cJSON_Delete(args);
+        } else {
+            std::fprintf(stderr, "[sim] media tool: bad args JSON\n");
+        }
     }
 
     // Advance an in-flight smooth swipe (continuous motion, sim-clock paced).

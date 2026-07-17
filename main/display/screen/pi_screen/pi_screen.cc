@@ -32,8 +32,10 @@
 #include "metalio_hal/storage.h"
 #include "metalio_hal/sysmon.h"
 #include "pi_fonts.h"
+#include "pi_media_focus.h"
 #include "pi_net_events.h"
 #include "pi_quick_panel.h"
+#include "pi_media.h"
 #include "pi_settings.h"
 #include "pi_sleep.h"
 #include "pi_theme.h"
@@ -2222,6 +2224,11 @@ void DrainQueueTick(lv_timer_t*) {
                 pi_agent_task_tts_clear_cut();  // run 收尾：注入轮若没产文本，标志别漏给下一轮
                 TtsExtractFlush();              // 冲刷尾句
                 pi_agent_task_tts_run_end();    // pump 排空后 speak_end，余音继续播完
+                // Stage D 焦点仲裁兜底：回合彻底结束，安排一次去抖 Resume 检查——覆盖
+                // 本轮从未真正触发 TTS 音频的情况（纯工具调用回复 / TTS 被用户关闭）；
+                // 若本轮确实说了话，TTS 自己的 on_finished 早已排过一次，这次多半是
+                // no-op（gen 已前进或 state 已是 Playing）。
+                pi_media_focus_turn_ended();
                 s_agent_busy = false;
                 ShowTalkBtn();
                 s_zen_turn_done = true;
@@ -2275,6 +2282,7 @@ void DrainQueueTick(lv_timer_t*) {
                 }
                 FinalizeMdView();
                 pi_agent_task_tts_cancel();  // 出错即作废本 run 朗读并停播
+                pi_media_focus_turn_ended();  // Stage D 兜底：回合出错也算结束，安排 Resume 检查
                 s_agent_busy = false;
                 ShowTalkBtn();
                 break;
@@ -2342,6 +2350,8 @@ void Go(ViewState s) {
             if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
     }
+    // mini 播放条：Idle / Chat 可见，Listen 隐藏（Stage C）。
+    pi_media::SetMiniBarContext(s == ViewState::Idle || s == ViewState::Chat);
 }
 
 // pin 常驻组件的待机布局：出现时大时钟区整体隐藏（时间/日期上移到状态栏中央的迷你
@@ -2513,6 +2523,8 @@ void VoiceTask(void*) {
                 // barge-in：用户开口即打断在播 TTS。必须走 pi_agent_task_tts_cancel
                 // 而非裸 volc_tts_stop——后者不会作废 TTS pump 缓冲里未播的旧文本。
                 pi_agent_task_tts_cancel();
+                // Stage D 焦点仲裁：开始聆听 = 立即给音乐让路（no-op 若本来就没在播）。
+                pi_media_focus_asr_start();
                 volc_asr_callbacks_t cbs = {};
                 cbs.on_delta = OnAsrDelta;
                 cbs.on_final = OnAsrFinal;
@@ -2545,6 +2557,9 @@ void VoiceTask(void*) {
                 if (err != ESP_OK && !s_asr_final_ready && !s_asr_failed) {
                     PostAsrFailure("ASR timed out waiting for final");
                 }
+                // 聆听结束：安排去抖 Resume 检查——多半会被紧随而来的 agent 回合/TTS
+                // 重新 Suspend 顶掉（gen 前进），不会闪一下就恢复音乐。
+                pi_media_focus_asr_ended();
                 break;
             }
             case VoiceCmd::Cancel:
@@ -2552,6 +2567,7 @@ void VoiceTask(void*) {
                     active = false;
                     mhal::audio_pipeline::StopCapture();
                     volc_asr_abort();
+                    pi_media_focus_asr_ended();
                 }
                 break;
         }
@@ -3097,6 +3113,10 @@ void OnScrReleased(lv_event_t*) { s_sbar_pull_tracking = false; }
 //   快捷面板 / sheet / overlay 卡片打开时一律忽略（模态语义；overlay 此前靠
 //   scrim 打标豁免，现收进这里统一守卫）。
 void OnEdgeNav(screen_edge_nav_dir_t dir) {
+    if (pi_media::IsOpen()) {  // 全屏媒体页在最上层：左缘右滑 = 收抽屉/返回聊天（不停播）
+        if (dir == SCREEN_EDGE_NAV_FROM_LEFT) pi_media::Back();
+        return;
+    }
     if (pi_settings::IsOpen()) {
         if (dir == SCREEN_EDGE_NAV_FROM_LEFT) pi_settings::Back();
         return;
@@ -3137,7 +3157,8 @@ void EnableEventBubbleRecursive(lv_obj_t* obj) {
 
 // 覆盖层（设置栈/快捷面板/新对话 sheet）打开时，实体键 PTT 一律惰性。
 bool KeyOverlayOpen() {
-    return pi_settings::IsOpen() || pi_quick_panel::IsOpen() || s_sheet_open || s_confirm_sheet_open;
+    return pi_media::IsOpen() || pi_settings::IsOpen() || pi_quick_panel::IsOpen() ||
+           s_sheet_open || s_confirm_sheet_open;
 }
 
 void OnKeyPressAsync(void*) {
@@ -3264,6 +3285,7 @@ void OnScreenUnloaded(lv_event_t*) {
     // P0/P1 浮层/手势状态
     pi_quick_panel::OnScreenUnloaded();
     pi_settings::OnScreenUnloaded();
+    pi_media::OnScreenUnloaded();
     s_sheet_root = s_sheet_meta_lbl = s_sheet_confirm_lbl = nullptr;
     s_sheet_open = false;
     s_confirm_sheet_root = s_confirm_title_lbl = s_confirm_body_lbl = s_confirm_confirm_lbl = nullptr;
@@ -3347,6 +3369,10 @@ lv_obj_t* PiScreen::Create() {
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_bg_opa(s_pin_host, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+
+    // Stage C：常驻 mini 播放条。建在 pin host 之后（z 序压过 ptt 层，条上按钮可收到
+    // 触摸）、快捷面板/设置栈/媒体全屏页之前（那些不透明浮层自然遮住它）。
+    pi_media::CreateMiniBar(scr);
 
     // P0 浮层：快捷面板在 ptt 层之上，新对话 sheet 再压一层（面板里的
     // 「新对话」要能弹出 sheet）。都常驻构建、HIDDEN 切换。
@@ -3433,8 +3459,8 @@ lv_obj_t* PiScreen::Create() {
     sl_hooks.is_gated = []() {
         return s_agent_busy ||                                                       // 生成中
                !mhal::audio_pipeline::IsPlaybackIdle() ||                            // TTS 播报中
-               pi_quick_panel::IsOpen() || pi_settings::IsOpen() || s_sheet_open ||
-               s_confirm_sheet_open ||  // 浮层
+               pi_quick_panel::IsOpen() || pi_settings::IsOpen() || pi_media::IsOpen() ||
+               s_sheet_open || s_confirm_sheet_open ||  // 浮层
                pi_card::HasOpenOverlay() ||                                          // 卡片浮层
                s_state == ViewState::Listen;                                         // 聆听中
     };

@@ -15,6 +15,7 @@
 #include "pi_card_cmd.h"
 #include "pi_card_data.h"
 #include "pi_card_icons.h"
+#include "pi_card_media.h"
 #include "pi_card_render.h"
 #include "pi_card_stock.h"
 #include "pi_card_tools.h"
@@ -225,6 +226,8 @@ void Init() {
     DataHub::Instance().RegisterBuiltins();
     CommandRegistry::Instance().RegisterBuiltins();
     pi_card_stock::RegisterBindProvider();  // stock.<symbol>.<field> 动态绑定（Phase4）
+    pi_card_media::RegisterDataPaths();     // media.* 播放态路径（Stage B）
+    pi_card_media::RegisterCommands();      // media.* invoke 命令（Stage B）
 }
 
 void SetFeedHooks(const FeedHooks& hooks) { s_feed = hooks; }
