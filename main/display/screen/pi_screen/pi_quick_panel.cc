@@ -7,6 +7,7 @@
 #include "metalio_hal/backlight.h"
 #include "metalio_hal/network.h"
 #include "metalio_hal/power.h"
+#include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "screen_util.h"
@@ -76,19 +77,6 @@ lv_obj_t* MakeRect(lv_obj_t* parent, int32_t w, int32_t h, Tok color) {
 lv_obj_t* MakeCircle(lv_obj_t* parent, int32_t d, Tok color) {
     lv_obj_t* o = MakeRect(parent, d, d, color);
     lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    return o;
-}
-
-lv_obj_t* MakeRing(lv_obj_t* parent, int32_t d, Tok border_color, int32_t border_w) {
-    lv_obj_t* o = lv_obj_create(parent);
-    screen_strip_obj_chrome(o);
-    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(o, d, d);
-    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(o, border_w, LV_PART_MAIN);
-    pi_theme::ApplyBorder(o, border_color);
     return o;
 }
 
@@ -337,13 +325,9 @@ void BuildActionGrid(lv_obj_t* parent) {
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(grid, 16, LV_PART_MAIN);
 
-    // 「✚ 新对话」：加号 = 两根交叉的琥珀短条
+    // 「✚ 新对话」
     lv_obj_t* btn_new = MakeGridBtn(grid, "\xe6\x96\xb0\xe5\xaf\xb9\xe8\xaf\x9d");  // "新对话"
-    lv_obj_t* icon_new = lv_obj_get_child(btn_new, 0);
-    lv_obj_t* ph = MakeRect(icon_new, 22, 2, Tok::Accent);
-    lv_obj_align(ph, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* pv = MakeRect(icon_new, 2, 22, Tok::Accent);
-    lv_obj_align(pv, LV_ALIGN_CENTER, 0, 0);
+    pi_card::MakeIcon(lv_obj_get_child(btn_new, 0), "plus", 24, Tok::Accent);
     lv_obj_add_event_cb(
         btn_new,
         [](lv_event_t*) {
@@ -353,13 +337,9 @@ void BuildActionGrid(lv_obj_t* parent) {
         },
         LV_EVENT_CLICKED, nullptr);
 
-    // 「⚙ 设置」：环 + 心点（P1 已接线：收起面板 -> 推入设置 Hub）
+    // 「⚙ 设置」（P1 已接线：收起面板 -> 推入设置 Hub）
     lv_obj_t* btn_set = MakeGridBtn(grid, "\xe8\xae\xbe\xe7\xbd\xae");  // "设置"
-    lv_obj_t* icon_set = lv_obj_get_child(btn_set, 0);
-    lv_obj_t* ring_set = MakeRing(icon_set, 22, Tok::Dim, 2);
-    lv_obj_align(ring_set, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* dot_set = MakeCircle(icon_set, 8, Tok::Dim);
-    lv_obj_align(dot_set, LV_ALIGN_CENTER, 0, 0);
+    pi_card::MakeIcon(lv_obj_get_child(btn_set, 0), "settings", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_set,
         [](lv_event_t*) {
@@ -369,29 +349,19 @@ void BuildActionGrid(lv_obj_t* parent) {
         },
         LV_EVENT_CLICKED, nullptr);
 
-    // 「◐ 主题」：环 + 左半实心圆。P2 接线：一键在深/浅主题间切换（共享
-    // 样式即时翻转，面板本身也当场换装），持久化 NVS "ui"/"theme"。
+    // 「◐ 主题」。P2 接线：一键在深/浅主题间切换（共享样式即时翻转，面板
+    // 本身也当场换装），持久化 NVS "ui"/"theme"。
     lv_obj_t* btn_theme = MakeGridBtn(grid, "\xe4\xb8\xbb\xe9\xa2\x98");  // "主题"
-    lv_obj_t* icon_theme = lv_obj_get_child(btn_theme, 0);
-    lv_obj_t* ring_theme = MakeRing(icon_theme, 22, Tok::Dim, 2);
-    lv_obj_align(ring_theme, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t* half = MakeCircle(icon_theme, 10, Tok::Dim);
-    lv_obj_align(half, LV_ALIGN_LEFT_MID, 3, 0);
+    pi_card::MakeIcon(lv_obj_get_child(btn_theme, 0), "sun-moon", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_theme, [](lv_event_t*) { pi_theme::Set(!pi_theme::IsLight()); }, LV_EVENT_CLICKED,
         nullptr);
 
-    // 「⌂ 文件管理」：简易文件夹图元（矩形本体 + 左上角标签页）。仅 WiFi 已
-    // 连接才能打开（4G 有运营商 NAT，外部连不进来）；未连接点按只吐 toast，
-    // 不置灰——省一份"打开时刷新按钮态"的常驻逻辑，点按时判一次足够。
+    // 「⌂ 文件管理」。仅 WiFi 已连接才能打开（4G 有运营商 NAT，外部连不
+    // 进来）；未连接点按只吐 toast，不置灰——省一份"打开时刷新按钮态"的
+    // 常驻逻辑，点按时判一次足够。
     lv_obj_t* btn_files = MakeGridBtn(grid, "\xe6\x96\x87\xe4\xbb\xb6");  // "文件"
-    lv_obj_t* icon_files = lv_obj_get_child(btn_files, 0);
-    lv_obj_t* folder_body = MakeRect(icon_files, 20, 14, Tok::Dim);
-    lv_obj_set_style_radius(folder_body, 2, LV_PART_MAIN);
-    lv_obj_align(folder_body, LV_ALIGN_BOTTOM_MID, 0, -1);
-    lv_obj_t* folder_tab = MakeRect(icon_files, 9, 4, Tok::Dim);
-    lv_obj_set_style_radius(folder_tab, 1, LV_PART_MAIN);
-    lv_obj_align(folder_tab, LV_ALIGN_TOP_LEFT, 0, 0);
+    pi_card::MakeIcon(lv_obj_get_child(btn_files, 0), "folder", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_files,
         [](lv_event_t*) {
@@ -409,13 +379,9 @@ void BuildActionGrid(lv_obj_t* parent) {
         },
         LV_EVENT_CLICKED, nullptr);
 
-    // 「⏻ 关机」：环 + 顶部短竖条；长按 2s 才关机
+    // 「⏻ 关机」：长按 2s 才关机
     s_off_btn = MakeGridBtn(grid, "\xe5\x85\xb3\xe6\x9c\xba");  // "关机"
-    lv_obj_t* icon_off = lv_obj_get_child(s_off_btn, 0);
-    lv_obj_t* ring_off = MakeRing(icon_off, 22, Tok::Dim, 2);
-    lv_obj_align(ring_off, LV_ALIGN_CENTER, 0, 1);
-    lv_obj_t* stem = MakeRect(icon_off, 2, 11, Tok::Dim);
-    lv_obj_align(stem, LV_ALIGN_TOP_MID, 0, -1);
+    pi_card::MakeIcon(lv_obj_get_child(s_off_btn, 0), "power", 24, Tok::Dim);
     lv_obj_add_event_cb(s_off_btn, OnOffPressed, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(s_off_btn, OnOffReleased, LV_EVENT_RELEASED, nullptr);
     lv_obj_add_event_cb(s_off_btn, OnOffReleased, LV_EVENT_PRESS_LOST, nullptr);

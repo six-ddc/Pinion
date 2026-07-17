@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "pi_card_icon_map.h"
+#include "pi_fonts.h"
 #include "screen_util.h"
 
 namespace pi_card {
@@ -101,11 +103,48 @@ lv_obj_t* ArcSeg(lv_obj_t* box, int32_t d, Tok tone, int32_t bw, int32_t start_d
 
 bool Eq(const char* a, const char* b) { return std::strcmp(a, b) == 0; }
 
+// 图标名（含别名）→ Lucide 字形串，生成表按名有序，二分。查不到返回 nullptr。
+const char* GlyphFor(const char* name) {
+    size_t lo = 0, hi = sizeof(kIconGlyphs) / sizeof(kIconGlyphs[0]);
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        int c = std::strcmp(kIconGlyphs[mid].name, name);
+        if (c == 0) return kIconGlyphs[mid].utf8;
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return nullptr;
+}
+
+// box 尺寸 → 不溢出的最大字体档（Lucide 字形约占满 em）。
+const lv_font_t* IconFontFor(int32_t size) {
+    if (size >= 28) return &font_pi_icons_28;
+    if (size >= 22) return &font_pi_icons_22;
+    return &font_pi_icons_16;
+}
+
 }  // namespace
 
 lv_obj_t* MakeIcon(lv_obj_t* parent, const char* name, int32_t size, Tok tone) {
     lv_obj_t* box = Box(parent, size);
     if (name == nullptr) name = "dot";
+
+    // 首选 Lucide 字体字形：单色 alpha mask，ApplyText 令牌自动跟随主题。
+    // box 太小（<16 会裁切字形）或名字不在表内时回落到下方形状拼合。
+    if (size >= 16) {
+        if (const char* utf8 = GlyphFor(name)) {
+            lv_obj_t* l = lv_label_create(box);
+            lv_obj_add_flag(l, LV_OBJ_FLAG_IGNORE_LAYOUT);
+            lv_obj_set_style_text_font(l, IconFontFor(size), LV_PART_MAIN);
+            pi_theme::ApplyText(l, tone);
+            lv_label_set_text_static(l, utf8);
+            lv_obj_center(l);
+            return box;
+        }
+    }
+
     const int32_t s = size;
     const int32_t stroke = s >= 28 ? 3 : 2;  // 线条粗细随尺寸
 

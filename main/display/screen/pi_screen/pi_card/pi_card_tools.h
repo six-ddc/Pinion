@@ -84,7 +84,8 @@ const char *pi_card_system_prompt(void);
     "'…{v}…{label}…'} when you must generate/decide ({v}=value, {label}=choice's selected text; a "  \
     "report auto-carries every id'd control's value, choice as idx(label)). DATA: ui_update mutates " \
     "card data (data.set/append/remove/replace) and any list/bind_data label re-renders. PRESETS "    \
-    "shapes: see system prompt. Icons (representative): volume|battery|wifi|gear|check|close. "       \
+    "shapes: see system prompt. Icons: Lucide names (wifi|battery|play|sun|cloud-rain|map-pin|"       \
+    "trending-up|check|x…); unknown name → dot. "                                                     \
     "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
     "Table-style columns: see COMPACT rule in system prompt — grow:1 on every row label."
 

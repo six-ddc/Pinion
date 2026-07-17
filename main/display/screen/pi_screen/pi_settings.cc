@@ -16,6 +16,7 @@
 #include "metalio_hal/network.h"
 #include "metalio_hal/power.h"
 #include "media_admin_httpd.h"
+#include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_net_events.h"
 #include "pi_sleep.h"
@@ -424,7 +425,7 @@ lv_obj_t* MakePage(PageId id, const char* title_utf8, lv_obj_t** out_page,
     lv_obj_set_style_pad_right(hdr, 28, LV_PART_MAIN);
     lv_obj_set_style_pad_column(hdr, 8, LV_PART_MAIN);
 
-    // 「<」返回：96 宽全高触区（"‹" 不在 mono 子集）
+    // 「‹」返回：96 宽全高触区
     lv_obj_t* back = lv_obj_create(hdr);
     screen_strip_obj_chrome(back);
     lv_obj_remove_flag(back, LV_OBJ_FLAG_SCROLLABLE);
@@ -433,10 +434,7 @@ lv_obj_t* MakePage(PageId id, const char* title_utf8, lv_obj_t** out_page,
     lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_flex_flow(back, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(back, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t* back_lbl = lv_label_create(back);
-    lv_label_set_text(back_lbl, "<");
-    SetLabelFont(back_lbl, &font_pi_mono_20, Tok::Dim);
-    lv_obj_remove_flag(back_lbl, LV_OBJ_FLAG_CLICKABLE);
+    pi_card::MakeIcon(back, "chevron-left", 22, Tok::Dim);
     lv_obj_add_event_cb(back, OnBackClicked, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* title = lv_label_create(hdr);
@@ -486,8 +484,8 @@ void OnHubRowClicked(lv_event_t* e) {
     Push(static_cast<PageId>(static_cast<int>(PageId::Network) + static_cast<int>(idx)));
 }
 
-// 行：52px 方框 mono 图标 + 中文标题 + 右侧 mono 值摘要 + ">"
-void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_ascii, const char* title_utf8) {
+// 行：52px 方框 Lucide 图标 + 中文标题 + 右侧值摘要 + 展开箭头
+void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_name, const char* title_utf8) {
     lv_obj_t* row = lv_obj_create(parent);
     screen_strip_obj_chrome(row);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -516,9 +514,7 @@ void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_ascii, const char* t
     lv_obj_set_flex_flow(icon_box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(icon_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_t* icon = lv_label_create(icon_box);
-    lv_label_set_text(icon, icon_ascii);
-    SetLabelFont(icon, &font_pi_mono_17, Tok::Accent);
+    pi_card::MakeIcon(icon_box, icon_name, 28, Tok::Accent);
 
     lv_obj_t* title = lv_label_create(row);
     lv_label_set_text(title, title_utf8);
@@ -538,9 +534,7 @@ void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_ascii, const char* t
     SetLabelFont(val, &font_puhui_20_4, Tok::Dim);
     s_hub_val[idx] = val;
 
-    lv_obj_t* arrow = lv_label_create(row);
-    lv_label_set_text(arrow, ">");
-    SetLabelFont(arrow, &font_pi_mono_17, Tok::Faint);
+    pi_card::MakeIcon(row, "chevron-right", 16, Tok::Faint);
 }
 
 void BuildHubPage(lv_obj_t** out_page) {
@@ -552,7 +546,7 @@ void BuildHubPage(lv_obj_t** out_page) {
 
     // 「文件管理」不在这张 Hub 表里——单一入口在快捷面板（下拉面板一步直达
     // pi_settings::OpenFiles()），设置栈保持"网络/蓝牙/声音/显示/对话/关于"六页干净。
-    static const char* kIcons[6] = {"N", "B", "S", "D", "C", "i"};
+    static const char* kIcons[6] = {"wifi", "bluetooth", "volume-2", "sun", "message-circle", "info"};
     static const char* kTitles[6] = {
         "\xe7\xbd\x91\xe7\xbb\x9c",  // 网络
         "\xe8\x93\x9d\xe7\x89\x99",  // 蓝牙
@@ -881,9 +875,7 @@ void BuildNetworkPage(lv_obj_t** out_page) {
     // 警示行「! 切换网络通道将重启设备」
     lv_obj_t* warn = MakeFlexRow(content, 32);
     lv_obj_set_style_pad_column(warn, 12, LV_PART_MAIN);
-    lv_obj_t* bang = lv_label_create(warn);
-    lv_label_set_text(bang, "!");
-    SetLabelFont(bang, &font_pi_mono_17, Tok::Accent);
+    pi_card::MakeIcon(warn, "triangle-alert", 18, Tok::Accent);
     lv_obj_t* warn_lbl = lv_label_create(warn);
     lv_label_set_text(warn_lbl,
                       "\xe5\x88\x87\xe6\x8d\xa2\xe7\xbd\x91\xe7\xbb\x9c\xe9\x80\x9a\xe9\x81\x93"
@@ -1523,9 +1515,7 @@ void BuildChatPage(lv_obj_t** out_page) {
     lv_label_set_text(tag, "CLOUD");
     SetLabelFont(tag, &font_pi_mono_14, Tok::Faint);
     lv_obj_set_style_text_letter_space(tag, 2, LV_PART_MAIN);
-    lv_obj_t* arrow = lv_label_create(row);
-    lv_label_set_text(arrow, ">");
-    SetLabelFont(arrow, &font_pi_mono_17, Tok::Faint);
+    pi_card::MakeIcon(row, "chevron-right", 16, Tok::Faint);
 }
 
 // ---------------------------------------------------------------------------

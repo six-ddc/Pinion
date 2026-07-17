@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "media_player/media_id3.h"
 #include "media_player/media_player.h"
+#include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "screen_util.h"
@@ -759,23 +760,12 @@ void BuildPage() {
     lv_obj_add_flag(s_root, LV_OBJ_FLAG_CLICKABLE);  // edge-nav 兜底命中
     lv_obj_add_flag(s_root, LV_OBJ_FLAG_PRESS_LOCK);
 
-    // 顶栏：返回箭头（< 双短臂）+ 列表钮（三横线）
+    // 顶栏：返回箭头 + 播放列表钮
     lv_obj_t* back = MakeTopBtn(s_root, OnBackBtn, 16);
-    Bar(back, 3, 20, Tok::Dim, 2, -7);   // 「<」上臂：/ （左端在下）
-    lv_obj_t* ba1 = lv_obj_get_child(back, lv_obj_get_child_count(back) - 1);
-    lv_obj_set_style_transform_pivot_x(ba1, 1, LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_y(ba1, 10, LV_PART_MAIN);
-    lv_obj_set_style_transform_rotation(ba1, 450, LV_PART_MAIN);
-    Bar(back, 3, 20, Tok::Dim, 2, 7);    // 下臂：\ （左端在上）
-    lv_obj_t* ba2 = lv_obj_get_child(back, lv_obj_get_child_count(back) - 1);
-    lv_obj_set_style_transform_pivot_x(ba2, 1, LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_y(ba2, 10, LV_PART_MAIN);
-    lv_obj_set_style_transform_rotation(ba2, -450, LV_PART_MAIN);
+    lv_obj_center(pi_card::MakeIcon(back, "chevron-left", 28, Tok::Dim));
 
     lv_obj_t* list = MakeTopBtn(s_root, OnListBtn, kW - 52 - 16);
-    Bar(list, 22, 3, Tok::Dim, 0, -6);
-    Bar(list, 22, 3, Tok::Dim, 0, 0);
-    Bar(list, 22, 3, Tok::Dim, 0, 6);
+    lv_obj_center(pi_card::MakeIcon(list, "list-music", 28, Tok::Dim));
 
     s_eyebrow = Label(s_root, "NOW PLAYING", &font_pi_mono_14, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_eyebrow, 4, LV_PART_MAIN);

@@ -105,6 +105,9 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/font/font_pi_mono_20.c
     ${CLAW_ROOT}/main/display/font/font_pi_clock_132.c
     ${CLAW_ROOT}/main/display/font/font_puhui_24_4.c
+    ${CLAW_ROOT}/main/display/font/font_pi_icons_16.c
+    ${CLAW_ROOT}/main/display/font/font_pi_icons_22.c
+    ${CLAW_ROOT}/main/display/font/font_pi_icons_28.c
     ${CLAW_ROOT}/managed_components/78__xiaozhi-fonts/src/font_puhui_20_4.c
     ${CLAW_ROOT}/managed_components/78__xiaozhi-fonts/src/font_puhui_30_4.c
 )
