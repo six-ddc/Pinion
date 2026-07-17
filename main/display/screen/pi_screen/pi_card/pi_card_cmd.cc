@@ -91,12 +91,12 @@ void CommandRegistry::RegisterBuiltins() {
     Register("net.reconnect", "reconnect network", CmdLevel::Safe,
              []() { mhal::network::StartAsync(); });
 
-    // device.vibrate：短促振动反馈，无副作用（Safe）。
-    Register("device.vibrate", "buzz the vibration motor briefly", CmdLevel::Safe,
+    // device.vibrate：短促振动反馈，无副作用（Safe）。desc 精简（预算超标后收紧措辞）。
+    Register("device.vibrate", "brief vibration buzz", CmdLevel::Safe,
              []() { mhal::motor::Buzz(200); });
 
     // bt.reconnect：重连上次配对成功的音箱；无记录/失败均 no-op（Safe，可逆）。
-    Register("bt.reconnect", "reconnect last-paired BT speaker", CmdLevel::Safe, []() {
+    Register("bt.reconnect", "reconnect last BT speaker", CmdLevel::Safe, []() {
         Settings bt("bt", false);
         std::string addr = bt.GetString("last_addr", "");
         if (!addr.empty()) mhal::bt::Connect(addr);
@@ -108,12 +108,12 @@ void CommandRegistry::RegisterBuiltins() {
              "切换并重启");
 
     // gps.enable：启用 GPS（占用 UART0 + 给模块上电）。有真机风险（UART0 可能是控制台、
-    // 模块是否贴料未定，见 gps.h），故走固件确认而非让 LLM 直接开。
-    Register("gps.enable", "power on GPS module (uses UART0)", CmdLevel::Confirm,
+    // 模块是否贴料未定，见 gps.h），故走固件确认而非让 LLM 直接开。desc 精简（预算收紧）。
+    Register("gps.enable", "power on GPS (uses UART0)", CmdLevel::Confirm,
              []() { mhal::gps::Enable(true); }, "启用 GPS 模块？", "将占用 UART0 并给模块上电；若该口用作日志会冲突",
              "启用 GPS");
     // gps.disable：停解析 + 断电，可逆（Safe）。
-    Register("gps.disable", "power off GPS module", CmdLevel::Safe,
+    Register("gps.disable", "power off GPS", CmdLevel::Safe,
              []() { mhal::gps::Enable(false); });
 
     ESP_LOGI(TAG, "registered %d builtin commands", static_cast<int>(entries_.size()));

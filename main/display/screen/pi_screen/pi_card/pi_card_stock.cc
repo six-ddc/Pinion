@@ -668,15 +668,14 @@ void RegisterBindProvider() {
 const char* BindPathsDesc() {
     static std::string s;
     if (s.empty()) {
-        s = "DYNAMIC stock quote paths: bind \"stock.<symbol>.<field>\" on a label (str, "
-            "pre-formatted, no fmt needed; auto-refreshes ~5s while that market is open, sparser "
-            "closed). symbol = Tencent format from the stock tool (sh600519/hk00700/usAAPL.OQ); "
-            "field: " +
+        // 精简版（预算超标后收紧措辞，字段清单/格式提示/上限等功能信息一个不少，只删口水词）。
+        s = "DYNAMIC: bind \"stock.<symbol>.<field>\" on a label (str, pre-formatted, no fmt). "
+            "Refreshes ~5s in-session, sparser closed. symbol = Tencent format (sh600519/hk00700/"
+            "usAAPL.OQ). field: " +
             JoinBindFields() +
-            " (pct like \"+1.23%\", market_cap like \"1.57万亿\"; pb is A-share only, shows \"--\" "
-            "elsewhere). Values arrive async -- render shows \"--\" first, fills within seconds. "
-            "At most " +
-            std::to_string(kMaxBindSymbols) + " symbols subscribed at once.";
+            " (pct \"+1.23%\", market_cap \"1.57万亿\"; pb A-share only, else \"--\"). Async: shows "
+            "\"--\" first. Max " +
+            std::to_string(kMaxBindSymbols) + " symbols at once.";
     }
     return s.c_str();
 }

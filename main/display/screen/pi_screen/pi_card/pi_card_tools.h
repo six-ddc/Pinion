@@ -63,8 +63,8 @@ const char *pi_card_system_prompt(void);
     "(repeats item once per element of data[key]; inside item strings use {i}=0-based index, "       \
     "{n}=1-based, {item.FIELD}=that record's field; row actions may be report/set/close only, not "  \
     "toggle/patch); chart{bind_history:'path',points?,w?,h?} (LINE chart of a history-enabled "      \
-    "path); stock_chart{symbol,name?,mode?:'min'|'5d'|'day'|'week'} (live CN/HK/US stock "            \
-    "quote+chart card, self-refreshing, tap cycles timeframe; symbol from the stock tool); "          \
+    "path); stock_chart{symbol,name?,mode?} (live CN/HK/US stock chart, self-refreshing, tap "        \
+    "cycles timeframe; symbol from the stock tool; mode enum in schema); "                            \
     "qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "               \
     "eyebrow|kicker|section|title|heading|label|value|caption. variant (button): primary(the ONE "   \
     "amber CTA)|ghost|plain|default. Common props: id,w,h,grow,pad,gap,size,mono,tone,fill,color,bg," \
@@ -83,18 +83,10 @@ const char *pi_card_system_prompt(void);
     "cmds run at once, others pop a firmware confirm) — all zero round-trip. Only {do:'report',text:" \
     "'…{v}…{label}…'} when you must generate/decide ({v}=value, {label}=choice's selected text; a "  \
     "report auto-carries every id'd control's value, choice as idx(label)). DATA: ui_update mutates " \
-    "card data (data.set/append/"    \
-    "remove/replace) and any list/bind_data label re-renders. PRESETS expand to a normal card: "      \
-    "confirm{title,body?,confirm:{text?,report?/set?},cancel?}; form{title,fields:[{type,id,label,"  \
-    "…}],submit?}; dashboard{title,metrics:[{label,bind,kind?,fmt?,icon?}]}; menu{title,items:"       \
-    "[{text,report?}],style?}. Icons (representative): volume|battery|wifi|gear|check|close. "        \
+    "card data (data.set/append/remove/replace) and any list/bind_data label re-renders. PRESETS "    \
+    "shapes: see system prompt. Icons (representative): volume|battery|wifi|gear|check|close. "       \
     "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
-    "Table-style columns: stack rows and give EVERY label in each row grow:1 — without grow the "     \
-    "labels hug their text and columns won't line up across rows. "                                   \
-    "Example: {\"root\":{\"type\":\"column\",\"gap\":14,\"children\":[{\"type\":\"row\","       \
-    "\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio."   \
-    "volume\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]}"  \
-    "]}}"
+    "Table-style columns: see COMPACT rule in system prompt — grow:1 on every row label."
 
 #define PI_CARD_RENDER_SCHEMA \
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
