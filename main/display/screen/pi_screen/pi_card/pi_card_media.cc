@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 
+#include "media_player/media_id3.h"
 #include "media_player/media_player.h"
 #include "media_player/radio_stations.h"
 #include "metalio_hal/storage.h"
@@ -106,6 +107,22 @@ struct LocalTrack {
     std::string path;
 };
 
+// 用 ID3v2 标签覆盖标题/副信息（Stage E）：有 TIT2 用作 title，否则保留调用方
+// 已填的文件名兜底；TALB/TPE1 组成 "专辑 · 艺人"（缺一个就显示另一个），都缺
+// 保留调用方已填的目录名兜底。只读 tag 头几 KB（media_id3::ReadTags 内部
+// 流式解析，不载入整曲），50 个文件量级 <1s（Stage E 实测见工作包报告）。
+void ApplyId3Meta(std::string& title, std::string& subtitle, const std::string& path) {
+    media_id3::Tags t = media_id3::ReadTags(path);
+    if (!t.title.empty()) title = t.title;
+    if (!t.album.empty() && !t.artist.empty()) {
+        subtitle = t.album + " \xc2\xb7 " + t.artist;  // "专辑 · 艺人"
+    } else if (!t.album.empty()) {
+        subtitle = t.album;
+    } else if (!t.artist.empty()) {
+        subtitle = t.artist;
+    }
+}
+
 // 递归收集 dir 下的 .mp3；album = 该文件所在的直接父目录名（顶层文件用 category）。
 void ScanInto(const std::string& dir, const std::string& album, std::vector<LocalTrack>& out) {
     if (out.size() >= kMaxItems) return;
@@ -121,7 +138,10 @@ void ScanInto(const std::string& dir, const std::string& album, std::vector<Loca
         if (S_ISDIR(st.st_mode)) {
             ScanInto(full, name, out);  // 子目录名即专辑名
         } else if (S_ISREG(st.st_mode) && HasMp3Ext(name)) {
-            out.push_back({BaseNoExt(name), album, full});
+            std::string title = BaseNoExt(name);
+            std::string sub = album;
+            ApplyId3Meta(title, sub, full);
+            out.push_back({title, sub, full});
         }
     }
     closedir(d);
@@ -251,6 +271,7 @@ char* RunPlay(const cJSON* args, bool* is_error) {
             MediaItem m;
             m.title = BaseNoExt(el->valuestring);
             m.subtitle = ParentDirName(el->valuestring);
+            ApplyId3Meta(m.title, m.subtitle, el->valuestring);  // ID3 覆盖（Stage E）
             m.path_or_url = el->valuestring;
             m.is_stream = false;
             m.duration_s = 0;
@@ -342,10 +363,12 @@ void RegisterCommands() {
     auto& reg = CommandRegistry::Instance();
     auto& mc = MediaController::Instance();
 
-    reg.Register("media.toggle", "play/pause media", CmdLevel::Safe, [&mc]() { mc.Toggle(); });
-    reg.Register("media.next", "next track", CmdLevel::Safe, [&mc]() { mc.Next(); });
-    reg.Register("media.prev", "previous track", CmdLevel::Safe, [&mc]() { mc.Prev(); });
-    reg.Register("media.stop", "stop media playback", CmdLevel::Safe, [&mc]() { mc.Stop(); });
+    // 预算超标后精简 desc 措辞（命令语义不变，只删口水词：full=true 的 COMMANDS 子句才含
+    // desc，false 变体只列名，故这里的每字节都进了 ui_render DESC 的预算）。
+    reg.Register("media.toggle", "play/pause", CmdLevel::Safe, [&mc]() { mc.Toggle(); });
+    reg.Register("media.next", "next", CmdLevel::Safe, [&mc]() { mc.Next(); });
+    reg.Register("media.prev", "prev", CmdLevel::Safe, [&mc]() { mc.Prev(); });
+    reg.Register("media.stop", "stop playback", CmdLevel::Safe, [&mc]() { mc.Stop(); });
     // media.open：推出全屏 Now-Playing 页（Stage C）。invoke 在 LVGL 线程执行，直接调
     // pi_media::Open()（用 CreateMiniBar 记住的 parent，重复调用 no-op）。
     reg.Register("media.open", "open full-screen player", CmdLevel::Safe,

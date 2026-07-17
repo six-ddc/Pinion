@@ -2,13 +2,22 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include "esp_log.h"
+#include "media_player/media_id3.h"
 #include "media_player/media_player.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "screen_util.h"
+
+// lv_image_decoder_dsc_t 的字段（.header/.decoded）只在私有头里给了完整定义
+// （公开头 lv_types.h 只 forward-declare）；LVGL_ROOT_DIR（managed_components/
+// lvgl__lvgl）在两端都是 PUBLIC include dir，"src/..." 相对路径可达。只有本文件
+// 的封面预解码需要它——不通过 pi_card 渲染器，不污染其它文件。
+#include "src/draw/lv_image_decoder_private.h"
 
 // ---------------------------------------------------------------------------
 // 见头文件。设计语言严格延续 pi_settings / pi_quick_panel：Bg 深底、Card 面 +
@@ -16,6 +25,8 @@
 // pi_theme 令牌取色（唯一例外：透明度、canvas 图元里落到令牌颜色时的一次性取色）。
 // ---------------------------------------------------------------------------
 namespace {
+
+constexpr char TAG[] = "pi_media";
 
 using media::MediaController;
 using media::MediaItem;
@@ -366,6 +377,152 @@ struct PageCache {
     std::string title;
 } s_page_cache;
 
+// ---------------------------------------------------------------------------
+// 封面预解码（Stage E）：换曲时把内嵌 APIC（JPEG via tjpgd / PNG via lodepng）
+// 一次性解码成静态位图，之后 lv_image 只引用这份位图——不把 raw JPEG 字节直接
+// 喂给 lv_image（tjpgd 是 get_area 条带解码器，每次重绘都会重新解码，1Hz 进度
+// 刷新会让它每秒重解一次，见工作包设计记录）。JPEG 走 tjpgd 的 tile 循环自己
+// 拼图；PNG（lodepng）open() 即整图解码，直接整块拷贝。
+// 内存纪律：s_cover 只保留"当前曲"这一份，下次换曲/关页前必须先释放。
+struct CoverBitmap {
+    lv_image_dsc_t dsc{};
+    uint8_t* data = nullptr;  // malloc；随 FreeCoverBitmap/换曲释放
+};
+CoverBitmap s_cover;
+int s_cover_alloc_count = 0;  // Stage E 内存纪律验证用：净分配数应恒为 0 或 1（当前曲）
+
+void FreeCoverBitmap(CoverBitmap* cb) {
+    if (cb->data != nullptr) {
+        free(cb->data);
+        cb->data = nullptr;
+        s_cover_alloc_count--;
+        ESP_LOGI(TAG, "cover bitmap freed, alloc_count=%d", s_cover_alloc_count);
+    }
+    cb->dsc = lv_image_dsc_t{};
+}
+
+// bytes/len：APIC 原始编码字节（调用方持有，本函数只读不释放）。成功时 out
+// 持有一份自己 malloc 的位图（cf/w/h/stride 取自解码器实际结果）。
+bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
+    int w = 0, h = 0;
+    if (!media_id3::PeekImageSize(bytes, len, &w, &h)) return false;
+    if (w <= 0 || h <= 0 || w > 800 || h > 800) return false;  // 防御性尺寸门控
+
+    lv_image_dsc_t src{};
+    src.data = bytes;
+    src.data_size = static_cast<uint32_t>(len);
+    src.header.cf = LV_COLOR_FORMAT_RAW;  // 让解码器按魔数自行识别 JPEG/PNG
+    src.header.w = static_cast<uint32_t>(w);
+    src.header.h = static_cast<uint32_t>(h);
+
+    lv_image_decoder_dsc_t dsc{};
+    if (lv_image_decoder_open(&dsc, &src, nullptr) != LV_RESULT_OK) return false;
+
+    uint8_t* buf = nullptr;
+    size_t buf_size = 0;
+    uint32_t out_w = dsc.header.w;
+    uint32_t out_h = dsc.header.h;
+    uint32_t cf = dsc.header.cf;  // lv_image_header_t::cf 是 8-bit 位域，非枚举类型
+    uint32_t stride = 0;
+
+    if (dsc.decoded != nullptr) {
+        // 整图一次性解码（PNG/lodepng）：dsc.decoded 已是完整位图，整块拷贝出来
+        // 自持一份（decoder_close 会销毁 dsc.decoded 本身）。
+        const lv_draw_buf_t* db = dsc.decoded;
+        buf_size = db->data_size;
+        buf = static_cast<uint8_t*>(malloc(buf_size));
+        if (buf != nullptr) std::memcpy(buf, db->data, buf_size);
+        cf = db->header.cf;
+        out_w = db->header.w;
+        out_h = db->header.h;
+        stride = db->header.stride;
+    } else {
+        // 条带解码（JPEG/tjpgd）：循环取 tile 拼进自持缓冲，驱动方式与 LVGL 内部
+        // lv_draw_image.c 的 img_decode_and_draw 一致（decoded_area 哨兵初值
+        // LV_COORD_MIN，每轮读回归一化后的 tile 矩形，直到解码器耗尽返回非 OK）。
+        stride = out_w * 3;  // tjpgd 固定输出 RGB888
+        buf_size = static_cast<size_t>(stride) * out_h;
+        buf = static_cast<uint8_t*>(malloc(buf_size));
+        if (buf != nullptr) {
+            std::memset(buf, 0, buf_size);
+            lv_area_t full_area{0, 0, static_cast<int32_t>(out_w) - 1, static_cast<int32_t>(out_h) - 1};
+            lv_area_t tile{LV_COORD_MIN, LV_COORD_MIN, LV_COORD_MIN, LV_COORD_MIN};
+            lv_result_t res = LV_RESULT_OK;
+            int guard = 0;
+            while (res == LV_RESULT_OK && guard++ < 4096) {  // guard：绝不死循环
+                res = lv_image_decoder_get_area(&dsc, &full_area, &tile);
+                if (res != LV_RESULT_OK) break;
+                const lv_draw_buf_t* db = dsc.decoded;
+                if (db == nullptr) break;
+                int32_t tw = tile.x2 - tile.x1 + 1;
+                int32_t th = tile.y2 - tile.y1 + 1;
+                for (int32_t row = 0; row < th; row++) {
+                    int32_t dy = tile.y1 + row;
+                    if (dy < 0 || dy >= static_cast<int32_t>(out_h)) continue;
+                    int32_t dx = tile.x1;
+                    if (dx < 0) dx = 0;
+                    int32_t copy_w = tw - (dx - tile.x1);
+                    if (dx + copy_w > static_cast<int32_t>(out_w)) copy_w = static_cast<int32_t>(out_w) - dx;
+                    if (copy_w <= 0) continue;
+                    std::memcpy(buf + (static_cast<size_t>(dy) * out_w + dx) * 3,
+                               db->data + static_cast<size_t>(row) * db->header.stride,
+                               static_cast<size_t>(copy_w) * 3);
+                }
+            }
+        }
+        cf = LV_COLOR_FORMAT_RGB888;
+    }
+    lv_image_decoder_close(&dsc);
+
+    if (buf == nullptr) return false;
+    s_cover_alloc_count++;
+    ESP_LOGI(TAG, "cover bitmap allocated %zuB, alloc_count=%d", buf_size, s_cover_alloc_count);
+    out->data = buf;
+    out->dsc.header.cf = cf;
+    out->dsc.header.w = out_w;
+    out->dsc.header.h = out_h;
+    out->dsc.header.stride = stride;
+    out->dsc.data_size = static_cast<uint32_t>(buf_size);
+    out->dsc.data = buf;
+    return true;
+}
+
+// 换曲时调用：读 APIC → 门控尺寸 → 预解码 → 成功则在 s_art_host 内叠一张
+// LV_IMAGE_ALIGN_COVER 图（裁切铺满 330×330，圆角由 s_art_host 的 clip_corner
+// 兜底）。失败（无 APIC/超尺寸/解码失败——含约 10-20% 的 progressive JPEG，
+// tjpgd 不支持）时静默什么都不做，art_host 保留 BuildArt 已画好的生成式母题。
+void TryLoadCover(const std::string& path) {
+    uint32_t t0 = lv_tick_get();
+    size_t sz = 0;
+    std::string mime;
+    uint8_t* bytes = media_id3::ReadCover(path, &sz, &mime);
+    uint32_t t1 = lv_tick_get();
+    if (bytes == nullptr) {
+        ESP_LOGI(TAG, "cover: no APIC (read %ums)", static_cast<unsigned>(t1 - t0));
+        return;
+    }
+
+    CoverBitmap cb;
+    bool ok = DecodeCoverBytes(bytes, sz, &cb);
+    uint32_t t2 = lv_tick_get();
+    ESP_LOGI(TAG, "cover: %s mime=%s bytes=%zu read=%ums decode=%ums total=%ums", ok ? "OK" : "FAIL",
+             mime.c_str(), sz, static_cast<unsigned>(t1 - t0), static_cast<unsigned>(t2 - t1),
+             static_cast<unsigned>(t2 - t0));
+    free(bytes);  // 原始编码字节仅解码期间需要，位图已自持一份
+    if (!ok) return;
+
+    FreeCoverBitmap(&s_cover);
+    s_cover = cb;
+
+    lv_obj_t* img = lv_image_create(s_art_host);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(img, kArt, kArt);
+    lv_image_set_src(img, &s_cover.dsc);
+    lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);  // 保持比例铺满+居中裁切
+    lv_obj_center(img);
+}
+
 void BuildArt(bool is_stream, bool playing) {
     lv_obj_clean(s_art_host);
     if (is_stream) {
@@ -708,7 +865,11 @@ void RefreshPage() {
         lv_label_set_text(s_eyebrow, cur.is_stream ? "LIVE RADIO" : "NOW PLAYING");
         lv_label_set_text(s_title, cur.title.empty() ? "--" : cur.title.c_str());
         lv_label_set_text(s_sub, cur.subtitle.c_str());
-        BuildArt(cur.is_stream, playing);
+        FreeCoverBitmap(&s_cover);            // 换曲：先释放上一曲的解码位图
+        BuildArt(cur.is_stream, playing);     // 生成式母题打底（clean 掉旧封面 img）
+        ESP_LOGI(TAG, "track_changed idx=%d is_stream=%d path=%s", idx, cur.is_stream,
+                 cur.path_or_url.c_str());
+        if (!cur.is_stream) TryLoadCover(cur.path_or_url);  // 有真封面则叠图覆盖；电台永远走母题
     }
     if (static_cast<int>(st) != s_page_cache.state) {
         // 播放态变化：切图元 + 电波呼吸随播放态起停（重建 art）。
@@ -789,11 +950,13 @@ void Open() {
 void Close() {
     CloseDrawer();
     if (s_root != nullptr) {
-        lv_obj_delete(s_root);
+        lv_obj_delete(s_root);  // 连带删掉挂在 s_art_host 下的封面 lv_image 子对象
         s_root = nullptr;
         s_eyebrow = s_art_host = s_title = s_sub = nullptr;
         s_prog_track = s_prog_fill = s_time_cur = s_time_dur = s_play_host = nullptr;
     }
+    FreeCoverBitmap(&s_cover);  // 页面不可见时不留一份解码位图在内存里
+    s_page_cache.index = -2;    // 逼下次 Open() 重新走 track_changed（含重新预解码封面）
 }
 
 bool IsOpen() { return s_root != nullptr; }
@@ -819,6 +982,7 @@ void OnScreenUnloaded() {
     s_mini = s_mini_title = s_mini_sub = s_mini_btn = s_mini_glyph = s_mini_prog = nullptr;
     s_mini_shown = false;
     s_mini_cache = MiniCache{};
+    FreeCoverBitmap(&s_cover);
 }
 
 }  // namespace pi_media

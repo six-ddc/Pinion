@@ -30,4 +30,13 @@
 /* pi_card Phase3：chart 控件（standby 常驻卡的 battery/rssi 历史折线，两端均默认已开）。 */
 #define LV_USE_CHART 1
 
+/* 媒体封面解码（Stage E）：JPEG(tjpgd)/PNG(lodepng) + FS_MEMFS（tjpgd 从内存字节源
+ * 解码要靠它把 lv_image_dsc_t 包成"文件"读，见 lv_tjpgd.c）。字母与设备端 sdkconfig
+ * 的 CONFIG_LV_FS_MEMFS_LETTER=77（'M'）保持一致（非强制，两端各自独立取值也可，
+ * 统一只是少一处心智负担）。 */
+#define LV_USE_TJPGD 1
+#define LV_USE_LODEPNG 1
+#define LV_USE_FS_MEMFS 1
+#define LV_FS_MEMFS_LETTER 'M'
+
 #endif /* LV_CONF_H */

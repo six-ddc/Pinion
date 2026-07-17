@@ -27,18 +27,16 @@ extern "C" {
 // media 工具主体（agent worker 线程）。mode 分派 search / radio / play。
 char *pi_media_tool_run(const cJSON *args, bool *is_error);
 
+// 预算超标后精简（保留 mode 语义/search·radio·play 参数形状/接力引导本身，只删口水词）。
 #define PI_MEDIA_TOOL_DESC                                                                            \
-    "Play music/podcasts from the SD card, or live radio. mode:'search' scans the SD card "          \
-    "(dirs under Music/ and Podcasts/ are albums/shows; returns {items:[{index,title,album,path}]}, " \
-    "query filters by fuzzy name); mode:'radio' lists built-in CN radio stations "                    \
-    "({stations:[{index,name,genre}]}, query filters); mode:'play' starts playback — give paths:"    \
-    "[\"...\"] (local file paths from a prior search) with optional start_index, OR station_indices:" \
-    "[int] (indices from the radio list). Returns a now-playing snapshot. After a successful play, "  \
-    "FOLLOW with ui_render to show a control card, e.g. root=column of: a label bind:'media.title' "  \
-    "(str) + a label bind:'media.state', a bar bind:'media.progress_pct' (0-100), a row of buttons "  \
-    "invoke media.prev / media.toggle / media.next, and a list bind_data:'tracks' whose rows tap "    \
-    "{do:'set',path:'media.play_index',value:'{i}'} to jump to that track. Never poll — the card "    \
-    "auto-refreshes from media.* paths."
+    "Play SD-card music/podcasts, or live radio. mode:'search' scans SD (Music/Podcasts "            \
+    "subdirs=albums/shows) -> {items:[{index,title,album,path}]} (query=fuzzy filter); mode:'radio' " \
+    "lists built-in CN stations -> {stations:[{index,name,genre}]} (query filters); mode:'play' "     \
+    "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int] (from "    \
+    "radio list) -> now-playing snapshot. After play succeeds, ui_render a control card: label "      \
+    "bind:'media.title'/'media.state', bar bind:'media.progress_pct', buttons invoke media.prev/"      \
+    "toggle/next, list bind_data:'tracks' rows {do:'set',path:'media.play_index',value:'{i}'}. "       \
+    "Never poll — media.* auto-refreshes."
 
 #define PI_MEDIA_TOOL_SCHEMA                                                                         \
     "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"search\","       \

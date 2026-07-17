@@ -89,7 +89,9 @@ add_executable(pi_sim
     ${CLAW_ROOT}/components/media_player/src/media_pump.cc
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
     ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
+    ${CLAW_ROOT}/components/media_player/src/media_id3.cc
     shim/src/media_http_curl.cc
+    shim/src/media_textconv_sim.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
@@ -117,7 +119,7 @@ target_include_directories(pi_sim PRIVATE
     ${CLAW_ROOT}/components/media_player/src     # minimp3.h / media_resampler.h / media_internal.h（私有）
 )
 
-target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2)
+target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2 iconv)
 
 # Offline deterministic replay of the two-turn mock script (pi_scr_mock.h)
 # instead of the real API -- markdown-rendering fixture included. Usage:
@@ -134,3 +136,14 @@ add_executable(md_test
     ${CLAW_ROOT}/components/lv_markdown/src/md_inline.cc
 )
 target_include_directories(md_test PRIVATE ${CLAW_ROOT}/components/lv_markdown/include)
+
+# ---- id3_test: host unit tests + fuzz harness for the LVGL-free ID3 parser ----
+add_executable(id3_test
+    id3_test.cc
+    ${CLAW_ROOT}/components/media_player/src/media_id3.cc
+    shim/src/media_textconv_sim.cc
+)
+target_include_directories(id3_test PRIVATE
+    ${CLAW_ROOT}/components/media_player/include
+)
+target_link_libraries(id3_test PRIVATE iconv)

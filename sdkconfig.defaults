@@ -62,6 +62,11 @@ CONFIG_LV_COLOR_DEPTH_24=y
 CONFIG_LV_USE_QRCODE=y
 # chart 控件（pi_card Phase3：standby 常驻卡的 battery/rssi 历史折线）
 CONFIG_LV_USE_CHART=y
+# 媒体封面解码（Stage E）：TJPGD（JPEG）+ LODEPNG（PNG，已默认开）+ FS_MEMFS
+#（tjpgd 从内存字节源解码需要它把 lv_image_dsc_t 包成"文件"读，见 lv_tjpgd.c）。
+CONFIG_LV_USE_TJPGD=y
+CONFIG_LV_USE_FS_MEMFS=y
+CONFIG_LV_FS_MEMFS_LETTER=77
 
 # Wi-Fi：ESP32-C5 ESP-Hosted SDIO（引脚 CMD50/CLK51/D0-49/D1-34/D2-31/D3-53/RST54）
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
