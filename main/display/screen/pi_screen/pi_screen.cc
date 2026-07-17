@@ -3381,6 +3381,9 @@ lv_obj_t* PiScreen::Create() {
     // P1：「⚙ 设置」接线——面板已自行收起，这里直接推入设置 Hub（设置栈
     // 懒创建为 screen 的最后一个子对象，z 序压过 ptt 层/面板/sheet）。
     qp_hooks.on_settings = []() { pi_settings::Open(s_scr); };
+    // 「文件管理」快捷面板一步直达（跳过设置 Hub，直接推 Files 页；WiFi 门
+    // 控在 pi_quick_panel 侧已做，这里回调时必已连通）。
+    qp_hooks.on_files = []() { pi_settings::OpenFiles(s_scr); };
     pi_quick_panel::Create(scr, qp_hooks);
     BuildNewSessionSheet(scr);
     BuildConfirmSheet(scr);  // Phase3：通用确认 sheet（invoke-confirm 与 pin ✕ 共用）

@@ -381,6 +381,34 @@ void BuildActionGrid(lv_obj_t* parent) {
         btn_theme, [](lv_event_t*) { pi_theme::Set(!pi_theme::IsLight()); }, LV_EVENT_CLICKED,
         nullptr);
 
+    // 「⌂ 文件管理」：简易文件夹图元（矩形本体 + 左上角标签页）。仅 WiFi 已
+    // 连接才能打开（4G 有运营商 NAT，外部连不进来）；未连接点按只吐 toast，
+    // 不置灰——省一份"打开时刷新按钮态"的常驻逻辑，点按时判一次足够。
+    lv_obj_t* btn_files = MakeGridBtn(grid, "\xe6\x96\x87\xe4\xbb\xb6");  // "文件"
+    lv_obj_t* icon_files = lv_obj_get_child(btn_files, 0);
+    lv_obj_t* folder_body = MakeRect(icon_files, 20, 14, Tok::Dim);
+    lv_obj_set_style_radius(folder_body, 2, LV_PART_MAIN);
+    lv_obj_align(folder_body, LV_ALIGN_BOTTOM_MID, 0, -1);
+    lv_obj_t* folder_tab = MakeRect(icon_files, 9, 4, Tok::Dim);
+    lv_obj_set_style_radius(folder_tab, 1, LV_PART_MAIN);
+    lv_obj_align(folder_tab, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_event_cb(
+        btn_files,
+        [](lv_event_t*) {
+            bool wifi_up = mhal::network::GetType() == mhal::network::Type::WiFi &&
+                          mhal::network::IsConnected();
+            if (!wifi_up) {
+                // "需连接 WiFi"
+                ShowToast(
+                    "\xe9\x9c\x80\xe8\xbf\x9e\xe6\x8e\xa5 WiFi", &font_puhui_20_4, Tok::Dim);
+                return;
+            }
+            pi_quick_panel::Close();
+            if (s_hooks.on_files != nullptr)
+                s_hooks.on_files();
+        },
+        LV_EVENT_CLICKED, nullptr);
+
     // 「⏻ 关机」：环 + 顶部短竖条；长按 2s 才关机
     s_off_btn = MakeGridBtn(grid, "\xe5\x85\xb3\xe6\x9c\xba");  // "关机"
     lv_obj_t* icon_off = lv_obj_get_child(s_off_btn, 0);

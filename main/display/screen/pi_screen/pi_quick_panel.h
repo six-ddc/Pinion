@@ -7,7 +7,7 @@
 //
 // 半透明 scrim 盖住底下内容，面板从顶部滑出（圆角 24 底边、卡片色 0x16130E、
 // 1px 边线）。内容：状态行（网络类型 + 电量）、VOL / BRT 滑条（拖动即时生效，
-// 松手持久化）、一行四个动作按钮（新对话 / 设置 / 主题 / 关机-长按 2s）。
+// 松手持久化）、一行五个动作按钮（新对话 / 设置 / 主题 / 文件管理 / 关机-长按 2s）。
 //
 // 呼出/收起策略（长按 PWR_KEY、状态栏下拉、scrim 点按、面板内上滑）由
 // pi_screen 侧的手势/按键代码调用 Open()/Close()/Toggle() 完成；本模块只
@@ -21,6 +21,10 @@ struct Hooks {
     void (*on_new_session)() = nullptr;
     // 「设置」被点按（面板已自行收起后回调）。pi_screen 侧推入设置栈（P1）。
     void (*on_settings)() = nullptr;
+    // 「文件管理」被点按且当前 WiFi 已连接（面板已自行收起后回调）；未连
+    // WiFi 时本模块直接吐 toast 提示，不回调。pi_screen 侧一步直达
+    // pi_settings::OpenFiles()。
+    void (*on_files)() = nullptr;
 };
 
 // 构建面板（默认隐藏）。parent 是 pi_screen 的 screen 对象；只调一次，

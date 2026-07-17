@@ -43,6 +43,7 @@
 #include "pi_card/pi_card_media.h"
 #include "pi_card/pi_card_tools.h"
 #include "stock/stock_tool.h"
+#include "media_admin_httpd.h"
 #include "pi_screen.h"
 #include "screen_util.h"
 #include "sim_hooks.h"
@@ -1514,6 +1515,10 @@ int main() {
     lv_screen_load(pi);
     if (old_scr != nullptr && old_scr != pi) lv_obj_delete(old_scr);
     lv_unlock();
+
+    // PI_SIM_ADMIN=1：起 SD 音乐 Web 后台（POSIX socket 薄壳，http://127.0.0.1:8080），
+    // 在 macOS 浏览器里真实走通整个前端；文件落到 pi_sim_sd/。
+    if (std::getenv("PI_SIM_ADMIN") != nullptr) media_admin::httpd::Start();
 
     const bool loop_debug = std::getenv("PI_SIM_TOUCH_DEBUG") != nullptr;
     uint32_t stat_loops = 0, stat_handler = 0, stat_pump = 0, stat_last = SDL_GetTicks();

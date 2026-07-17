@@ -15,6 +15,7 @@
 #include "metalio_hal/bluetooth.h"
 #include "metalio_hal/network.h"
 #include "metalio_hal/power.h"
+#include "media_admin_httpd.h"
 #include "pi_fonts.h"
 #include "pi_net_events.h"
 #include "pi_sleep.h"
@@ -51,7 +52,7 @@ constexpr uint32_t kSliderApplyGapMs = 150;  // 拖动中节流写入（同快�
 
 pi_settings::Hooks s_hooks;
 
-enum class PageId { Hub, Network, Bluetooth, Sound, Display, Chat, About };
+enum class PageId { Hub, Network, Bluetooth, Sound, Display, Chat, About, Files };
 
 struct PageEntry {
     PageId id;
@@ -67,6 +68,10 @@ uint32_t s_ticks = 0;
 // Hub 行值摘要（六行）与右上电量
 lv_obj_t* s_hub_val[6] = {};
 lv_obj_t* s_hub_batt = nullptr;
+
+// 文件管理页
+lv_obj_t* s_file_state_lbl = nullptr;  // 运行状态 / URL
+lv_obj_t* s_file_btn_lbl = nullptr;    // 启动/停止 按钮文字
 
 // 网络页
 lv_obj_t* s_net_seg[2] = {};
@@ -545,6 +550,8 @@ void BuildHubPage(lv_obj_t** out_page) {
     lv_obj_set_style_pad_ver(content, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_row(content, 0, LV_PART_MAIN);
 
+    // 「文件管理」不在这张 Hub 表里——单一入口在快捷面板（下拉面板一步直达
+    // pi_settings::OpenFiles()），设置栈保持"网络/蓝牙/声音/显示/对话/关于"六页干净。
     static const char* kIcons[6] = {"N", "B", "S", "D", "C", "i"};
     static const char* kTitles[6] = {
         "\xe7\xbd\x91\xe7\xbb\x9c",  // 网络
@@ -1522,6 +1529,85 @@ void BuildChatPage(lv_obj_t** out_page) {
 }
 
 // ---------------------------------------------------------------------------
+// 文件管理页（SD 音乐 Web 后台的起停 + 地址显示）
+// ---------------------------------------------------------------------------
+void RefreshFilesPage() {
+    if (s_file_state_lbl == nullptr)
+        return;
+    bool wifi_up = mhal::network::GetType() == mhal::network::Type::WiFi &&
+                   mhal::network::IsConnected();
+    bool running = media_admin::httpd::IsRunning();
+    char buf[128];
+    if (running) {
+        std::string url = media_admin::httpd::GetUrl();
+        std::snprintf(buf, sizeof(buf),
+                      "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad \xc2\xb7 %s",  // "运行中 · <url>"
+                      url.empty() ? "http://?" : url.c_str());
+        lv_label_set_text(s_file_state_lbl, buf);
+        pi_theme::ApplyText(s_file_state_lbl, Tok::Accent);
+    } else if (!wifi_up) {
+        // "需连接 WiFi（4G 无法从外部访问）"
+        lv_label_set_text(s_file_state_lbl,
+                          "\xe9\x9c\x80\xe8\xbf\x9e\xe6\x8e\xa5 WiFi\xef\xbc\x88""4G "
+                          "\xe6\x97\xa0\xe6\xb3\x95\xe4\xbb\x8e\xe5\xa4\x96\xe9\x83\xa8"
+                          "\xe8\xae\xbf\xe9\x97\xae\xef\xbc\x89");
+        pi_theme::ApplyText(s_file_state_lbl, Tok::Faint);
+    } else {
+        lv_label_set_text(s_file_state_lbl,
+                          "\xe6\x9c\xaa\xe5\x90\xaf\xe5\x8a\xa8");  // "未启动"
+        pi_theme::ApplyText(s_file_state_lbl, Tok::Dim);
+    }
+    if (s_file_btn_lbl != nullptr) {
+        lv_label_set_text(s_file_btn_lbl,
+                          running ? "\xe5\x81\x9c\xe6\xad\xa2\xe6\x9c\x8d\xe5\x8a\xa1"   // "停止服务"
+                                  : "\xe5\x90\xaf\xe5\x8a\xa8\xe6\x9c\x8d\xe5\x8a\xa1");  // "启动服务"
+    }
+}
+
+void OnFileToggleClicked(lv_event_t*) {
+    bool wifi_up = mhal::network::GetType() == mhal::network::Type::WiFi &&
+                   mhal::network::IsConnected();
+    if (media_admin::httpd::IsRunning()) {
+        media_admin::httpd::Stop();
+    } else {
+        if (!wifi_up)
+            return;  // 未连 WiFi：按钮灰化语义，直接忽略
+        media_admin::httpd::Start();
+    }
+    RefreshFilesPage();
+    RefreshHub();
+}
+
+void BuildFilesPage(lv_obj_t** out_page) {
+    // "文件管理"
+    lv_obj_t* content = MakePage(PageId::Files,
+                                 "\xe6\x96\x87\xe4\xbb\xb6\xe7\xae\xa1\xe7\x90\x86", out_page);
+
+    lv_obj_t* card = MakeCard(content, "MEDIA WEB ADMIN");
+    // "在浏览器管理 SD 卡里 Music / Podcasts 的 MP3（列表 / 上传 / 目录 / 删除）"
+    lv_obj_t* desc = lv_label_create(card);
+    lv_label_set_text(desc,
+                      "\xe5\x9c\xa8\xe6\xb5\x8f\xe8\xa7\x88\xe5\x99\xa8\xe7\xae\xa1\xe7\x90\x86 "
+                      "SD \xe5\x8d\xa1\xe9\x87\x8c Music / Podcasts \xe7\x9a\x84 MP3");
+    SetLabelFont(desc, &font_puhui_20_4, Tok::Faint);
+    lv_obj_set_width(desc, LV_PCT(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+
+    // 状态行（运行中显示 URL / 未连 WiFi 提示 / 未启动）；中英混排一律 puhui（mono 无中文子集）
+    s_file_state_lbl = lv_label_create(card);
+    SetLabelFont(s_file_state_lbl, &font_puhui_20_4, Tok::Dim);
+    lv_obj_set_width(s_file_state_lbl, LV_PCT(100));
+    lv_label_set_long_mode(s_file_state_lbl, LV_LABEL_LONG_WRAP);
+
+    // 启动/停止按钮
+    lv_obj_t* btn = MakeActionBtn(card, "\xe5\x90\xaf\xe5\x8a\xa8\xe6\x9c\x8d\xe5\x8a\xa1",
+                                  OnFileToggleClicked);
+    s_file_btn_lbl = lv_obj_get_child(btn, 0);
+
+    RefreshFilesPage();
+}
+
+// ---------------------------------------------------------------------------
 // 关于页（只读 kv，打开时刷新一次）
 // ---------------------------------------------------------------------------
 void BuildAboutPage(lv_obj_t** out_page) {
@@ -1629,6 +1715,10 @@ void PageWillClose(PageId id) {
             for (auto*& o : s_mode_seg)
                 o = nullptr;
             break;
+        case PageId::Files:
+            s_file_state_lbl = nullptr;
+            s_file_btn_lbl = nullptr;
+            break;
         case PageId::Hub:
             for (auto*& o : s_hub_val)
                 o = nullptr;
@@ -1664,6 +1754,9 @@ void Push(PageId id) {
             break;
         case PageId::About:
             BuildAboutPage(&page);
+            break;
+        case PageId::Files:
+            BuildFilesPage(&page);
             break;
     }
     if (page == nullptr)
@@ -1734,6 +1827,9 @@ void TickCb(lv_timer_t*) {
     // 网络状态卡片 5s 一刷（4G 信号走 AT 通道，别刷太勤）
     if (s_ticks % 10 == 0 && top == PageId::Network)
         RefreshNetworkPage();
+    // 文件管理页 2s 一刷（服务可能因 10min 闲置自动停 / WiFi 状态变化）
+    if (s_ticks % 4 == 0 && top == PageId::Files)
+        RefreshFilesPage();
 }
 
 void CloseAll() {
@@ -1763,7 +1859,10 @@ namespace pi_settings {
 
 void SetHooks(const Hooks& hooks) { s_hooks = hooks; }
 
-void Open(lv_obj_t* parent) {
+// 共用初始化：起 root、订阅网络事件、起 tick 定时器，然后 Push 指定首页。
+// Open() 首页 Hub；OpenFiles() 首页 Files（快捷面板一步直达，不经 Hub —— 栈里
+// 只有这一页，Back()/Pop() 走到空栈即 CloseAll，与"从 Hub 点进来"体感一致）。
+static void OpenWith(lv_obj_t* parent, PageId first_page) {
     if (s_root != nullptr)
         return;
 
@@ -1792,10 +1891,15 @@ void Open(lv_obj_t* parent) {
             }
         });
 
-    Push(PageId::Hub);
+    Push(first_page);
     s_ticks = 0;
     s_tick_timer = lv_timer_create(TickCb, kTickMs, nullptr);
 }
+
+void Open(lv_obj_t* parent) { OpenWith(parent, PageId::Hub); }
+
+// 快捷面板「文件管理」一步直达：直接把 Files 页推成栈里唯一一页。
+void OpenFiles(lv_obj_t* parent) { OpenWith(parent, PageId::Files); }
 
 void Close() { CloseAll(); }
 

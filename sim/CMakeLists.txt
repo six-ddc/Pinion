@@ -54,6 +54,9 @@ add_executable(pi_sim
     shim/src/audio_pipeline_shim.cc
     shim/src/mhal_shim.cc
     shim/src/net_shim.cc
+    # SD 音乐 Web 后台：可移植 core + sim POSIX socket 薄壳（复用同一份网页）
+    ${CLAW_ROOT}/components/media_admin/media_admin_core.cc
+    shim/src/media_admin_httpd_sim.cc
     shim/src/bt_shim.cc
     shim/src/volc_stub.cc
     # firmware UI sources, unchanged
@@ -110,6 +113,7 @@ target_include_directories(pi_sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include   # must precede everything ESP-flavored
     ${CLAW_ROOT}/main                          # stock/…（行情数据层）
     ${CLAW_ROOT}/main/stock
+    ${CLAW_ROOT}/components/media_admin/include # media_admin_core.h / _httpd.h / _web.h
     ${CLAW_ROOT}/main/display/screen
     ${CLAW_ROOT}/main/display/screen/pi_screen
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
