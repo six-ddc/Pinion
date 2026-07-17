@@ -45,6 +45,12 @@ struct MediaController::Impl : public PumpHost {
 
     std::function<void()> on_state_;
 
+    // 当前曲目是否已真正出过声（OnPlaybackFlowing 至少触发过一次）。OnTrackStarted
+    // （新曲开始）复位；OnReconnecting 的"已恢复"分支据此判断——若本曲从未真正播出过
+    // （如一个从未连上过的 URL 在给最终放弃前的某次重试里恰好收到了几个字节又断），
+    // 不能因为"字节又来了"就直接报 Playing，仍要等 OnPlaybackFlowing 首帧真正喂出。
+    bool track_has_flowed_ = false;
+
     std::vector<Pump*> zombies_;  // 已自然结束（OnAllFinished/OnTrackError）待回收的 pump
 
     // —— 生命周期辅助（均要求已持 ctrl_mu_、且调用点不持 mu_，因为要 join 线程）——
@@ -109,6 +115,11 @@ struct MediaController::Impl : public PumpHost {
             pump_ = p;
             index_ = start_index;
             state_ = MediaState::Loading;
+            // 在此处（而非只靠 OnTrackStarted）就复位：新 pump 的字节源可能在
+            // OnTrackStarted 被调用前就已经历一次失败+恢复（尤其 curl 侧后台线程一
+            // 建好就跑），若不在这里先清掉上一个 pump 遗留的 true，OnReconnecting 的
+            // "已恢复"分支可能在本曲从未真正出声前就误判为可以报 Playing。
+            track_has_flowed_ = false;
         }
 #ifdef ESP_PLATFORM
         // ESP-IDF 默认 pthread 栈对 minimp3 偏紧：spawn 前抬到 16KB（仅真机路径）。
@@ -133,15 +144,41 @@ struct MediaController::Impl : public PumpHost {
     // —— PumpHost 回调（pump 线程上下文）——
 
     void OnTrackStarted(Pump* p, int idx) override {
+        // 只更新曲目索引 + 保持/切回 Loading——源已打开不代表已在出声（流式 open 非
+        // 阻塞，此刻字节可能一个都还没读到）。真正的 Playing 由 OnPlaybackFlowing 触发
+        // （见下）。多曲连播时上一曲可能是 Playing，这里显式切回 Loading 让 UI 如实
+        // 反映"新曲正在缓冲"。
         bool changed = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (p != pump_) return;  // 陈旧 pump
             index_ = idx;
-            state_ = MediaState::Playing;
-            changed = true;
+            if (state_ != MediaState::Loading) {
+                state_ = MediaState::Loading;
+            }
+            track_has_flowed_ = false;  // 新曲：Playing 需要重新用首帧触发（含 OnReconnecting 的恢复分支）
+            changed = true;  // 索引变化本身也值得通知 UI（标题/曲目切换）
         }
         if (changed) NotifyState();
+    }
+
+    // 本曲第一帧真正喂给播放管线：Loading→Playing 的唯一触发点（文件/流统一）。
+    void OnPlaybackFlowing(Pump* p, int idx) override {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (p != pump_) return;  // 陈旧 pump
+            index_ = idx;
+            track_has_flowed_ = true;
+            if (state_ == MediaState::Loading) {
+                state_ = MediaState::Playing;
+                changed = true;
+            }
+        }
+        if (changed) {
+            ESP_LOGI("media_ctrl", "track %d first frame flowing -> Playing", idx);
+            NotifyState();
+        }
     }
 
     void OnTrackError(Pump* p, int idx, const char* msg) override {
@@ -184,6 +221,13 @@ struct MediaController::Impl : public PumpHost {
 
     // 网络流断线重连：把可见态在 Playing<->Loading 间短暂切换（用户看到"缓冲中"而非
     // 卡死的进度）。只在陈旧 pump 已换代/未在播放态时忽略，避免把 Paused/Stopped 误改。
+    //
+    // "已恢复"分支的 track_has_flowed_ 守卫：字节源收到字节（TCP 连上、开始收数据）
+    // 不等于"minimp3 已经解出并喂出至少一帧"——两者之间还隔着解码窗保留水位/首帧解码
+    // 延迟。若本曲此前从未真正出过声就直接在这里报 Playing，会重现与 OnTrackStarted
+    // 同类的"过早报 Playing"问题（实测：从未连上的 URL 在某次重试里若恰好收到几个字节
+    // 又立刻断开，没有这个守卫会在此处误报一次 Playing）。只有本曲已经真正流过至少一帧
+    // （track_has_flowed_）才允许"重连恢复"直接回到 Playing；否则耐心等 OnPlaybackFlowing。
     void OnReconnecting(Pump* p, bool reconnecting) override {
         bool changed = false;
         {
@@ -192,7 +236,7 @@ struct MediaController::Impl : public PumpHost {
             if (reconnecting && state_ == MediaState::Playing) {
                 state_ = MediaState::Loading;
                 changed = true;
-            } else if (!reconnecting && state_ == MediaState::Loading) {
+            } else if (!reconnecting && state_ == MediaState::Loading && track_has_flowed_) {
                 state_ = MediaState::Playing;
                 changed = true;
             }

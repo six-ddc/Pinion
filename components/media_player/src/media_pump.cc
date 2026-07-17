@@ -240,11 +240,13 @@ void PumpReaderMain(Pump* p) {
 
 // 带 skip 的喂入：续播/恢复时先丢弃 skip_remaining 个输出样本（文件 seek 近似），
 // 其余阻塞喂播放管线（带起播代次，打断即丢弃）。fed_samples 累计已播样本 → position。
-static void FeedWithSkip(Pump* p, std::vector<int16_t>& pcm, uint64_t& skip_remaining,
+// 返回本次真正喂进播放管线的样本数（跳过部分不计入）——调用方据此判断"是否真的出声了"，
+// 驱动 Loading→Playing 的唯一触发点（见 PumpDecoderMain 里的 flowing_reported）。
+static size_t FeedWithSkip(Pump* p, std::vector<int16_t>& pcm, uint64_t& skip_remaining,
 #ifndef ESP_PLATFORM
-                         WavDump& wav,
+                           WavDump& wav,
 #endif
-                         uint32_t gen) {
+                           uint32_t gen) {
     size_t off = 0;
     if (skip_remaining > 0) {
         size_t drop = std::min<uint64_t>(skip_remaining, pcm.size());
@@ -252,12 +254,13 @@ static void FeedWithSkip(Pump* p, std::vector<int16_t>& pcm, uint64_t& skip_rema
         off = drop;  // 被跳过的样本已在 position 起点计入，不喂不 dump
     }
     size_t n = pcm.size() - off;
-    if (n == 0) return;
+    if (n == 0) return 0;
     size_t fed = mhal::audio_pipeline::FeedPlayback(pcm.data() + off, n, kFeedTimeoutMs, gen);
     p->fed_samples += fed;
 #ifndef ESP_PLATFORM
     wav.Write(pcm.data() + off, fed);
 #endif
+    return fed;
 }
 
 void PumpDecoderMain(Pump* p) {
@@ -284,6 +287,9 @@ void PumpDecoderMain(Pump* p) {
     const int64_t start_us = esp_timer_get_time();
     int64_t last_log_us = start_us;
     uint64_t cleared_tail = 0;  // 丢弃的无法成帧尾部字节（诊断，正常仅曲末 < 1 帧）
+    // 本曲是否已上报过 OnPlaybackFlowing（Loading→Playing）：每接手一个新 epoch（新曲）
+    // 重置，跳过阶段（续播 seek）不算数——必须真有样本喂进播放管线才算"在出声"。
+    bool flowing_reported = false;
 
     for (;;) {
         if (p->stop) break;
@@ -314,6 +320,7 @@ void PumpDecoderMain(Pump* p) {
                 // skip 仅用于首曲（续播/恢复的起播索引）；自动连播的后续曲从 0 起。
                 skip_remaining = (adopted == 1) ? p->skip_out_samples : 0;
                 p->fed_samples = skip_remaining;
+                flowing_reported = false;  // 新曲：Loading→Playing 需要重新用首帧触发
             }
             if (!p->ring.empty()) {
                 size_t take = std::min(p->ring.size(), kDecoderPull);
@@ -343,11 +350,17 @@ void PumpDecoderMain(Pump* p) {
                 out.clear();
                 resampler.Process(pcm, samples, info.channels, info.hz, out);
                 p->resampled_samples += out.size();
-                FeedWithSkip(p, out, skip_remaining,
+                size_t fed = FeedWithSkip(p, out, skip_remaining,
 #ifndef ESP_PLATFORM
-                             wav,
+                                          wav,
 #endif
-                             p->playback_gen);
+                                          p->playback_gen);
+                // 首个真正喂进播放管线的帧（跳过阶段不算）：Loading→Playing 的唯一触发
+                // 点。修复此前"源一打开就报 Playing"导致从未连上的流长时间误报播放中。
+                if (fed > 0 && !flowing_reported) {
+                    flowing_reported = true;
+                    if (p->host) p->host->OnPlaybackFlowing(p, p->cur_index.load());
+                }
             }
             if (p->stop) break;
         }

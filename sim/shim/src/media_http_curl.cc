@@ -89,7 +89,6 @@ class CurlStreamSource : public MediaSource {
         if (self->abort_) return 0;  // 中止传输
         self->ring_.insert(self->ring_.end(), data, data + n);
         self->bytes_this_conn_ += n;
-        self->ever_connected_ = true;
         // 若之前处于"重连中"上报过 true，这里配对上报 false（去重：exchange 只有真正从
         // true 翻到 false 时才回调一次）。
         if (self->reconnecting_.exchange(false) && self->on_reconnecting_) {
@@ -141,7 +140,12 @@ class CurlStreamSource : public MediaSource {
             } else if (fail_streak_start_ms == 0) {
                 fail_streak_start_ms = now_ms;
             }
-            if (!reconnecting_.exchange(true) && ever_connected_.load() && on_reconnecting_) {
+            // 注意：不再用 ever_connected_ 门控——从未连接成功过的 URL（首连即失败）
+            // 也要上报 reconnecting=true。之前门控只在"曾经连上过又断开"时才报，配合
+            // media_pump.cc 的旧版"源一打开就报 Playing"会让从未连上的坏 URL 长达
+            // ~60s 显示 Playing；现在 Playing 已改为首帧真正喂出才触发（见 OnPlaybackFlowing），
+            // 这里放开门控是为了让 OnReconnecting 的语义本身也诚实（不依赖上层的另一层保护）。
+            if (!reconnecting_.exchange(true) && on_reconnecting_) {
                 on_reconnecting_(true);
             }
             if (now_ms - fail_streak_start_ms > kGiveUpAfterMs) {
@@ -166,8 +170,7 @@ class CurlStreamSource : public MediaSource {
     std::deque<uint8_t> ring_;
     std::atomic<bool> abort_{false};
     std::atomic<bool> failed_{false};
-    std::atomic<bool> ever_connected_{false};  // 本 source 是否曾经收到过任何数据
-    std::atomic<bool> reconnecting_{false};    // 当前是否已上报过 reconnecting=true（去重）
+    std::atomic<bool> reconnecting_{false};  // 当前是否已上报过 reconnecting=true（去重）
     size_t bytes_this_conn_ = 0;
     std::thread thr_;
 };

@@ -20,13 +20,21 @@ struct Pump;
 // pump 线程回调宿主：由 MediaController 实现。回调携带触发的 Pump*，宿主据其 session
 // 与当前会话代次比对丢弃陈旧 pump（换曲/停止 teardown 期间在途回调）的事件。
 struct PumpHost {
-    virtual void OnTrackStarted(Pump* p, int index) = 0;                 // Loading→Playing，位置已在 pump 内重置
+    // 源已打开、开始起播新曲：仅更新曲目索引，**不**代表已在出声（流式 open 是非阻塞
+    // 的，此刻字节可能一个都还没读到）。宿主应保持/切回 Loading，真正的 Playing 由
+    // 下面的 OnPlaybackFlowing 触发。
+    virtual void OnTrackStarted(Pump* p, int index) = 0;
     virtual void OnTrackError(Pump* p, int index, const char* msg) = 0;  // 打开/读取失败 → Error
     virtual void OnAllFinished(Pump* p) = 0;                             // 播完最后一曲 → Stopped
     // 网络流断线重连状态变化：true=开始重连（宿主可把可见态切到 Loading），
-    // false=已恢复数据（切回 Playing）。可能从 pump 的 reader 线程或字节源自己的后台
-    // 线程（如 curl 的 bg thread）调用，宿主实现须线程安全、非阻塞。
+    // false=已恢复数据（切回 Playing，仅当本曲已报过 OnPlaybackFlowing）。可能从 pump
+    // 的 reader 线程或字节源自己的后台线程（如 curl 的 bg thread）调用，宿主实现须
+    // 线程安全、非阻塞。
     virtual void OnReconnecting(Pump* p, bool reconnecting) = 0;
+    // 本曲第一个解码帧真正喂给播放管线（而非仅仅"源已打开"）：Loading→Playing 的唯一
+    // 触发点，文件/流统一处理。修复：此前 OnTrackStarted 一开源就报 Playing，导致从未
+    // 连上的电台 URL 在长达 ~60s 的重连/放弃窗口内一直误报"正在播放"。decoder 线程调用。
+    virtual void OnPlaybackFlowing(Pump* p, int index) = 0;
     virtual ~PumpHost() = default;
 };
 
