@@ -127,6 +127,22 @@ const lv_font_t* IconFontFor(int32_t size) {
 
 }  // namespace
 
+bool IconKnown(const char* name) {
+    if (name == nullptr) return false;
+    if (GlyphFor(name) != nullptr) return true;
+    // MakeIcon 形状拼合后备接受的名字（多数同时在字形表里，这里只兜住不在表内的）。
+    static const char* kShapeNames[] = {"check", "ok",       "close",       "x",      "plus",
+                                        "add",   "minus",    "chevron",     "arrow",  "next",
+                                        "dot",   "gear",     "settings",    "info",   "warning",
+                                        "alert", "battery",  "charging",    "bolt",   "wifi",
+                                        "signal", "cellular", "sun",        "brightness", "volume",
+                                        "volume_high", "volume_low", "mute", "music", "mic",
+                                        "clock"};
+    for (const char* s : kShapeNames)
+        if (Eq(name, s)) return true;
+    return false;
+}
+
 lv_obj_t* MakeIcon(lv_obj_t* parent, const char* name, int32_t size, Tok tone) {
     lv_obj_t* box = Box(parent, size);
     if (name == nullptr) name = "dot";

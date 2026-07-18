@@ -31,4 +31,8 @@ namespace pi_card {
 // size 建议 20~32。tone 决定图标主色（默认令牌由调用方给，通常 Tok::Tx/Accent）。
 lv_obj_t* MakeIcon(lv_obj_t* parent, const char* name, int32_t size, pi_theme::Tok tone);
 
+// name 能渲染出具体图形（字体字形或形状拼合命中）；false 则 MakeIcon 回落成圆点。
+// Lint 用它在 ui_render 返回的 hints 里纠正 LLM 生造的图标名。
+bool IconKnown(const char* name);
+
 }  // namespace pi_card

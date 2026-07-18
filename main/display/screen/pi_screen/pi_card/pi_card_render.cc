@@ -185,7 +185,8 @@ void ApplyLabelStyle(lv_obj_t* lbl, const cJSON* node) {
 
 // 按钮变体：primary(一处 sharp accent) / ghost(描边) / plain(纯文字) / 默认(中性填充)。
 // 只有 primary 用琥珀——把强调色收敛到「一处」，其余按钮退成中性，主次层级立现。
-void ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
+// 返回按钮前景令牌（变体决定、node tone 可覆写）——按钮内嵌图标用它与文字同色。
+Tok ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
     const char* variant = GetStr(node, "variant", "default");
     lv_obj_set_style_radius(btn, 12, LV_PART_MAIN);
     lv_obj_set_style_pad_hor(btn, 20, LV_PART_MAIN);
@@ -213,6 +214,8 @@ void ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
     SafeFont(font, GetStr(node, "text"));  // 中文按钮文字兜底 puhui，不出豆腐块
     lv_obj_set_style_text_font(lbl, font, LV_PART_MAIN);
     SetTextTone(lbl, node, text_tone);
+    ToneTok(GetStr(node, "tone"), text_tone);  // 覆写后的最终前景令牌回给调用方
+    return text_tone;
 }
 
 bool IsGrowable(const char* type) {
@@ -678,9 +681,22 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     } else if (std::strcmp(type, "button") == 0) {
         obj = lv_button_create(parent);
         lv_obj_t* lbl = lv_label_create(obj);
-        lv_label_set_text(lbl, GetStr(node, "text", ""));  // 无文字置空，避免 LVGL "Text" 占位
-        ApplyButtonStyle(obj, lbl, node);  // 变体 + 字体 + 颜色
-        lv_obj_center(lbl);
+        const char* text = GetStr(node, "text", "");
+        lv_label_set_text(lbl, text);  // 无文字置空，避免 LVGL "Text" 占位
+        Tok fg = ApplyButtonStyle(obj, lbl, node);  // 变体 + 字体 + 颜色
+        if (const char* icon_name = GetStr(node, "icon")) {
+            // 图标按钮：icon 可单用或与 text 并存（图标居左），与文字同前景令牌。
+            lv_obj_t* ic = MakeIcon(obj, icon_name, GetInt(node, "size", 20), fg);
+            lv_obj_move_to_index(ic, 0);
+            lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(obj, 8, LV_PART_MAIN);
+            // 仅图标时藏掉空 label，免得 pad_column 让图标偏心。
+            if (text[0] == '\0') lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_center(lbl);
+        }
     } else if (std::strcmp(type, "slider") == 0) {
         obj = lv_slider_create(parent);
         int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
@@ -763,7 +779,8 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         }
     } else if (std::strcmp(type, "stock_chart") == 0) {
         // 行情卡叶子控件（pi_card_stock）：symbol 声明式，行情数据设备侧直取直画、
-        // 自适应刷新、点击切周期；生命周期（注册表/canvas 缓冲/timer）全部自管。
+        // 自适应刷新、分段按钮切周期、按住图面看数值；生命周期（注册表/canvas
+        // 缓冲/timer）全部自管。
         obj = pi_card_stock::Create(parent, node);
         if (obj == nullptr) {
             err = "stock_chart alloc failed";
@@ -1267,6 +1284,21 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
     if (std::strcmp(type, "button") == 0) {
         const char* variant = GetStr(node, "variant");
         if (variant && std::strcmp(variant, "primary") == 0) ++st.primary_count;
+        const char* text = GetStr(node, "text");
+        if ((text == nullptr || text[0] == '\0') && GetStr(node, "icon") == nullptr) {
+            st.hints->push_back("This button has neither text nor icon and renders as a blank "
+                                "pill; give it a short text and/or an icon (Lucide name).");
+        }
+    }
+    {
+        // 未知图标名回落成圆点——当场纠正 LLM 生造的名字（button 的 icon 属性同样适用）。
+        const char* icon = GetStr(node, "icon");
+        if (icon == nullptr && std::strcmp(type, "icon") == 0) icon = GetStr(node, "name");
+        if (icon != nullptr && !IconKnown(icon)) {
+            st.hints->push_back(std::string("Icon '") + icon +
+                                "' is not in the built-in Lucide subset and renders as a plain "
+                                "dot; use a more common Lucide icon name.");
+        }
     }
     const bool ctrl = std::strcmp(type, "slider") == 0 || std::strcmp(type, "switch") == 0 ||
                       std::strcmp(type, "arc") == 0 || std::strcmp(type, "choice") == 0;
