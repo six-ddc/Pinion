@@ -320,11 +320,18 @@ bool IsInteractive(const char* type) {
 }
 
 // ------------------------------ 自适应尺寸 ---------------------------------
-// parent_flow: 0=column（含 root）, 1=row。growable/label 在 column 里默认全宽、
+// parent_flow: 0=column（含 root）, 1=row, 2=grid。growable/label 在 column 里默认全宽、
 // 在 row 里默认按比例分配（flex-grow 1），使「一排按钮均分」「一列控件铺满」这
-// 类最简 JSON 也有好布局。显式 w/grow 永远优先。
-enum { FLOW_COL = 0, FLOW_ROW = 1 };
+// 类最简 JSON 也有好布局。显式 w/grow 永远优先。grid 子项尺寸由 lv_obj_set_grid_cell
+// 的 col_align 接管（见 grid 分支），故 ApplySizing 对 grid 子项跳过全部 flex 默认。
+enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2 };
 void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_flow) {
+    if (parent_flow == FLOW_GRID) {
+        // grid 单元的 growable/STRETCH 由 set_grid_cell 决定，这里只落显式 w/h（无则不动）。
+        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
+        if (HasKey(node, "h")) lv_obj_set_height(obj, GetInt(node, "h", 0));
+        return;
+    }
     const bool spacer = std::strcmp(type, "spacer") == 0;
     if (HasKey(node, "w")) {
         lv_obj_set_width(obj, GetInt(node, "w", 0));
@@ -386,7 +393,8 @@ void ApplyDefaultStyle(lv_obj_t* obj, const char* type, int depth) {
     }
     // button 的样式（含变体）在其分支里由 ApplyButtonStyle 处理，这里不碰。
     // 顶层容器：卡片外观（柔圆角 + 慷慨留白 + 细边框），即便 LLM 只给光秃 column。
-    if (depth == 0 && (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0)) {
+    if (depth == 0 && (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0 ||
+                       std::strcmp(type, "grid") == 0)) {
         pi_theme::ApplyBg(obj, Tok::Card);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_radius(obj, 18, LV_PART_MAIN);
@@ -705,6 +713,16 @@ void SubstRecord(cJSON* node, const cJSON* rec, int i) {
     }
 }
 
+// grid 轨道模板堆载体：lv_obj_set_grid_dsc_array 只存指针、不拷贝数组，故 col/row 轨道
+// 数组必须与 grid 对象同寿命——堆分配、逐对象挂 LV_EVENT_DELETE 释放（照抄 chart
+// handle_box 模式）。绝不存进 card：list 行重渲 lv_obj_clean 会删旧 grid，若把 dsc 存进
+// card 就悬垂 + 每次重渲无界增长。
+struct GridDsc {
+    std::vector<int32_t> cols;  // 末尾 LV_GRID_TEMPLATE_LAST
+    std::vector<int32_t> rows;  // 末尾 LV_GRID_TEMPLATE_LAST
+};
+void GridDscFreeCb(lv_event_t* e) { delete static_cast<GridDsc*>(lv_event_get_user_data(e)); }
+
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
                      int depth, int& node_count, std::string& err, int parent_flow,
                      bool in_list_row) {
@@ -752,6 +770,72 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         FlexJustifyOf(GetStr(node, "justify"), main_align);
         FlexCrossOf(GetStr(node, "align"), cross_align);
         lv_obj_set_flex_align(obj, main_align, cross_align, cross_align);
+    } else if (std::strcmp(type, "grid") == 0) {
+        // 行主序自动放置的网格：cols 声明列 fr 权重（或 "auto"=按内容），子节点可选 span
+        // 跨列，无需写行列坐标。轨道 dsc 堆分配、随对象 DELETE 释放（GridDscFreeCb）。
+        // 子节点在本分支内直接渲染 + set_grid_cell 放置（同 list：不走底部通用 children 循环）。
+        obj = lv_obj_create(parent);
+        screen_strip_obj_chrome(obj);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
+        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
+        int gap = GetInt(node, "gap", 12);
+        lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
+        lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
+
+        const cJSON* cols = GetItem(node, "cols");  // Validate 已保证 array 长 1..6、元素合法
+        const int ncol = cJSON_GetArraySize(cols);
+        auto* dsc = new GridDsc();
+        dsc->cols.reserve(ncol + 1);
+        const cJSON* cel = nullptr;
+        cJSON_ArrayForEach(cel, cols) {
+            if (cJSON_IsString(cel)) dsc->cols.push_back(LV_GRID_CONTENT);  // "auto"：按内容宽
+            else dsc->cols.push_back(LV_GRID_FR(cel->valueint));           // 正整数：fr 权重
+        }
+        dsc->cols.push_back(LV_GRID_TEMPLATE_LAST);
+
+        const cJSON* children = GetItem(node, "children");
+        // 行主序自动放置：cur=当前行已占列数，row=当前行号。span 放不下则换行；填满一行
+        // 后 cur 归零、row 进位。place_next 回吐本 cell 的 (col_out,row_out) 落位并推进游标。
+        auto place_next = [ncol](int span, int& cur, int& row, int& col_out, int& row_out) {
+            if (span < 1) span = 1;
+            if (span > ncol) span = ncol;
+            if (cur + span > ncol) { ++row; cur = 0; }  // 本行放不下 → 换到下一行
+            col_out = cur;
+            row_out = row;  // 本 cell 的落位行（在推进游标之前取）
+            cur += span;
+            if (cur >= ncol) { ++row; cur = 0; }  // 填满 → 为下一 cell 进位
+            return span;
+        };
+        int cursor = 0, row = 0, col_out = 0, row_out = 0;
+        const cJSON* ch = nullptr;
+        cJSON_ArrayForEach(ch, children) place_next(GetInt(ch, "span", 1), cursor, row, col_out, row_out);
+        int nrow = (cursor > 0) ? row + 1 : row;  // 末行未满也计一行
+        if (nrow < 1) nrow = 1;
+        dsc->rows.assign(nrow, LV_GRID_CONTENT);
+        dsc->rows.push_back(LV_GRID_TEMPLATE_LAST);
+
+        lv_obj_set_grid_dsc_array(obj, dsc->cols.data(), dsc->rows.data());
+        lv_obj_add_event_cb(obj, GridDscFreeCb, LV_EVENT_DELETE, dsc);
+
+        cursor = 0;
+        row = 0;
+        cJSON_ArrayForEach(ch, children) {
+            int span = place_next(GetInt(ch, "span", 1), cursor, row, col_out, row_out);
+            lv_obj_t* cobj =
+                RenderNode(obj, ch, card, limits, depth + 1, node_count, err, FLOW_GRID, in_list_row);
+            if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
+            // col_align 镜像 ApplySizing column：growable/label/divider 铺满列(STRETCH)，
+            // 其余（icon/switch/qrcode…）及显式 w 靠列首(START)。row_align 竖向居中。
+            const char* ct = GetStr(ch, "type");
+            lv_grid_align_t col_align = LV_GRID_ALIGN_START;
+            if (!HasKey(ch, "w") && ct != nullptr &&
+                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
+                col_align = LV_GRID_ALIGN_STRETCH;
+            }
+            lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
+        }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
         if (const char* txt = GetStr(node, "text")) lv_label_set_text(obj, txt);
@@ -1097,7 +1181,9 @@ void CollectNodeIds(const cJSON* node, std::set<std::string>& ids) {
     if (const char* id = GetStr(node, "id")) ids.insert(id);
     const char* type = GetStr(node, "type");
     if (!type) return;
-    if (std::strcmp(type, "column") != 0 && std::strcmp(type, "row") != 0) return;
+    if (std::strcmp(type, "column") != 0 && std::strcmp(type, "row") != 0 &&
+        std::strcmp(type, "grid") != 0)
+        return;
     const cJSON* children = GetItem(node, "children");
     if (!children || !cJSON_IsArray(children)) return;
     const cJSON* child = nullptr;
@@ -1124,9 +1210,9 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
         err = "node missing type";
         return false;
     }
-    static const char* kTypes[] = {"column", "row",   "label", "button", "slider", "arc",
+    static const char* kTypes[] = {"column", "row",   "label", "button",  "slider", "arc",
                                    "switch", "bar",   "icon",  "divider", "spacer", "qrcode",
-                                   "choice", "list",  "chart", "stock_chart"};
+                                   "choice", "list",  "chart", "stock_chart", "grid"};
     bool known = false;
     for (auto* t : kTypes)
         if (std::strcmp(t, type) == 0) known = true;
@@ -1215,6 +1301,50 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
             }
         }
     }
+    if (std::strcmp(type, "grid") == 0) {
+        // 结构性错误直接拒绝（仿 choice）：cols 缺失/空/超 6/元素非法、子节点 span 越界。
+        const cJSON* cols = GetItem(node, "cols");
+        if (!cols || !cJSON_IsArray(cols)) {
+            err = "grid needs a \"cols\" array (1-6 track weights: positive int 1-20, or \"auto\")";
+            return false;
+        }
+        int ncol = cJSON_GetArraySize(cols);
+        if (ncol < 1 || ncol > 6) {
+            err = "grid cols must have 1 to 6 tracks";
+            return false;
+        }
+        const cJSON* cel = nullptr;
+        cJSON_ArrayForEach(cel, cols) {
+            if (cJSON_IsString(cel)) {
+                if (std::strcmp(cel->valuestring, "auto") != 0) {
+                    err = "grid cols string track must be \"auto\" (content-sized)";
+                    return false;
+                }
+            } else if (cJSON_IsNumber(cel)) {
+                if (cel->valueint < 1 || cel->valueint > 20) {
+                    err = "grid cols fr weight must be 1 to 20";
+                    return false;
+                }
+            } else {
+                err = "grid cols entries must be a positive int (fr weight) or \"auto\"";
+                return false;
+            }
+        }
+        const cJSON* gch = GetItem(node, "children");
+        if (gch && cJSON_IsArray(gch)) {
+            const cJSON* c = nullptr;
+            cJSON_ArrayForEach(c, gch) {
+                if (HasKey(c, "span")) {
+                    int span = GetInt(c, "span", 1);
+                    if (span < 1 || span > ncol) {
+                        err = "grid child span must be 1 to " + std::to_string(ncol) +
+                              " (number of cols)";
+                        return false;
+                    }
+                }
+            }
+        }
+    }
     // bind 路径必须已注册（或命中动态 provider 的合法模式）
     if (const char* path = GetStr(node, "bind")) {
         if (!DataHub::Instance().Has(path)) {
@@ -1253,8 +1383,9 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
     if (!ValidateActions(GetItem(node, "on_click"), node_ids, err, in_list_row)) return false;
     if (!ValidateActions(GetItem(node, "on_change"), node_ids, err, in_list_row)) return false;
     if (!ValidateActions(GetItem(node, "on_release"), node_ids, err, in_list_row)) return false;
-    // 递归子节点
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
+    // 递归子节点（column/row/grid 三种容器都有 children）
+    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0 ||
+        std::strcmp(type, "grid") == 0) {
         const cJSON* children = GetItem(node, "children");
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
@@ -1301,7 +1432,8 @@ int CountTemplateNodes(const cJSON* node) {
     if (!cJSON_IsObject(node)) return 0;
     int c = 1;
     const char* type = GetStr(node, "type");
-    if (type && (!std::strcmp(type, "column") || !std::strcmp(type, "row"))) {
+    if (type && (!std::strcmp(type, "column") || !std::strcmp(type, "row") ||
+                 !std::strcmp(type, "grid"))) {
         const cJSON* children = GetItem(node, "children");
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
@@ -1450,6 +1582,13 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
                                     "effect; give children an explicit w or drop grow.");
             }
         }
+        if (children != nullptr && cJSON_IsArray(children)) {
+            const cJSON* child = nullptr;
+            cJSON_ArrayForEach(child, children) LintWalk(child, depth + 1, data, st);
+        }
+    } else if (std::strcmp(type, "grid") == 0) {
+        // grid 无 justify/align，只需把子节点纳入 Lint 递归（口径与渲染/校验一致）。
+        const cJSON* children = GetItem(node, "children");
         if (children != nullptr && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) LintWalk(child, depth + 1, data, st);

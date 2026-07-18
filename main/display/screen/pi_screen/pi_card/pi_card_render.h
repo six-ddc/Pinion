@@ -3,9 +3,9 @@
 // ---------------------------------------------------------------------------
 // pi_card::Render —— JSON 节点树 → LVGL 控件树（遵循 pi_theme 双主题 + 自适应）
 //
-// type 白名单：column / row / label / button / slider / arc / switch / bar /
-// icon / divider / spacer / qrcode / choice / list / chart / stock_chart。配色
-// 一律走 pi_theme 令牌（tone/role），字体 puhui(中文)+pi_mono(数值)，图标经
+// type 白名单：column / row / grid / label / button / slider / arc / switch /
+// bar / icon / divider / spacer / qrcode / choice / list / chart / stock_chart。
+// 配色一律走 pi_theme 令牌（tone/role），字体 puhui(中文)+pi_mono(数值)，图标经
 // pi_card_icons 形状拼合。
 // 未知 type → 整卡失败（回滚已建部分）+ 可读错误串；未知字段静默忽略（前向
 // 兼容）。限额：≤64 节点、≤8 层。
@@ -44,7 +44,7 @@ void ChoiceSetValue(lv_obj_t* obj, int idx);
 bool ChoiceLabel(lv_obj_t* obj, std::string& out);
 
 // 递归渲染 node 到 parent 下。成功返回顶层控件；失败返回 nullptr 并写 err。
-// parent_flow: 父容器主轴（0=column/root, 1=row），用于自适应尺寸默认值。
+// parent_flow: 父容器主轴（0=column/root, 1=row, 2=grid），用于自适应尺寸默认值。
 // in_list_row: 本节点是否位于 list 的 item 模板重渲实例内——为真时不注册 id 进 card->nodes
 // （N 行实例 id 不唯一）。
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,

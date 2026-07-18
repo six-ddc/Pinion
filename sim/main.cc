@@ -38,6 +38,8 @@
 
 #include "cJSON.h"
 #include "IOExpander.hpp"
+#include "settings.h"  // P1 grid rehydrate 测试：直写 standby pin 封套
+#include "pi_theme.h"  // T1 主题往返测试：pi_theme::Set
 #include "media_player/media_player.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
@@ -435,12 +437,73 @@ constexpr const char* kCardAlign =
     "{\"type\":\"row\",\"align\":\"end\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
     "{\"type\":\"label\",\"role\":\"label\",\"text\":\"底对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]}]}}";
 
+// grid 验收卡（Commit 3）。全静态，可视验证行主序自动放置 + span + auto 轨道 + col_align 分派。
+// G1（idx22）：基础表格 cols[2,1,1] + 表头 section + divider span3 全宽 + 数据行。
+constexpr const char* kCardGridBasic =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"网格表格\"},"
+    "{\"type\":\"grid\",\"cols\":[2,1,1],\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"项目\"},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"今日\"},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"昨日\"},"
+    "{\"type\":\"divider\",\"span\":3},"
+    "{\"type\":\"label\",\"text\":\"温度\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"24\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"22\"},"
+    "{\"type\":\"label\",\"text\":\"湿度\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"60\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"55\"},"
+    "{\"type\":\"label\",\"text\":\"气压\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"1013\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"1009\"}]}]}}";
+// G2（idx23）：auto 轨道——首列按内容宽（LV_GRID_CONTENT），次列 fr:1 铺满。
+constexpr const char* kCardGridAuto =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"auto 轨道\"},"
+    "{\"type\":\"grid\",\"cols\":[\"auto\",1],\"gap\":10,\"children\":["
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"名称\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"Metalio Claw\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"固件\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"Claw6 v1\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"4G\"}]}]}}";
+// G3（idx24）：控件混排——icon/switch 靠列首(START)、slider/label 铺满(STRETCH)。
+constexpr const char* kCardGridCtl =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"控件混排\"},"
+    "{\"type\":\"grid\",\"cols\":[1,2],\"gap\":12,\"children\":["
+    "{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"value\":60},"
+    "{\"type\":\"icon\",\"icon\":\"sun\"},{\"type\":\"slider\",\"value\":40},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"开关\"},{\"type\":\"switch\",\"checked\":true}]}]}}";
+// G5（idx25）：超高 grid（根 grid，得卡面）——22 行溢出 overlay 86% 高封顶，触发
+// ReflowOverlay 固定高度 + 竖向滚动，验 grid 布局与 overlay 滚动兼容不裁不崩。
+constexpr const char* kCardGridTall =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"grid\",\"cols\":[1,1],\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"KEY\"},{\"type\":\"label\",\"role\":\"section\",\"text\":\"VAL\"},"
+    "{\"type\":\"label\",\"text\":\"行01\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v01\"},"
+    "{\"type\":\"label\",\"text\":\"行02\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v02\"},"
+    "{\"type\":\"label\",\"text\":\"行03\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v03\"},"
+    "{\"type\":\"label\",\"text\":\"行04\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v04\"},"
+    "{\"type\":\"label\",\"text\":\"行05\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v05\"},"
+    "{\"type\":\"label\",\"text\":\"行06\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v06\"},"
+    "{\"type\":\"label\",\"text\":\"行07\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v07\"},"
+    "{\"type\":\"label\",\"text\":\"行08\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v08\"},"
+    "{\"type\":\"label\",\"text\":\"行09\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v09\"},"
+    "{\"type\":\"label\",\"text\":\"行10\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v10\"},"
+    "{\"type\":\"label\",\"text\":\"行11\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v11\"},"
+    "{\"type\":\"label\",\"text\":\"行12\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v12\"},"
+    "{\"type\":\"label\",\"text\":\"行13\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v13\"},"
+    "{\"type\":\"label\",\"text\":\"行14\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v14\"},"
+    "{\"type\":\"label\",\"text\":\"行15\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v15\"},"
+    "{\"type\":\"label\",\"text\":\"行16\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v16\"},"
+    "{\"type\":\"label\",\"text\":\"行17\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v17\"},"
+    "{\"type\":\"label\",\"text\":\"行18\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v18\"},"
+    "{\"type\":\"label\",\"text\":\"行19\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v19\"},"
+    "{\"type\":\"label\",\"text\":\"行20\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v20\"},"
+    "{\"type\":\"label\",\"text\":\"行21\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v21\"},"
+    "{\"type\":\"label\",\"text\":\"行22\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v22\"}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
                                   kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
                                   kCardStockBind, kCardMediaCtl,  kCardStockChart, kCardStyleFam,
-                                  kCardJustify,  kCardAlign};
+                                  kCardJustify,  kCardAlign,      kCardGridBasic, kCardGridAuto,
+                                  kCardGridCtl,  kCardGridTall};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。
@@ -704,6 +767,50 @@ constexpr const char* kCardInvokeBad =
     "{\"root\":{\"type\":\"column\",\"children\":["
     "{\"type\":\"button\",\"text\":\"x\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"power.off\"}]}]}}";
 
+// Commit 3 E1 grid 负例（均应被 Validate 同步拒绝，is_error=true）。
+constexpr const char* kGridNoCols =
+    "{\"root\":{\"type\":\"grid\",\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
+constexpr const char* kGridEmptyCols =
+    "{\"root\":{\"type\":\"grid\",\"cols\":[],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
+constexpr const char* kGridSevenCols =
+    "{\"root\":{\"type\":\"grid\",\"cols\":[1,1,1,1,1,1,1],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
+constexpr const char* kGridBadElem =
+    "{\"root\":{\"type\":\"grid\",\"cols\":[1,-1,1],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
+constexpr const char* kGridSpanOver =
+    "{\"root\":{\"type\":\"grid\",\"cols\":[2,1],\"children\":["
+    "{\"type\":\"label\",\"text\":\"x\",\"span\":3}]}}";
+// 正例：column justify 未知值 "middle" → 不拒绝、回落默认、hints 含回落提示。
+constexpr const char* kGridJustifyFallback =
+    "{\"root\":{\"type\":\"column\",\"justify\":\"middle\",\"children\":["
+    "{\"type\":\"label\",\"text\":\"x\"}]}}";
+
+// 撑爆 64 节点预算：grid cols[1] + 70 个 label cell（1 grid + 70 = 71 > 64）→ 应被拒。
+std::string BuildGridOverflow() {
+    std::string s = "{\"root\":{\"type\":\"grid\",\"cols\":[1],\"children\":[";
+    for (int i = 0; i < 70; i++) {
+        if (i) s += ",";
+        s += "{\"type\":\"label\",\"text\":\"n\"}";
+    }
+    s += "]}}";
+    return s;
+}
+
+// 正例断言：期望 is_error=false 且 hints 含指定子串（回落提示）。
+void RenderExpectOkWithHint(const char* spec, const char* tag, const char* want_hint) {
+    cJSON* args = cJSON_Parse(spec);
+    if (!args) {
+        std::fprintf(stderr, "[sim] %s JSON parse failed\n", tag);
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    const bool has_hint = res && std::strstr(res, want_hint) != nullptr;
+    std::fprintf(stderr, "[sim][positive] %-14s -> %s (%s, hint %s)\n", tag, res ? res : "(null)",
+                 is_err ? "竟被拒 ✗" : "通过 ✓", has_hint ? "含回落 ✓" : "缺回落 ✗");
+    free(res);
+    cJSON_Delete(args);
+}
+
 // TEMP SCAFFOLD（消息流「贴底跟随」验证）：往 chat feed 里追加一张普通卡片（非 overlay）。
 // 每追加一张都会走 CardEndRow → ScrollFeedToBottom(false)——即模型侧输出的那条跟随分支，
 // 于是不必真的调 LLM 就能验证「用户翻上去后新输出不抢视口」。
@@ -880,6 +987,51 @@ void ExecDataOp(const std::string& op) {
                  is_err ? "ERROR" : "ok");
     free(res);
     cJSON_Delete(args);
+}
+
+// Commit 3 G4：list 行模板 = grid（固定 id "gridlist"），验模板记账 + 重渲 GridDsc 无泄漏。
+constexpr const char* kCardGridList =
+    "{\"card\":\"gridlist\",\"display\":\"overlay\",\"data\":{\"rows\":["
+    "{\"k\":\"甲\",\"v\":\"1\"},{\"k\":\"乙\",\"v\":\"2\"}]},"
+    "\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"list-of-grid\"},"
+    "{\"type\":\"list\",\"bind_data\":\"rows\",\"max\":8,\"item\":{\"type\":\"grid\",\"cols\":[1,1],"
+    "\"children\":[{\"type\":\"label\",\"text\":\"{item.k}\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"{item.v}\"}]}}]}}";
+
+// 渲染 gridlist 后跑 N 轮 {append,remove} ui_update（每轮触发 list 重渲 = 删旧 grid 行 +
+// 建新 grid 行）。GridDsc 净值应保持有界（≈当前行数），绝不随轮次单调增长——[griddsc]
+// 日志给出 alloc/free 净值证据。
+void ExecG4Leak(int rounds) {
+    cJSON* rc = cJSON_Parse(kCardGridList);
+    bool is_err = false;
+    char* r0 = pi_card_tool_render(rc, &is_err);
+    std::fprintf(stderr, "[sim] g4leak render -> %s (%s)\n", r0 ? r0 : "(null)", is_err ? "ERR" : "ok");
+    free(r0);
+    cJSON_Delete(rc);
+    for (int i = 0; i < rounds; i++) {
+        for (const char* op : {"append", "remove"}) {
+            cJSON* args = cJSON_CreateObject();
+            cJSON_AddStringToObject(args, "card", "gridlist");
+            cJSON* data = cJSON_AddObjectToObject(args, "data");
+            if (std::strcmp(op, "append") == 0) {
+                cJSON* ap = cJSON_AddObjectToObject(data, "append");
+                cJSON_AddStringToObject(ap, "key", "rows");
+                cJSON* item = cJSON_AddObjectToObject(ap, "item");
+                cJSON_AddStringToObject(item, "k", "丙");
+                cJSON_AddStringToObject(item, "v", "9");
+            } else {
+                cJSON* rm = cJSON_AddObjectToObject(data, "remove");
+                cJSON_AddStringToObject(rm, "key", "rows");
+                cJSON_AddNumberToObject(rm, "index", 0);
+            }
+            bool e = false;
+            char* res = pi_card_tool_update(args, &e);
+            free(res);
+            cJSON_Delete(args);
+        }
+    }
+    std::fprintf(stderr, "[sim] g4leak done: %d rounds of {append,remove}\n", rounds);
 }
 
 // TEMP SCAFFOLD（Phase2 T8）：走真实 ui_update 的 data.set，改 "datalabel" 卡的 status 值。
@@ -1308,6 +1460,38 @@ void ExecCmd(const std::string& line) {
         // Phase3：chart bind_history 非历史路径 / invoke 未注册命令，均应同步被拒（D12/D16）。
         RenderBadCard(kCardChartBadHistory, "chart绑非history路径");
         RenderBadCard(kCardInvokeBad, "invoke未注册cmd");
+        // Commit 3 E1：grid 结构性负例（cols 缺失/空/7列/元素-1/span越界/撑爆64节点）全应拒；
+        // column justify 未知值走回落正例（不拒 + hints 含回落提示）。
+        RenderBadCard(kGridNoCols, "grid缺cols");
+        RenderBadCard(kGridEmptyCols, "grid空cols");
+        RenderBadCard(kGridSevenCols, "grid7列");
+        RenderBadCard(kGridBadElem, "grid元素-1");
+        RenderBadCard(kGridSpanOver, "grid span越界");
+        RenderBadCard(BuildGridOverflow().c_str(), "grid撑爆64");
+        RenderExpectOkWithHint(kGridJustifyFallback, "justify middle",
+                               "is not a recognized value");
+    } else if (cmd == "p1grid") {  // Commit 3 P1: standby grid pin persists → RehydratePin re-renders
+        // 直写一张 standby grid 卡的 pin 封套到 NVS（模拟上次会话已持久化），再调
+        // RehydratePin（模拟重启回灌）：grid 应 Validate 通过并重渲，不被 discard/erase。
+        const char* env =
+            "{\"v\":1,\"root\":{\"type\":\"grid\",\"cols\":[1,1],\"gap\":6,\"children\":["
+            "{\"type\":\"label\",\"role\":\"section\",\"text\":\"CPU\"},"
+            "{\"type\":\"label\",\"role\":\"value\",\"text\":\"42%\"},"
+            "{\"type\":\"label\",\"role\":\"section\",\"text\":\"MEM\"},"
+            "{\"type\":\"label\",\"role\":\"value\",\"text\":\"61%\"}]}}";
+        Settings("ui", true).SetString("pin", env);
+        std::fprintf(stderr, "[sim] p1grid: wrote standby-grid pin envelope to NVS\n");
+        pi_card::RehydratePin();  // 读 NVS + Validate + OnRenderEvent（drain 下一拍渲染）
+        Settings ui_ro("ui", false);
+        const bool kept = !ui_ro.GetString("pin", "").empty();
+        std::fprintf(stderr, "[sim] p1grid: after RehydratePin pin-in-NVS=%s (kept=Validate通过未被erase)\n",
+                     kept ? "true ✓" : "false ✗");
+    } else if (cmd == "g4leak") {  // Commit 3 G4: list-of-grid, N rounds ui_update, GridDsc leak check
+        int n = 20;
+        std::string rest;
+        std::getline(ss, rest);
+        if (!rest.empty()) n = std::atoi(rest.c_str());
+        ExecG4Leak(n);
     } else if (cmd == "standby") {  // Phase3: render the standby pin-widget demo card
         RenderStandbyCard();
     } else if (cmd == "standbybig") {  // Phase3 D8: oversized standby envelope (>3072B) rejection
@@ -1454,6 +1638,18 @@ void Pump() {
     if (card_ms > 0 && !card_done && now > card_ms) {
         card_done = true;
         RenderDemoCard();
+    }
+
+    // T1：到点做一次主题往返（深→浅→深）。几何走共享 lv_style_t（无色）故不受影响；
+    // 往返后应与从未切换的深色截图逐像素一致——证 pi_theme::Set 只改色、不动几何。
+    static const uint32_t theme_swap_ms = EnvMs("PI_SIM_THEME_SWAP_MS");
+    static bool theme_swapped = false;
+    if (theme_swap_ms > 0 && !theme_swapped && now > theme_swap_ms) {
+        theme_swapped = true;
+        lv_lock();
+        pi_theme::Set(true);   // → 浅色
+        pi_theme::Set(false);  // → 回深色（往返）
+        lv_unlock();
     }
 
     // Stage A 媒体管线无头测试钩子：PI_SIM_MEDIA_FILE / PI_SIM_MEDIA_URL 启动即

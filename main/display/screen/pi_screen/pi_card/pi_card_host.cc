@@ -674,15 +674,16 @@ void RehydratePin() {
 // ---------------------------------------------------------------------------
 namespace {
 
-// 收集 spec 树里所有 bind 路径。递归口径与渲染器/校验器一致：只有 column/row 的 children
-// 会被渲染，别去收集一棵永远不会存在的子树。
+// 收集 spec 树里所有 bind 路径。递归口径与渲染器/校验器一致：只有 column/row/grid 的
+// children 会被渲染，别去收集一棵永远不会存在的子树。
 void CollectBindPaths(const cJSON* node, std::set<std::string>& paths) {
     if (!cJSON_IsObject(node)) return;
     const cJSON* b = cJSON_GetObjectItem(node, "bind");
     if (cJSON_IsString(b)) paths.insert(b->valuestring);
     const cJSON* type = cJSON_GetObjectItem(node, "type");
     if (!cJSON_IsString(type)) return;
-    if (std::strcmp(type->valuestring, "column") != 0 && std::strcmp(type->valuestring, "row") != 0) {
+    if (std::strcmp(type->valuestring, "column") != 0 && std::strcmp(type->valuestring, "row") != 0 &&
+        std::strcmp(type->valuestring, "grid") != 0) {
         return;
     }
     const cJSON* children = cJSON_GetObjectItem(node, "children");
@@ -1241,10 +1242,10 @@ extern "C" const char* pi_card_system_prompt(void) {
         "Exactly ONE primary (amber) button -- theme already paints slider/arc fill, on-switch and "
         "selected choice amber, don't also color text amber (keep tx/dim). Use semantic tone/fill "
         "tokens (accent/ok/err/tx/dim/...), not raw hex.\n\n"
-        "COMPACT -- small window, dense beats tall. Lay data as multi-column table rows (one "
-        "row/record, one label/field, grow:1 on EVERY label so columns align), 2-4 columns/row. "
-        "Never one fact per line, never dump prose -- labels 1-3 words, value right of label, clamp "
-        "lists with max.\n\n"
+        "COMPACT -- small window, dense beats tall. Lay data in a grid: cols=column ratios (e.g. "
+        "[2,1,1], or \"auto\"), one cell/field row-major so columns align (no grow tricks); 2-4 "
+        "cols, role:section headers, full-width rule = divider span=<#cols>. Never one fact/line, "
+        "never dump prose -- labels 1-3 words, value cell right of label, clamp lists with max.\n\n"
         "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
         "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
         "generate new content or a NEW decision -- full round-trip, shows as a user message; never "

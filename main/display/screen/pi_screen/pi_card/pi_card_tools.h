@@ -55,8 +55,9 @@ const char *pi_card_system_prompt(void);
     "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = current value of every "  \
     "hardware path this card binds (this IS your device read); hints = non-blocking design tips. "   \
     "On invalid input returns an error to fix and retry; overlays auto-close (ttl_ms) and are "      \
-    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?,justify?,align?}; label{text?,"    \
-    "role?,bind?,fmt?,"                                                                               \
+    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?,justify?,align?}; "                \
+    "grid{cols:[1-6 fr-weights 1-20 or \"auto\"],children:[cells row-major],gap?} (cell span:N "      \
+    "crosses N cols; aligned tables, no coords); label{text?,role?,bind?,fmt?,"                       \
     "bind_data?}; button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
     "on_release?}; arc{…like slider} (round dial); switch{checked,bind?,id?,on_change?}; "            \
     "bar{min,max,value,bind?}; choice{options:[2-6],value?,id?,bind?,on_change?} (segmented picker; " \
@@ -89,7 +90,8 @@ const char *pi_card_system_prompt(void);
     "shapes: see system prompt. Icons: Lucide names (wifi|battery|play|sun|cloud-rain|map-pin|"       \
     "trending-up|check|x…); unknown name → dot. "                                                     \
     "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
-    "Table-style columns: see COMPACT rule in system prompt — grow:1 on every row label."
+    "Table data: a grid (cols=ratios, one cell/field row-major, role:section headers) aligns "        \
+    "columns without grow tricks."
 
 #define PI_CARD_RENDER_SCHEMA \
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
@@ -99,9 +101,9 @@ const char *pi_card_system_prompt(void);
     "et\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"},\"cmd\":{\"type\":\"string\"}},\"req" \
     "uired\":[\"do\"]},\"node\":{\"t" \
     "ype\":" \
-    "\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"column\",\"row\",\"label\"," \
-    "\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"spacer\",\"qrcode\",\"ch" \
-    "oice\",\"list\",\"chart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\"" \
+    "\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"column\",\"row\",\"grid\"," \
+    "\"label\",\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"spacer\",\"qr" \
+    "code\",\"choice\",\"list\",\"chart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\"" \
     ":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"min\",\"5d\",\"day\",\"week\"]},\"children\":{\"type" \
     "\":\"array\",\"items\":{\"$ref\":\"#/$defs/node\"}},\"text\":{\"type\":\"string\"},\"role\":{\"t" \
     "ype\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"heading\",\"label\",\"" \
@@ -119,7 +121,9 @@ const char *pi_card_system_prompt(void);
     "{\"type\":\"boolean\"},\"gap\":{\"type\":\"number\"},\"pad\":{\"type\":\"number\"},\"w\":{\"type" \
     "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"justify\":{\"type\":" \
     "\"string\",\"enum\":[\"start\",\"center\",\"end\",\"between\",\"around\",\"evenly\"]},\"align\":{" \
-    "\"type\":\"string\",\"enum\":[\"start\",\"center\",\"end\"]},\"hidden\":{\"type\":" \
+    "\"type\":\"string\",\"enum\":[\"start\",\"center\",\"end\"]},\"cols\":{\"type\":\"array\",\"item" \
+    "s\":{\"type\":[\"integer\",\"string\"]},\"minItems\":1,\"maxItems\":6},\"span\":{\"type\":\"inte" \
+    "ger\"},\"hidden\":{\"type\":" \
     "\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_chan" \
     "ge\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\":\"arr" \
     "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}}},\"properties\":{\"root" \
