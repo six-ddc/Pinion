@@ -119,6 +119,11 @@ class DataHub {
     // subject，绑定控件经 observer 自动更新。StartLiveRefresh 幂等建进程级 lv_timer。
     void StartLiveRefresh();
 
+    // 息屏门控（pi_sleep Off 态，LVGL 线程）：暂停期间 PublishLive 跳过活性 Seed——屏全黑
+    // 时刷 subject 只是白费 set_text/invalidate/DSI 帧。keep_history 采样不受影响（待机
+    // chart 的"过去"不能有洞）。取消暂停时立即补种全部活跃只读绑定，亮屏第一帧即新值。
+    void SetLivePaused(bool paused);
+
     // ---- Phase4：动态路径 provider（stock.<symbol>.<field> 行情绑定）----
     // 与静态路径的根本差异：路径集合无法预注册（symbol 是开放集），值是异步拉取的推模型
     // （无同步 getter）。为不破坏「entries_ 在 Register 后只读 → worker 线程无锁查询」的
@@ -186,7 +191,8 @@ class DataHub {
 
     const Entry* Find(const std::string& path) const;
     Entry* Find(const std::string& path);
-    void Seed(Entry* e);  // 读 getter 写 subject（LVGL 线程）
+    void Seed(Entry* e);                              // 读 getter 写 subject（LVGL 线程）
+    void SeedValue(Entry* e, const HubValue& v);      // 已有读数写 subject（活性/历史共用一次 getter）
     void PublishLive();   // 1Hz 定时器回调：只读且有绑定的路径重跑 getter → Seed
     const DynProvider* MatchProvider(const std::string& path, size_t* out_idx) const;
 
@@ -196,6 +202,7 @@ class DataHub {
     std::vector<DynProvider> providers_;
     std::map<std::string, DynEntry> dyn_entries_;
     bool inited_ = false;
+    bool live_paused_ = false;   // 息屏 Off 态：true 时 PublishLive 只采历史不 Seed（见 SetLivePaused）
     int active_live_count_ = 0;  // 当前 refcount>0 && !setter 的路径数，==0 时 PublishLive 早退
     int history_count_ = 0;      // 当前 keep_history 路径数，两者都为 0 时 PublishLive 早退
 

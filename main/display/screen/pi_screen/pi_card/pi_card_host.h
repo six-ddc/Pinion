@@ -100,6 +100,16 @@ void ReflowOverlay(UiCard* card);
 // 息屏门控：有 overlay 卡片开着时不进息屏（同 quick_panel 语义）。
 bool HasOpenOverlay();
 
+// 息屏 Off 态门控（pi_sleep 的 on_off 钩子调，LVGL 线程）：off=true 暂停 DataHub 活性
+// 刷新与 stock 行情拉取——屏全黑还在刷 subject/拉网络纯属浪费电；keep_history 采样与
+// 在途结果落地不受影响。off=false 立即补种/补拉，亮屏第一帧即新值。幂等。
+void SetScreenOff(bool off);
+
+// 可见性反查（LVGL 线程）：是否存在「当前可见」（lv_obj_is_visible——含滚出视口、藏在
+// 非活跃视图的判定）的卡绑定了以 prefix 开头的 DataHub 路径。stock 的 bind 订阅（背后是
+// 周期网络拉取）按它对不可见卡停拉。卡数是个位数量级，逐卡线性扫即可。
+bool AnyVisibleCardBindsPrefix(const std::string& prefix);
+
 // ---- Phase3：常驻小组件（display:'standby'，单槽，固定 id "pin"）----
 // Create() 末尾调（pi_card::Init + DataHub 注册 + pin host 建好之后，Go(Idle) 之后、drain
 // timer 建立前）：读 NVS "ui"/"pin"，解析失败/版本不符/Validate 失败一律 EraseKey 静默丢弃，

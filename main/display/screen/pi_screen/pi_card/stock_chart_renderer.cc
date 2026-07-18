@@ -222,4 +222,43 @@ void Render(const Target& t, const ChartSeries& s) {
     lv_obj_invalidate(t.canvas);
 }
 
+Hit HitTest(const ChartSeries& s, int w, int h, int rel_x) {
+    Hit r;
+    if (!s.valid || s.count == 0 || w <= 1 || h <= 0) return r;
+    if (rel_x < 0) rel_x = 0;
+    if (rel_x > w - 1) rel_x = w - 1;
+    // 折线两种（分时/5日 与 >60 根退化折线）共用 XOverSlots 的逆映射：最近邻取整。
+    auto line_idx = [&](int total) {
+        if (total <= 1) return 0;
+        int idx = (rel_x * (total - 1) + (w - 1) / 2) / (w - 1);
+        if (idx >= static_cast<int>(s.count)) idx = static_cast<int>(s.count) - 1;
+        return idx < 0 ? 0 : idx;
+    };
+    if (s.has_ref && s.last_close > 0) {  // 分时 / 5 日
+        MinuteYRange R = computeMinuteYRange(s.points, s.count, s.last_close);
+        int total = TotalSlots(s);
+        int idx = line_idx(total);
+        r.idx = static_cast<size_t>(idx);
+        r.x = XOverSlots(idx, total, w);
+        r.y = priceToChartY(s.points[idx], R.yMin, R.yMax, h);
+        r.valid = true;
+        return r;
+    }
+    KlineYRange R = computeKlineYRange(s.lows, s.highs, s.count);
+    if (s.count <= kBarRenderThreshold) {  // 蜡烛：与渲染共用 KlineLayout，钉在影线 x 上
+        KlineLayout L = computeKlineLayout(s.count, w);
+        int idx = klineHoverIdx(rel_x, L, s.count);
+        r.idx = static_cast<size_t>(idx);
+        r.x = L.startWickX + idx * L.slotW;
+        r.y = priceToChartY(s.points[idx], R.yMin, R.yMax, h);
+    } else {  // >60 根退化折线
+        int idx = line_idx(static_cast<int>(s.count));
+        r.idx = static_cast<size_t>(idx);
+        r.x = XOverSlots(idx, static_cast<int>(s.count), w);
+        r.y = priceToChartY(s.points[idx], R.yMin, R.yMax, h);
+    }
+    r.valid = true;
+    return r;
+}
+
 }  // namespace stock_chart_renderer

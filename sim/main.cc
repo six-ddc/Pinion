@@ -365,11 +365,18 @@ constexpr const char* kCardMediaCtl =
     "\"{item.title}\",\"on_click\":[{\"do\":\"set\",\"path\":\"media.play_index\",\"value\":"
     "\"{i}\"}]}}]}}";
 
+// stock_chart 控件验收卡（idx 18）：真网拉行情；验周期分段按钮 + 图面按住十字线取值。
+// w 520 收进 overlay wrapper（80% 屏宽 - 卡片 pad）不裁边；不给 h——节点 h 会被通用
+// ApplySizing 打在控件根上把脚部裁掉（canvas 高度用默认 260 即可）。
+constexpr const char* kCardStockChart =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
+    "{\"type\":\"stock_chart\",\"symbol\":\"sh600519\",\"name\":\"贵州茅台\",\"w\":520}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
                                   kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
-                                  kCardStockBind, kCardMediaCtl};
+                                  kCardStockBind, kCardMediaCtl,  kCardStockChart};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。
@@ -663,6 +670,33 @@ void RenderFormCard() {
     bool is_err = false;
     char* res = pi_card_tool_render(args, &is_err);
     std::fprintf(stderr, "[sim] formcard render: %s (%s)\n", res ? res : "(null)", is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD（按钮 icon 支持验收）：三个纯图标播控钮 + icon+text 并存钮 +
+// 两个负例（生造图标名 / 空白按钮）——正例看渲染，负例看 hints 是否当场纠正。
+void RenderIconButtonCard() {
+    static const char* kSpec =
+        "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":8,\"children\":["
+        "{\"type\":\"label\",\"role\":\"title\",\"text\":\"图标按钮验证\"},"
+        "{\"type\":\"row\",\"gap\":8,\"children\":["
+        "{\"type\":\"button\",\"icon\":\"skip-back\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.prev\"}]},"
+        "{\"type\":\"button\",\"icon\":\"play\",\"variant\":\"primary\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.toggle\"}]},"
+        "{\"type\":\"button\",\"icon\":\"skip-forward\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.next\"}]}]},"
+        "{\"type\":\"row\",\"gap\":8,\"children\":["
+        "{\"type\":\"button\",\"icon\":\"list-music\",\"text\":\"列表\",\"variant\":\"ghost\"},"
+        "{\"type\":\"button\",\"icon\":\"totally-made-up\",\"text\":\"坏名\"},"
+        "{\"type\":\"button\"}]}]}}";
+    cJSON* args = cJSON_Parse(kSpec);
+    if (!args) {
+        std::fprintf(stderr, "[sim] iconcard JSON parse failed\n");
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    std::fprintf(stderr, "[sim] iconcard render: %s (%s)\n", res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
     free(res);
     cJSON_Delete(args);
 }
@@ -1192,6 +1226,8 @@ void ExecCmd(const std::string& line) {
         std::string tag;
         ss >> tag;
         DumpFeedGeom(tag.empty() ? "-" : tag.c_str());
+    } else if (cmd == "iconcard") {  // TEMP SCAFFOLD: 按钮 icon 支持 + 负例 hints 验收卡
+        RenderIconButtonCard();
     } else if (cmd == "formcard") {  // TEMP SCAFFOLD: render the report-snapshot / toggle test card
         RenderFormCard();
     } else if (cmd == "badcards") {  // TEMP SCAFFOLD: validator negative cases (bad/missing target)

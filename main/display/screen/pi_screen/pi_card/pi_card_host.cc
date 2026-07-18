@@ -234,6 +234,21 @@ void SetFeedHooks(const FeedHooks& hooks) { s_feed = hooks; }
 
 bool HasOpenOverlay() { return s_overlay_count > 0; }
 
+void SetScreenOff(bool off) {
+    DataHub::Instance().SetLivePaused(off);
+    pi_card_stock::SetScreenOff(off);
+}
+
+bool AnyVisibleCardBindsPrefix(const std::string& prefix) {
+    for (const auto& [id, card] : s_cards) {
+        if (card->root == nullptr || !lv_obj_is_visible(card->root)) continue;
+        for (const std::string& p : card->hub_paths) {
+            if (p.compare(0, prefix.size(), prefix) == 0) return true;
+        }
+    }
+    return false;
+}
+
 // overlay 高度稳定器——量出自然高度后二选一：矮于封顶就跟手收缩（SIZE_CONTENT，不滚动），
 // 高于封顶就钉死为固定高度 + 内部竖向滚动。
 //

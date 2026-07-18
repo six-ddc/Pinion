@@ -56,15 +56,16 @@ const char *pi_card_system_prompt(void);
     "hardware path this card binds (this IS your device read); hints = non-blocking design tips. "   \
     "On invalid input returns an error to fix and retry; overlays auto-close (ttl_ms) and are "      \
     "capped. Node={\"type\":…}. Types: column|row{children:[],gap?}; label{text?,role?,bind?,fmt?,"  \
-    "bind_data?}; button{text,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
+    "bind_data?}; button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
     "on_release?}; arc{…like slider} (round dial); switch{checked,bind?,id?,on_change?}; "            \
     "bar{min,max,value,bind?}; choice{options:[2-6],value?,id?,bind?,on_change?} (segmented picker; " \
     "value=selected index; reports index and label); list{bind_data:'key',item:<node>,max?,empty?} " \
     "(repeats item once per element of data[key]; inside item strings use {i}=0-based index, "       \
     "{n}=1-based, {item.FIELD}=that record's field; row actions may be report/set/close only, not "  \
     "toggle/patch); chart{bind_history:'path',points?,w?,h?} (LINE chart of a history-enabled "      \
-    "path); stock_chart{symbol,name?,mode?} (live CN/HK/US stock chart, self-refreshing, tap "        \
-    "cycles timeframe; symbol from the stock tool; mode enum in schema); "                            \
+    "path); stock_chart{symbol,name?,mode?} (live CN/HK/US stock chart, self-refreshing, on-card "    \
+    "timeframe buttons, touch-and-hold inspects points; symbol from the stock tool; mode enum in "    \
+    "schema); "                                                                                       \
     "qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "               \
     "eyebrow|kicker|section|title|heading|label|value|caption. variant (button): primary(the ONE "   \
     "amber CTA)|ghost|plain|default. Common props: id,w,h,grow,pad,gap,size,mono,tone,fill,color,bg," \

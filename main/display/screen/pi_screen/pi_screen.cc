@@ -31,6 +31,7 @@
 #include "metalio_hal/power.h"
 #include "metalio_hal/storage.h"
 #include "metalio_hal/sysmon.h"
+#include "media_player/media_player.h"  // 熄屏门控只读查询 MediaController 播放态（不调用任何变更态 API）
 #include "pi_fonts.h"
 #include "pi_media_focus.h"
 #include "pi_net_events.h"
@@ -3217,6 +3218,9 @@ void OnScreenUnloaded(lv_event_t*) {
     pi_agent_task_abort();  // 也会异步打断 TTS 播报
     if (s_voice_q != nullptr) VoiceSend(VoiceCmd::Cancel);  // 停采集/ASR 会话
     pi_sleep::OnScreenUnloaded();  // 恢复亮度/删 tick（在删 burnin timer 之前跑钩子无碍）
+    // pi_sleep 卸载时直接回 Awake、不回调 on_off(false)——这里显式复位息屏门控，否则
+    // Off 态卸载会让 DataHub/stock 的暂停态泄漏进下一次 Create（进程级单例，不随屏销毁）。
+    pi_card::SetScreenOff(false);
     if (s_net_listener_id >= 0) {
         pi_net_events::RemoveListener(s_net_listener_id);
         s_net_listener_id = -1;
@@ -3256,6 +3260,7 @@ void OnScreenUnloaded(lv_event_t*) {
     while (xQueueReceive(pi_ui_queue(), &evt, 0) == pdTRUE) {
         if (evt.s1 != nullptr) free(evt.s1);
         if (evt.s2 != nullptr) free(evt.s2);
+        if (evt.s3 != nullptr) free(evt.s3);  // 卡片事件的 data/props JSON，漏了就泄
     }
 
     s_scr = s_idle_view = s_listen_view = s_chat_view = s_ptt_layer = nullptr;
@@ -3460,8 +3465,19 @@ lv_obj_t* PiScreen::Create() {
     // 挂在 screen 最后，OFF 进入时再 move_foreground 保证压过一切浮层。
     pi_sleep::Hooks sl_hooks;
     sl_hooks.is_gated = []() {
-        return s_agent_busy ||                                                       // 生成中
-               !mhal::audio_pipeline::IsPlaybackIdle() ||                            // TTS 播报中
+        // 播放队列非空（!IsPlaybackIdle）有两种成因：媒体（音乐/电台）在播，或 TTS 在
+        // 播报——二者共用同一条 FeedPlayback 队列，仅凭队列忙无法区分。只应对后者门控
+        // （TTS 短播报挡熄屏合理；音乐/电台长播不应该常亮整晚）。用 MediaController
+        // 状态快照（media::MediaController::Instance().state()，只读，不触发任何
+        // Suspend/Resume）区分：媒体正在 Playing ⇒ 声音来自媒体，不门控；媒体非
+        // Playing（Stopped/Paused/Loading/Error）⇒ 声音只能来自 TTS，门控。
+        // 安全性：pi_media_focus.cc 保证 TTS 出声前必先 SuspendForSpeech() 把 media
+        // 拨到 Paused，因此"队列忙且 media 正在 Playing"与"队列忙且是 TTS"两种情形
+        // 互斥，不会漏判 TTS 也不会误判媒体。
+        const bool queue_busy = !mhal::audio_pipeline::IsPlaybackIdle();
+        const bool media_playing = media::MediaController::Instance().state() == media::MediaState::Playing;
+        return s_agent_busy ||                          // 生成中
+               (queue_busy && !media_playing) ||         // TTS 播报中（队列忙但不是媒体在放）
                pi_quick_panel::IsOpen() || pi_settings::IsOpen() || pi_media::IsOpen() ||
                s_sheet_open || s_confirm_sheet_open ||  // 浮层
                pi_card::HasOpenOverlay() ||                                          // 卡片浮层
@@ -3470,6 +3486,8 @@ lv_obj_t* PiScreen::Create() {
     sl_hooks.on_dim = [](bool dim) { ApplySleepDimVisual(dim); };
     sl_hooks.on_off = [](bool off) {
         ApplySleepOffVisual(off);
+        // 屏全黑：停 DataHub 活性刷新与 stock 行情拉取（历史采样照旧）；亮屏立即补种/补拉。
+        pi_card::SetScreenOff(off);
         // 真正休眠了才回待机：屏已全黑，此时切回 Idle 不打断任何阅读，醒来是
         // 干净的时钟主界面（会话仍保留，右滑/继续对话可回到 Chat）。亮屏期间
         // 绝不强制回主界面——这正是"啥也没干却跳回主界面"的根治。

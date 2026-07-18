@@ -99,7 +99,10 @@ bool DataHub::RangeOf(const std::string& path, int& lo, int& hi) const {
 
 void DataHub::Seed(Entry* e) {
     if (!e->getter) return;
-    HubValue v = e->getter();
+    SeedValue(e, e->getter());
+}
+
+void DataHub::SeedValue(Entry* e, const HubValue& v) {
     switch (e->type) {
         case HubType::Int:
             // 硬件读回来的种子也钳一遍——防越界快照污染绑定控件的初值。
@@ -342,11 +345,13 @@ std::vector<DataHub::PathMeta> DataHub::ListPaths() const {
 void DataHub::PublishLive() {
     if (active_live_count_ == 0 && history_count_ == 0) return;  // 无活跃只读绑定亦无历史路径，早退
     for (auto& [path, e] : entries_) {
-        if (e.refcount > 0 && !e.setter && e.getter) {
-            Seed(&e);
-        }
-        if (e.keep_history && e.getter) {
-            HubValue v = e.getter();
+        // 活性刷新与历史采样共用同一次 getter 读数；息屏（live_paused_）只停活性 Seed，
+        // 历史照采（否则待机 chart 的曲线在息屏时段有洞）。
+        const bool live = !live_paused_ && e.refcount > 0 && !e.setter;
+        if ((!live && !e.keep_history) || !e.getter) continue;
+        HubValue v = e.getter();
+        if (live) SeedValue(&e, v);
+        if (e.keep_history) {
             int iv = 0;
             if (const auto* i = std::get_if<int>(&v)) {
                 iv = *i;
@@ -362,6 +367,16 @@ void DataHub::PublishLive() {
                 if (sink.path == path && sink.cb) sink.cb(iv);
             }
         }
+    }
+}
+
+void DataHub::SetLivePaused(bool paused) {
+    if (live_paused_ == paused) return;
+    live_paused_ = paused;
+    if (paused || active_live_count_ == 0) return;
+    // 亮屏补种：立即重读全部活跃只读绑定，不等下个 1Hz tick——用户睁眼看到的就是新值。
+    for (auto& [path, e] : entries_) {
+        if (e.refcount > 0 && !e.setter) Seed(&e);
     }
 }
 

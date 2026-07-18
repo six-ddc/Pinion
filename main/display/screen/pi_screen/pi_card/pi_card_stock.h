@@ -9,7 +9,8 @@
 //   - 排空 stock_fetch_worker 结果队列，按控件 session 匹配应用（不匹配即释放）；
 //   - 按 StockFetchScheduler 自适应节奏入队报价/图表抓取（盘中密、闭市疏，
 //     market_hours.h 本地推算盘中）；控件不可见（滚出视口/屏卸载）跳过；
-//   - 点击图表循环切换 分时→五日→日K→周K（bump session 作废在途结果）。
+//   - 周期切换走脚部分段按钮（分时|五日|日K|周K，bump session 作废在途结果）；
+//     图面按住/拖动显示十字线 + 该点数值气泡（时间/价格/涨跌幅），二者互不冲突。
 // 生命周期：LV_EVENT_DELETE 出注册表 + 释放 canvas 缓冲；全部控件删光后 timer
 // 暂停。主题切换经 pi_theme::AddListener 全量重绘。
 // ---------------------------------------------------------------------------
@@ -41,5 +42,10 @@ void RegisterBindProvider();
 
 // ui_render DESC 用的动态路径说明片段（常驻指针；字段清单与 provider 同源）。
 const char* BindPathsDesc();
+
+// 息屏门控（pi_card::SetScreenOff 分发，LVGL 线程）：off=true 停排一切新抓取（控件与
+// bind 订阅；在途结果照常落地），off=false 立即补一轮调度。背光归零不影响
+// lv_obj_is_visible，故必须由睡眠状态机显式告知，控件可见性判定拦不住息屏拉取。
+void SetScreenOff(bool off);
 
 }  // namespace pi_card_stock

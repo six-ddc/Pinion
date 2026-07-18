@@ -36,6 +36,17 @@ void Render(const Target& t, const ChartSeries& s);
 // 清空（无数据/切换模式时）。
 void Clear(const Target& t);
 
+// 触摸命中：canvas 内相对 x → 最近数据点的下标与其画面坐标 (x,y)。几何换算与
+// Render 完全同源（TotalSlots/XOverSlots/KlineLayout），保证十字线钉在画线处。
+// 供控件的「按住看数值」交互用；series 无效/空返回 valid=false。
+struct Hit {
+    size_t idx = 0;
+    int x = 0;
+    int y = 0;
+    bool valid = false;
+};
+Hit HitTest(const ChartSeries& s, int w, int h, int rel_x);
+
 }  // namespace stock_chart_renderer
 
 #endif  // STOCK_CHART_RENDERER_H

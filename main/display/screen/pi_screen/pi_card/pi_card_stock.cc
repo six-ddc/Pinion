@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "pi_card_data.h"
+#include "pi_card_host.h"  // AnyVisibleCardBindsPrefix（bind 订阅的可见性反查）
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -60,9 +61,12 @@ struct StockCtx {
     lv_obj_t* lbl_name = nullptr;
     lv_obj_t* lbl_price = nullptr;
     lv_obj_t* lbl_pct = nullptr;
-    lv_obj_t* lbl_mode = nullptr;
     lv_obj_t* lbl_time = nullptr;
     lv_obj_t* lbl_loading = nullptr;
+    lv_obj_t* seg[CHART_MODE_COUNT] = {};  // 脚部周期分段按钮（分时|五日|日K|周K）
+    lv_obj_t* cross_line = nullptr;        // 十字线（竖 hairline；按住图面出现）
+    lv_obj_t* cross_dot = nullptr;         // 命中数据点圆点
+    lv_obj_t* cross_lbl = nullptr;         // 数值气泡（时间 价格 涨跌幅）
     stock_chart_renderer::Target target;
 
     void* canvas_buf = nullptr;
@@ -83,6 +87,9 @@ std::atomic<int> g_live{0};                // worker 线程校验用的存活计
 std::atomic<uint32_t> g_next_session{1};
 lv_timer_t* g_timer = nullptr;
 int g_theme_listener = -1;
+// 息屏门控（LVGL 线程）：Off 态 lv_obj_is_visible 仍为 true（背光归零不影响可见性判定），
+// 单靠控件可见性拦不住息屏拉取——true 时停排一切新抓取，在途结果照常 Drain 落地。
+bool g_screen_off = false;
 
 // ---- Phase4：stock.<symbol>.<field> 动态绑定订阅（LVGL 线程独占）----
 // 无控件的报价订阅：DataHub 动态路径被 Acquire 时按 symbol 建订阅，复用本模块的
@@ -373,9 +380,12 @@ void ScheduleFetches(uint32_t now) {
             SubmitFetch(c, Kind::Chart, now);
         }
     }
-    // bind 订阅：与控件报价同一 policy（盘中 5s / 闭市 60s / 失败快重试）。没有控件那样的
-    // 可见性可查（绑定的是 label，不归本模块管），有绑定即拉——卡片删除即退订，自然止损。
+    // bind 订阅：与控件报价同一 policy（盘中 5s / 闭市 60s / 失败快重试）。绑定的 label 不归
+    // 本模块管，可见性走 host 反查：只要有一张「当前可见」的卡绑着该 symbol 的任意字段就拉；
+    // 全部滚出视口/藏在非活跃视图（如 Chat 态下的待机 pin）则停拉，滚回来后下个 tick 内
+    // policy 按 last_fetch_at 自然立即补。卡片删除即退订，仍是最终止损。
     for (auto& [sym, sub] : g_subs) {
+        if (!pi_card::AnyVisibleCardBindsPrefix("stock." + sym + ".")) continue;
         StockFetchScheduler::State st;
         st.now_ms = now;
         st.clock_ready = clock_ready;
@@ -390,6 +400,7 @@ void ScheduleFetches(uint32_t now) {
 
 void TimerCb(lv_timer_t*) {
     DrainResults();
+    if (g_screen_off) return;  // 息屏：不排新抓取（亮屏由 SetScreenOff(false) 立即补一轮）
     ScheduleFetches(lv_tick_get());
 }
 
@@ -414,9 +425,35 @@ void EnsureModuleStarted() {
 
 // ---- 交互 -------------------------------------------------------------------
 
-void OnChartClicked(lv_event_t* e) {
-    auto* c = static_cast<StockCtx*>(lv_event_get_user_data(e));
-    c->mode = static_cast<ChartMode>((c->mode + 1) % CHART_MODE_COUNT);
+// ---- 周期分段按钮 + 图面按住看数值 ------------------------------------------
+// 旧交互「点图循环切周期」与「按住图面看数值」天然冲突（手指一碰就切走），改为：
+// 周期由脚部四个分段按钮显式切换；图面的按压/拖动专属十字线取值。
+
+void ApplySegStyle(StockCtx* c) {
+    for (int m = 0; m < CHART_MODE_COUNT; m++) {
+        lv_obj_t* b = c->seg[m];
+        if (b == nullptr) continue;
+        lv_obj_t* lbl = lv_obj_get_child(b, 0);
+        if (m == c->mode) {
+            pi_theme::ApplyBg(b, Tok::Accent);
+            lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+            if (lbl) pi_theme::ApplyText(lbl, Tok::Bg);
+        } else {
+            lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, LV_PART_MAIN);
+            if (lbl) pi_theme::ApplyText(lbl, Tok::Dim);
+        }
+    }
+}
+
+void HideCross(StockCtx* c) {
+    if (c->cross_line) lv_obj_add_flag(c->cross_line, LV_OBJ_FLAG_HIDDEN);
+    if (c->cross_dot) lv_obj_add_flag(c->cross_dot, LV_OBJ_FLAG_HIDDEN);
+    if (c->cross_lbl) lv_obj_add_flag(c->cross_lbl, LV_OBJ_FLAG_HIDDEN);
+}
+
+void SetMode(StockCtx* c, ChartMode mode) {
+    if (c->mode == mode) return;
+    c->mode = mode;
     c->session = NextSession();  // 作废在途结果
     c->quote_inflight = false;
     c->chart_inflight = false;
@@ -424,9 +461,85 @@ void OnChartClicked(lv_event_t* e) {
     c->chart_valid_once = false;
     delete c->series;
     c->series = nullptr;
-    lv_label_set_text(c->lbl_mode, kModeNames[c->mode]);
+    HideCross(c);  // 十字线随旧图作废
+    ApplySegStyle(c);
     EnterLoading(c);
     SubmitFetch(c, Kind::Chart, lv_tick_get());  // 不等 tick，立即入队
+}
+
+void OnSegClicked(lv_event_t* e) {
+    auto* c = static_cast<StockCtx*>(lv_event_get_user_data(e));
+    lv_obj_t* b = lv_event_get_target_obj(e);
+    SetMode(c, static_cast<ChartMode>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(b))));
+}
+
+// 命中点 → 气泡文案。分时/5日：时间 + 价 + 相对昨收涨跌幅（5日多带日期）；
+// K 线：日期 + 收盘 + 相对前一根涨跌幅。timestamps_s 是 UTC 秒 epoch——先过
+// utcToBjEpoch 平移到北京时间，再按 UTC 拆字段即得北京钟面（sim 实测：不平移
+// 会把 11:04 显成 03:04），不依赖设备本地 TZ。
+void CrossText(const StockCtx* c, size_t idx, char* buf, size_t cap) {
+    const ChartSeries& s = *c->series;
+    const uint32_t ts =
+        static_cast<uint32_t>(MarketSchedule::utcToBjEpoch(static_cast<time_t>(s.timestamps_s[idx])));
+    const unsigned hh = (ts % 86400u) / 3600u, mm = (ts % 3600u) / 60u;
+    if (s.has_ref) {
+        const float pct =
+            s.last_close > 0 ? (s.points[idx] - s.last_close) / s.last_close * 100.0f : 0.0f;
+        if (s.mode == CHART_MIN_5D) {
+            time_t t = static_cast<time_t>(ts);
+            struct tm tmv;
+            gmtime_r(&t, &tmv);
+            std::snprintf(buf, cap, "%02d-%02d %02u:%02u  %.2f  %+.2f%%", tmv.tm_mon + 1,
+                          tmv.tm_mday, hh, mm, s.points[idx], pct);
+        } else {
+            std::snprintf(buf, cap, "%02u:%02u  %.2f  %+.2f%%", hh, mm, s.points[idx], pct);
+        }
+    } else {
+        time_t t = static_cast<time_t>(ts);
+        struct tm tmv;
+        gmtime_r(&t, &tmv);
+        if (idx > 0 && s.points[idx - 1] > 0) {
+            const float pct = (s.points[idx] - s.points[idx - 1]) / s.points[idx - 1] * 100.0f;
+            std::snprintf(buf, cap, "%02d-%02d  %.2f  %+.2f%%", tmv.tm_mon + 1, tmv.tm_mday,
+                          s.points[idx], pct);
+        } else {
+            std::snprintf(buf, cap, "%02d-%02d  %.2f", tmv.tm_mon + 1, tmv.tm_mday, s.points[idx]);
+        }
+    }
+}
+
+void UpdateCross(StockCtx* c, lv_event_t* e) {
+    if (c->series == nullptr || !c->series->valid || c->series->count == 0) return;
+    lv_indev_t* indev = lv_event_get_indev(e);
+    if (indev == nullptr) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    lv_area_t a;
+    lv_obj_get_coords(c->holder, &a);
+    auto hit = stock_chart_renderer::HitTest(*c->series, c->target.w, c->target.h, p.x - a.x1);
+    if (!hit.valid) return;
+    lv_obj_set_pos(c->cross_line, hit.x, 0);
+    lv_obj_remove_flag(c->cross_line, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(c->cross_dot, hit.x - 4, hit.y - 4);  // 9px 圆点按中心对齐命中点
+    lv_obj_remove_flag(c->cross_dot, LV_OBJ_FLAG_HIDDEN);
+    char buf[48];
+    CrossText(c, hit.idx, buf, sizeof(buf));
+    lv_label_set_text(c->cross_lbl, buf);
+    lv_obj_remove_flag(c->cross_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(c->cross_lbl);  // 取实宽做贴边翻转
+    const int lw = lv_obj_get_width(c->cross_lbl);
+    int lx = hit.x + 12;
+    if (lx + lw > c->target.w - 2) lx = hit.x - 12 - lw;  // 右侧放不下翻到左侧
+    if (lx < 2) lx = 2;
+    lv_obj_set_pos(c->cross_lbl, lx, 2);
+}
+
+void OnChartPressing(lv_event_t* e) {
+    UpdateCross(static_cast<StockCtx*>(lv_event_get_user_data(e)), e);
+}
+
+void OnChartReleased(lv_event_t* e) {
+    HideCross(static_cast<StockCtx*>(lv_event_get_user_data(e)));
 }
 
 void OnHolderDeleted(lv_event_t* e) {
@@ -583,6 +696,10 @@ lv_obj_t* Create(lv_obj_t* parent, const cJSON* node) {
     lv_obj_set_style_bg_opa(holder, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_size(holder, cw, ch);
     lv_obj_add_flag(holder, LV_OBJ_FLAG_CLICKABLE);
+    // 按住看数值：图面按压归十字线，不让父级 feed 抢去滚动（去 SCROLL_CHAIN 断上抛）；
+    // PRESS_LOCK 让手指拖出图面边界仍持续收 PRESSING（取值钳在两端）。
+    lv_obj_remove_flag(holder, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_flag(holder, LV_OBJ_FLAG_PRESS_LOCK);
     c->holder = holder;
 
     lv_obj_t* canvas = lv_canvas_create(holder);
@@ -605,7 +722,39 @@ lv_obj_t* Create(lv_obj_t* parent, const cJSON* node) {
     lv_obj_center(c->lbl_loading);
     EnterLoading(c);
 
-    // 脚行：模式名 + 更新时间 + 轻提示
+    // 十字线三件套（默认隐藏，按住图面出现；建在坐标 label 之后保证盖在其上）
+    c->cross_line = lv_obj_create(holder);
+    screen_strip_obj_chrome(c->cross_line);
+    lv_obj_remove_flag(c->cross_line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(c->cross_line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(c->cross_line, 1, ch);
+    pi_theme::ApplyBg(c->cross_line, Tok::Tx);
+    lv_obj_set_style_bg_opa(c->cross_line, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_add_flag(c->cross_line, LV_OBJ_FLAG_HIDDEN);
+    c->cross_dot = lv_obj_create(holder);
+    screen_strip_obj_chrome(c->cross_dot);
+    lv_obj_remove_flag(c->cross_dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(c->cross_dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(c->cross_dot, 9, 9);
+    lv_obj_set_style_radius(c->cross_dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    pi_theme::ApplyBg(c->cross_dot, Tok::Tx);
+    lv_obj_set_style_bg_opa(c->cross_dot, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(c->cross_dot, 2, LV_PART_MAIN);
+    pi_theme::ApplyBorder(c->cross_dot, Tok::Card2);
+    lv_obj_add_flag(c->cross_dot, LV_OBJ_FLAG_HIDDEN);
+    c->cross_lbl = lv_label_create(holder);
+    lv_obj_remove_flag(c->cross_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_text_font(c->cross_lbl, &font_pi_mono_14, LV_PART_MAIN);
+    pi_theme::ApplyText(c->cross_lbl, Tok::Tx);
+    pi_theme::ApplyBg(c->cross_lbl, Tok::Card);  // 不透明底，压在折线上仍可读
+    lv_obj_set_style_bg_opa(c->cross_lbl, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_radius(c->cross_lbl, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(c->cross_lbl, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(c->cross_lbl, 4, LV_PART_MAIN);
+    lv_obj_add_flag(c->cross_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    // 脚行：周期分段选择器（分时|五日|日K|周K）+ 右侧更新时间。周期切换从「点图循环」
+    // 改到这里的显式按钮——图面的按压/拖动专属十字线取值，二者不再冲突。
     lv_obj_t* foot = lv_obj_create(root);
     screen_strip_obj_chrome(foot);
     lv_obj_remove_flag(foot, LV_OBJ_FLAG_SCROLLABLE);
@@ -613,15 +762,46 @@ lv_obj_t* Create(lv_obj_t* parent, const cJSON* node) {
     lv_obj_set_width(foot, LV_PCT(100));
     lv_obj_set_height(foot, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(foot, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(foot, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(foot, 10, LV_PART_MAIN);
 
-    c->lbl_mode = MakeLabel(foot, &font_puhui_20_4, Tok::Dim);
-    lv_label_set_text(c->lbl_mode, kModeNames[c->mode]);
-    c->lbl_time = MakeLabel(foot, &font_pi_mono_14, Tok::Faint);
-    lv_obj_t* hint = MakeLabel(foot, &font_puhui_20_4, Tok::Faint);
-    lv_label_set_text(hint, "点图切周期");
+    lv_obj_t* segbox = lv_obj_create(foot);  // 分段轨道，观感对齐 pi_card 的 choice 控件
+    screen_strip_obj_chrome(segbox);
+    lv_obj_remove_flag(segbox, LV_OBJ_FLAG_SCROLLABLE);
+    pi_theme::ApplyBg(segbox, Tok::Card2);
+    lv_obj_set_style_bg_opa(segbox, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(segbox, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(segbox, 3, LV_PART_MAIN);
+    lv_obj_set_flex_flow(segbox, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(segbox, 3, LV_PART_MAIN);
+    lv_obj_set_size(segbox, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    for (int m = 0; m < CHART_MODE_COUNT; m++) {
+        lv_obj_t* b = lv_button_create(segbox);
+        lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+        lv_obj_set_style_pad_hor(b, 14, LV_PART_MAIN);
+        lv_obj_set_style_pad_ver(b, 6, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
+        lv_obj_t* lbl = lv_label_create(b);
+        lv_obj_set_style_text_font(lbl, &font_puhui_20_4, LV_PART_MAIN);
+        lv_label_set_text(lbl, kModeNames[m]);
+        lv_obj_center(lbl);
+        lv_obj_set_user_data(b, reinterpret_cast<void*>(static_cast<intptr_t>(m)));
+        lv_obj_add_event_cb(b, OnSegClicked, LV_EVENT_CLICKED, c);
+        c->seg[m] = b;
+    }
+    ApplySegStyle(c);
 
-    lv_obj_add_event_cb(holder, OnChartClicked, LV_EVENT_CLICKED, c);
+    lv_obj_t* fgap = lv_obj_create(foot);  // 弹性把时间推到最右
+    screen_strip_obj_chrome(fgap);
+    lv_obj_set_style_bg_opa(fgap, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_height(fgap, 1);
+    lv_obj_set_flex_grow(fgap, 1);
+    c->lbl_time = MakeLabel(foot, &font_pi_mono_14, Tok::Faint);
+
+    lv_obj_add_event_cb(holder, OnChartPressing, LV_EVENT_PRESSED, c);
+    lv_obj_add_event_cb(holder, OnChartPressing, LV_EVENT_PRESSING, c);
+    lv_obj_add_event_cb(holder, OnChartReleased, LV_EVENT_RELEASED, c);
+    lv_obj_add_event_cb(holder, OnChartReleased, LV_EVENT_PRESS_LOST, c);
     lv_obj_add_event_cb(holder, OnHolderDeleted, LV_EVENT_DELETE, c);
 
     g_widgets.push_back(c);
@@ -648,6 +828,14 @@ std::string JoinBindFields() {
     return s;
 }
 }  // namespace
+
+void SetScreenOff(bool off) {
+    if (g_screen_off == off) return;
+    g_screen_off = off;
+    // 亮屏立即补一轮调度（不等下个 1s tick）：policy 按 last_fetch_at 判定，息屏久了自然
+    // 立即拉，短暂息屏则无动作。timer 可能因无控件/订阅而 pause，容器为空时这是 no-op。
+    if (!off) ScheduleFetches(lv_tick_get());
+}
 
 void RegisterBindProvider() {
     static std::string hint;  // provider 持 const char*，须常驻
