@@ -372,11 +372,35 @@ constexpr const char* kCardStockChart =
     "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
     "{\"type\":\"stock_chart\",\"symbol\":\"sh600519\",\"name\":\"贵州茅台\",\"w\":520}]}}";
 
+// 样式收敛验收卡 S1（idx 19，Commit 1 硬验收）：四 variant 按钮 + 全控件家福，一张卡
+// 覆盖所有走共享/局部几何样式的入口——primary/default/ghost/plain 按钮（s_btn_base /
+// s_ghost_extra / s_transp_bg）、slider（s_round_track/s_track_indic/s_knob）、bar、
+// switch、choice（choice-box 局部 radius/pad + s_choice_seg）、divider、fill 容器
+// （ApplyFill 局部 radius）、卡面（局部 radius/pad/border）。全静态值 → 完全确定，
+// 收敛前后逐像素可比。
+constexpr const char* kCardStyleFam =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
+    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STYLE FAMILY\"},"
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"样式家福\"},"
+    "{\"type\":\"row\",\"gap\":10,\"children\":["
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"主\"},"
+    "{\"type\":\"button\",\"variant\":\"default\",\"text\":\"默认\"},"
+    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"描边\"},"
+    "{\"type\":\"button\",\"variant\":\"plain\",\"text\":\"纯文\"}]},"
+    "{\"type\":\"slider\",\"value\":40},"
+    "{\"type\":\"bar\",\"value\":65},"
+    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"开关\"},"
+    "{\"type\":\"spacer\"},{\"type\":\"switch\",\"checked\":true}]},"
+    "{\"type\":\"choice\",\"id\":\"seg\",\"options\":[\"低\",\"中\",\"高\"],\"value\":1},"
+    "{\"type\":\"divider\"},"
+    "{\"type\":\"column\",\"fill\":\"card2\",\"gap\":6,\"children\":["
+    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"fill 容器（圆角 radius 局部设）\"}]}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
                                   kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
-                                  kCardStockBind, kCardMediaCtl,  kCardStockChart};
+                                  kCardStockBind, kCardMediaCtl,  kCardStockChart, kCardStyleFam};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。

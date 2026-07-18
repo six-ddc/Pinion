@@ -4,8 +4,9 @@
 // pi_card::Render —— JSON 节点树 → LVGL 控件树（遵循 pi_theme 双主题 + 自适应）
 //
 // type 白名单：column / row / label / button / slider / arc / switch / bar /
-// icon / divider / spacer / qrcode / choice。配色一律走 pi_theme 令牌
-// （tone/role），字体 puhui(中文)+pi_mono(数值)，图标经 pi_card_icons 形状拼合。
+// icon / divider / spacer / qrcode / choice / list / chart / stock_chart。配色
+// 一律走 pi_theme 令牌（tone/role），字体 puhui(中文)+pi_mono(数值)，图标经
+// pi_card_icons 形状拼合。
 // 未知 type → 整卡失败（回滚已建部分）+ 可读错误串；未知字段静默忽略（前向
 // 兼容）。限额：≤64 节点、≤8 层。
 //

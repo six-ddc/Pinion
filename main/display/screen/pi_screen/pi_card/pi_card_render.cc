@@ -133,7 +133,73 @@ bool HasCjk(const char* s) {
         if (*p >= 0x80) return true;  // 任意非 ASCII 字节 → 含中文/多字节
     return false;
 }
+// ------------------------------ 共享几何样式 -------------------------------
+// 卡片控件的「主题无关」几何属性（圆角/内距/描边宽/阴影）收敛成一组进程级
+// 静态 lv_style_t，各控件用 lv_obj_add_style 复用，替代每次渲染逐属性 set_local。
+// 颜色/背景全部继续走 pi_theme 令牌（local style），与这些几何属性集不相交——
+// 主题切换（改令牌 style 色值 + report_style_change）不受影响，无级联冲突。
+// 静态存储期永不销毁；EnsureCardStyles() 惰性初始化一次，RenderNode 顶部调用即覆盖
+// 全部入口（含 ApplyButtonStyle/ApplyDefaultStyle 等下游）。
+//
+// ⚠️ 边界：容器（column/row/list/spacer/divider/choice-box）都先过
+// screen_strip_obj_chrome，后者用 **local** style 把 pad/margin/border_width/radius
+// 置 0。LVGL 中 local style 优先级高于 added style，故对这些容器用 add_style 设
+// pad/border/radius 会被 local 0 压掉、静默失效。所以本组只放：(a) 作用在未 strip 的
+// button/slider（part MAIN/INDICATOR/KNOB）上的几何，(b) screen_strip 不碰的属性
+// （bg_opa）。容器的 radius/pad/border 一律保留原地 local set（见 ApplyDefaultStyle
+// 卡面、MakeChoice、ApplyFill）。
+lv_style_t s_btn_base;     // 按钮基座：radius 12 + pad 20/15 + 无阴影
+lv_style_t s_ghost_extra;  // ghost 变体附加：透明底 + 1px 描边
+lv_style_t s_transp_bg;    // 透明底容器（column/row/list/spacer/plain 按钮）—— 仅 bg_opa
+lv_style_t s_round_track;  // slider/bar 轨道 MAIN：圆头 + 水平 13 内缩
+lv_style_t s_track_indic;  // slider/bar 填充 INDICATOR：圆头
+lv_style_t s_knob;         // slider 把手 KNOB：圆头 + pad 10 + 微投影（黑为双主题不变量）
+lv_style_t s_choice_seg;   // choice 分段按钮（lv_button，未 strip）：radius 10 + 竖内距 10 + 无阴影
+
+void EnsureCardStyles() {
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+
+    lv_style_init(&s_btn_base);
+    lv_style_set_radius(&s_btn_base, 12);
+    lv_style_set_pad_hor(&s_btn_base, 20);
+    lv_style_set_pad_ver(&s_btn_base, 15);
+    lv_style_set_shadow_width(&s_btn_base, 0);
+
+    lv_style_init(&s_ghost_extra);
+    lv_style_set_bg_opa(&s_ghost_extra, LV_OPA_TRANSP);
+    lv_style_set_border_width(&s_ghost_extra, 1);
+
+    lv_style_init(&s_transp_bg);
+    lv_style_set_bg_opa(&s_transp_bg, LV_OPA_TRANSP);
+
+    lv_style_init(&s_round_track);
+    lv_style_set_radius(&s_round_track, LV_RADIUS_CIRCLE);
+    // 把手超出轨道两端各约 13px；MAIN 水平 padding 把轨道向内缩，0%/100% 端点的把手
+    // 停在滑块盒子内、不外伸吃穿 gap；bar 无把手但为跨行左右端对齐须一致。
+    lv_style_set_pad_hor(&s_round_track, 13);
+
+    lv_style_init(&s_track_indic);
+    lv_style_set_radius(&s_track_indic, LV_RADIUS_CIRCLE);
+
+    lv_style_init(&s_knob);
+    lv_style_set_radius(&s_knob, LV_RADIUS_CIRCLE);
+    lv_style_set_pad_all(&s_knob, 10);  // ~26px 把手
+    lv_style_set_shadow_width(&s_knob, 8);
+    lv_style_set_shadow_color(&s_knob, lv_color_hex(0x000000));
+    lv_style_set_shadow_opa(&s_knob, LV_OPA_30);
+
+    lv_style_init(&s_choice_seg);
+    lv_style_set_radius(&s_choice_seg, 10);
+    lv_style_set_pad_ver(&s_choice_seg, 10);
+    lv_style_set_shadow_width(&s_choice_seg, 0);
+}
+
 // 容器/控件底色：fill(令牌) > bg(hex)。无则不动（透明或默认样式）。
+// radius 走 local set 而非共享 add_style：目标容器已过 screen_strip_obj_chrome（local
+// radius=0），local 优先级高于 added style 会压掉共享样式的 radius。bg_opa 不受此限
+// （screen_strip 不碰 bg_opa），但一并 local set 更直白。
 void ApplyFill(lv_obj_t* obj, const cJSON* node) {
     Tok tok;
     lv_color_t c;
@@ -188,10 +254,7 @@ void ApplyLabelStyle(lv_obj_t* lbl, const cJSON* node) {
 // 返回按钮前景令牌（变体决定、node tone 可覆写）——按钮内嵌图标用它与文字同色。
 Tok ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
     const char* variant = GetStr(node, "variant", "default");
-    lv_obj_set_style_radius(btn, 12, LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(btn, 20, LV_PART_MAIN);
-    lv_obj_set_style_pad_ver(btn, 15, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_add_style(btn, &s_btn_base, LV_PART_MAIN);
     const lv_style_selector_t pressed = LV_PART_MAIN | static_cast<lv_style_selector_t>(LV_STATE_PRESSED);
     Tok text_tone = Tok::Tx;
     if (!std::strcmp(variant, "primary")) {
@@ -199,12 +262,11 @@ Tok ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
         pi_theme::ApplyBg(btn, Tok::AccentDim, pressed);
         text_tone = Tok::Bg;  // 深字压在琥珀上（深/浅主题都够对比）
     } else if (!std::strcmp(variant, "ghost")) {
-        lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+        lv_obj_add_style(btn, &s_ghost_extra, LV_PART_MAIN);
         pi_theme::ApplyBorder(btn, Tok::Line);
         pi_theme::ApplyBg(btn, Tok::Card2, pressed);
     } else if (!std::strcmp(variant, "plain")) {
-        lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_add_style(btn, &s_transp_bg, LV_PART_MAIN);
         text_tone = Tok::Accent;
     } else {  // 中性填充
         pi_theme::ApplyBg(btn, Tok::Card2);
@@ -263,31 +325,20 @@ void ApplyDefaultStyle(lv_obj_t* obj, const char* type, int depth) {
     if (std::strcmp(type, "slider") == 0) {
         lv_obj_set_height(obj, 6);
         pi_theme::ApplyBg(obj, Tok::Line);  // 底轨（整盒宽、可见）—— 把手边缘贴齐它的端点
-        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_round_track, LV_PART_MAIN);
         pi_theme::ApplyBg(obj, Tok::Accent, LV_PART_INDICATOR);
-        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+        lv_obj_add_style(obj, &s_track_indic, LV_PART_INDICATOR);
         // 把手用中性 Tx（而非又一块琥珀）+ 细描边 + 微投影：强调色只留给填充轨，
-        // 把手更精致、层次更清。
+        // 把手更精致、层次更清。几何（圆头/pad/投影）走共享 s_knob。
         pi_theme::ApplyBg(obj, Tok::Tx, LV_PART_KNOB);
-        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(obj, 10, LV_PART_KNOB);  // ~26px 把手
-        lv_obj_set_style_shadow_width(obj, 8, LV_PART_KNOB);
-        lv_obj_set_style_shadow_color(obj, lv_color_hex(0x000000), LV_PART_KNOB);
-        lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_KNOB);
+        lv_obj_add_style(obj, &s_knob, LV_PART_KNOB);
         lv_obj_set_ext_click_area(obj, 20);
-        // 把手超出轨道两端各约 13px（26px 直径）。给 MAIN 加水平 padding 把轨道向内缩，
-        // 使 0%/100% 端点的把手停在滑块自己的盒子内、不外伸吃穿行 gap 顶到相邻图标/label。
-        // padding 是盒内内缩，不改变 flex 占位——故 label 不会被挤出裁切（margin 会）。
-        lv_obj_set_style_pad_hor(obj, 13, LV_PART_MAIN);
     } else if (std::strcmp(type, "bar") == 0) {
         lv_obj_set_height(obj, 6);
         pi_theme::ApplyBg(obj, Tok::Line);  // 底轨可见，与 slider 一致
-        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_round_track, LV_PART_MAIN);
         pi_theme::ApplyBg(obj, Tok::Accent, LV_PART_INDICATOR);
-        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-        // 与 slider 同款水平内缩，让同列的 slider 轨道与 bar 轨道左右端对齐（bar 无把手
-        // 本不需内缩，但为跨行视觉对齐须一致）。
-        lv_obj_set_style_pad_hor(obj, 13, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_track_indic, LV_PART_INDICATOR);
     } else if (std::strcmp(type, "switch") == 0) {
         pi_theme::ApplyBg(obj, Tok::Card2);
         pi_theme::ApplyBg(obj, Tok::Accent,
@@ -416,6 +467,9 @@ lv_obj_t* MakeChoice(lv_obj_t* parent, const cJSON* node) {
     lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
     pi_theme::ApplyBg(box, Tok::Card2);
     lv_obj_set_style_bg_opa(box, LV_OPA_COVER, LV_PART_MAIN);
+    // radius/pad 走 local set，不能进共享 add_style：box 过了 screen_strip_obj_chrome
+    // （local radius/pad=0），而 LVGL local style 优先级高于 added style，会把共享样式的
+    // 几何压掉。见 EnsureCardStyles 注释。
     lv_obj_set_style_radius(box, 12, LV_PART_MAIN);
     lv_obj_set_style_pad_all(box, 4, LV_PART_MAIN);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
@@ -431,9 +485,7 @@ lv_obj_t* MakeChoice(lv_obj_t* parent, const cJSON* node) {
     cJSON_ArrayForEach(opt, opts) {
         lv_obj_t* seg = lv_button_create(box);
         lv_obj_set_flex_grow(seg, 1);
-        lv_obj_set_style_radius(seg, 10, LV_PART_MAIN);
-        lv_obj_set_style_pad_ver(seg, 10, LV_PART_MAIN);
-        lv_obj_set_style_shadow_width(seg, 0, LV_PART_MAIN);
+        lv_obj_add_style(seg, &s_choice_seg, LV_PART_MAIN);
         lv_obj_t* lbl = lv_label_create(seg);
         const char* text = cJSON_IsString(opt) ? opt->valuestring : "";
         const lv_font_t* font = &font_puhui_20_4;
@@ -629,6 +681,7 @@ void SubstRecord(cJSON* node, const cJSON* rec, int i) {
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
                      int depth, int& node_count, std::string& err, int parent_flow,
                      bool in_list_row) {
+    EnsureCardStyles();  // 惰性初始化共享几何样式（首次进入即建，覆盖全部下游入口）
     if (!cJSON_IsObject(node)) {
         err = "node is not an object";
         return nullptr;
@@ -656,7 +709,7 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         obj = lv_obj_create(parent);
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
         lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
         lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
         // row 支持自动换行，超宽不裁剪 —— 自适应关键。
@@ -793,7 +846,7 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         obj = lv_obj_create(parent);
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
         // 与 column/row 分支一致：显式给 SIZE_CONTENT，否则落回 lv_obj_create 的默认固定高度，
         // 撑不满全部行、把最后几行裁在盒子外（bug 曾在此复现：obj 高度停在第 4 行，第 5 行
         // 虽已正确布局到 y460-484 却被父容器裁掉，因为父容器自身高度从没被设过）。
@@ -858,7 +911,7 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
         lv_obj_set_size(obj, 0, 0);  // 本体不占尺寸；由 ApplySizing 给弹性/间隔
     } else {
         err = std::string("unknown type: ") + type;
