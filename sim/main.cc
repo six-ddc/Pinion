@@ -396,11 +396,51 @@ constexpr const char* kCardStyleFam =
     "{\"type\":\"column\",\"fill\":\"card2\",\"gap\":6,\"children\":["
     "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"fill 容器（圆角 radius 局部设）\"}]}]}}";
 
+// justify 全枚举验收卡 A1（idx 20，Commit 2）：6 行分别 justify=start/center/end/between/
+// around/evenly，每行 3 个自然宽 icon（row 内 icon 不 grow）→ 主轴分布差异可见。全静态。
+constexpr const char* kCardJustify =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":8,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"justify 全枚举\"},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"START\"},"
+    "{\"type\":\"row\",\"justify\":\"start\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"CENTER\"},"
+    "{\"type\":\"row\",\"justify\":\"center\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"END\"},"
+    "{\"type\":\"row\",\"justify\":\"end\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"BETWEEN\"},"
+    "{\"type\":\"row\",\"justify\":\"between\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"AROUND\"},"
+    "{\"type\":\"row\",\"justify\":\"around\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"EVENLY\"},"
+    "{\"type\":\"row\",\"justify\":\"evenly\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
+    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]}]}}";
+
+// align 全枚举验收卡 A2（idx 21，Commit 2）：3 行分别 align=start/center/end，每行含
+// 大 icon(size40)+文字+小 icon(size18) 高差 → 交叉轴（竖向）对齐差异可见。全静态。
+constexpr const char* kCardAlign =
+    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"align 交叉轴\"},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=start\"},"
+    "{\"type\":\"row\",\"align\":\"start\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"顶对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=center\"},"
+    "{\"type\":\"row\",\"align\":\"center\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"中对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]},"
+    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=end\"},"
+    "{\"type\":\"row\",\"align\":\"end\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"底对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]}]}}";
+
 constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
                                   kCard4,        kCard5,          kCardBadFmt,  kCardArc,
                                   kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
                                   kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
-                                  kCardStockBind, kCardMediaCtl,  kCardStockChart, kCardStyleFam};
+                                  kCardStockBind, kCardMediaCtl,  kCardStockChart, kCardStyleFam,
+                                  kCardJustify,  kCardAlign};
 
 // TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
 // 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。

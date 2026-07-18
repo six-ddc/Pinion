@@ -55,7 +55,8 @@ const char *pi_card_system_prompt(void);
     "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = current value of every "  \
     "hardware path this card binds (this IS your device read); hints = non-blocking design tips. "   \
     "On invalid input returns an error to fix and retry; overlays auto-close (ttl_ms) and are "      \
-    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?}; label{text?,role?,bind?,fmt?,"  \
+    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?,justify?,align?}; label{text?,"    \
+    "role?,bind?,fmt?,"                                                                               \
     "bind_data?}; button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
     "on_release?}; arc{…like slider} (round dial); switch{checked,bind?,id?,on_change?}; "            \
     "bar{min,max,value,bind?}; choice{options:[2-6],value?,id?,bind?,on_change?} (segmented picker; " \
@@ -116,7 +117,9 @@ const char *pi_card_system_prompt(void);
     "im\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\":\"string\"},\"" \
     "bg\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"size\":{\"type\":\"number\"},\"mono\":" \
     "{\"type\":\"boolean\"},\"gap\":{\"type\":\"number\"},\"pad\":{\"type\":\"number\"},\"w\":{\"type" \
-    "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"hidden\":{\"type\":" \
+    "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"justify\":{\"type\":" \
+    "\"string\",\"enum\":[\"start\",\"center\",\"end\",\"between\",\"around\",\"evenly\"]},\"align\":{" \
+    "\"type\":\"string\",\"enum\":[\"start\",\"center\",\"end\"]},\"hidden\":{\"type\":" \
     "\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_chan" \
     "ge\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\":\"arr" \
     "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}}},\"properties\":{\"root" \

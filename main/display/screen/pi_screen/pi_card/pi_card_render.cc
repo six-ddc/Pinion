@@ -64,6 +64,33 @@ bool ToneTok(const char* name, Tok& out) {
     return false;
 }
 
+// column/row 的 justify(主轴)/align(交叉轴) CSS 惯用词 → lv_flex_align_t（表驱动，仿 ToneTok）。
+// 未知名返回 false，调用方保留今日默认值 + Lint 回落提示（依既有「修饰性枚举未知值静默回落」
+// 约定，不拒绝整卡）。justify 全 6 值；align(交叉轴) 语义只取 start|center|end。
+bool FlexJustifyOf(const char* name, lv_flex_align_t& out) {
+    if (!name) return false;
+    struct M { const char* k; lv_flex_align_t v; };
+    static const M kMap[] = {
+        {"start", LV_FLEX_ALIGN_START},         {"center", LV_FLEX_ALIGN_CENTER},
+        {"end", LV_FLEX_ALIGN_END},             {"between", LV_FLEX_ALIGN_SPACE_BETWEEN},
+        {"around", LV_FLEX_ALIGN_SPACE_AROUND}, {"evenly", LV_FLEX_ALIGN_SPACE_EVENLY},
+    };
+    for (auto& m : kMap) {
+        if (std::strcmp(m.k, name) == 0) {
+            out = m.v;
+            return true;
+        }
+    }
+    return false;
+}
+bool FlexCrossOf(const char* name, lv_flex_align_t& out) {
+    if (!name) return false;
+    if (!std::strcmp(name, "start")) { out = LV_FLEX_ALIGN_START; return true; }
+    if (!std::strcmp(name, "center")) { out = LV_FLEX_ALIGN_CENTER; return true; }
+    if (!std::strcmp(name, "end")) { out = LV_FLEX_ALIGN_END; return true; }
+    return false;
+}
+
 // "#RRGGBB" → lv_color_t。
 bool ParseHex(const char* s, lv_color_t& out) {
     if (!s || s[0] != '#' || std::strlen(s) < 7) return false;
@@ -717,10 +744,14 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         int gap = GetInt(node, "gap", is_row ? 12 : 12);
         lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
         lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-        if (is_row) {
-            lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                                  LV_FLEX_ALIGN_CENTER);
-        }
+        // justify(主轴)/align(交叉轴)：不传 = 今日写死值（column START/START/START、
+        // row START/CENTER/CENTER），完全向后兼容。cross 与 track 同设一个值。未知枚举
+        // 值静默回落到默认（Lint 出提示）。
+        lv_flex_align_t main_align = LV_FLEX_ALIGN_START;
+        lv_flex_align_t cross_align = is_row ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START;
+        FlexJustifyOf(GetStr(node, "justify"), main_align);
+        FlexCrossOf(GetStr(node, "align"), cross_align);
+        lv_obj_set_flex_align(obj, main_align, cross_align, cross_align);
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
         if (const char* txt = GetStr(node, "text")) lv_label_set_text(obj, txt);
@@ -1380,8 +1411,46 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
         }
     }
     if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
+        // justify/align 未知枚举值：不拒绝、静默回落默认（依「修饰性枚举回落」约定），
+        // 但出 Lint 提示纠正 LLM。
+        lv_flex_align_t tmp;
+        const char* jz = GetStr(node, "justify");
+        if (jz != nullptr && !FlexJustifyOf(jz, tmp)) {
+            st.hints->push_back(std::string("justify '") + jz +
+                                "' is not a recognized value (start|center|end|between|around|"
+                                "evenly); it is ignored and the default is used.");
+        }
+        const char* al = GetStr(node, "align");
+        if (al != nullptr && !FlexCrossOf(al, tmp)) {
+            st.hints->push_back(std::string("align '") + al +
+                                "' is not a recognized value (start|center|end); it is ignored and "
+                                "the default is used.");
+        }
+        // row 的 justify=between/around/evenly 分配「剩余空间」，但 row 内 growable 子项默认
+        // grow:1 会吃光剩余空间 → justify 视觉上无效。提示改用显式 w 或去掉 grow。
+        const bool is_row = std::strcmp(type, "row") == 0;
+        const bool space_justify = jz != nullptr && (std::strcmp(jz, "between") == 0 ||
+                                                     std::strcmp(jz, "around") == 0 ||
+                                                     std::strcmp(jz, "evenly") == 0);
         const cJSON* children = GetItem(node, "children");
-        if (children && cJSON_IsArray(children)) {
+        if (is_row && space_justify && children != nullptr && cJSON_IsArray(children)) {
+            bool has_default_grow = false;
+            const cJSON* c = nullptr;
+            cJSON_ArrayForEach(c, children) {
+                const char* ct = GetStr(c, "type");
+                if (ct == nullptr) continue;
+                const bool grows = std::strcmp(ct, "spacer") == 0 ||
+                                   (IsGrowable(ct) && !HasKey(c, "w") && !HasKey(c, "grow"));
+                if (grows) { has_default_grow = true; break; }
+            }
+            if (has_default_grow) {
+                st.hints->push_back(std::string("justify '") + jz +
+                                    "' distributes free space, but a growable child in this row "
+                                    "defaults to grow:1 and eats it, so the spacing has no visible "
+                                    "effect; give children an explicit w or drop grow.");
+            }
+        }
+        if (children != nullptr && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) LintWalk(child, depth + 1, data, st);
         }
