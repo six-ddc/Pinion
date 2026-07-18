@@ -127,7 +127,7 @@ static void RingWrite(Pump* p, const uint8_t* buf, size_t n) {
         if (p->stop) return;
         size_t space = kByteRingCap - p->ring.size();
         size_t chunk = std::min(space, n - off);
-        p->ring.insert(p->ring.end(), buf + off, buf + off + chunk);
+        p->ring.append(buf + off, chunk);
         size_t hw = p->ring.size();
         lk.unlock();
         if (hw > p->ring_high_water.load()) p->ring_high_water = hw;
@@ -136,7 +136,7 @@ static void RingWrite(Pump* p, const uint8_t* buf, size_t n) {
     }
 }
 
-void PumpReaderMain(Pump* p) {
+static void ReaderRun(Pump* p) {
     const int count = (int)p->playlist.size();
     int idx = p->start_index;
     if (idx < 0 || idx >= count) {
@@ -263,12 +263,17 @@ static size_t FeedWithSkip(Pump* p, std::vector<int16_t>& pcm, uint64_t& skip_re
     return fed;
 }
 
-void PumpDecoderMain(Pump* p) {
+static void DecoderRun(Pump* p) {
     mp3dec_t* mp3 = new (std::nothrow) mp3dec_t;
+    // scratch (~16KB) 堆分配（>4KB 落 PSRAM）走 _ex 变体：原版在 mp3dec_decode_frame
+    // 栈上放整个 scratch，逼得解码线程要 28KB 连续内部栈——低内存时 pthread 建不出
+    // 来，std::thread 抛异常直接 terminate 重启（真机实测）。
+    mp3dec_scratch_t* scratch = new (std::nothrow) mp3dec_scratch_t;
     int16_t* pcm = new (std::nothrow) int16_t[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    if (mp3 == nullptr || pcm == nullptr) {
+    if (mp3 == nullptr || scratch == nullptr || pcm == nullptr) {
         ESP_LOGE(TAG, "decoder alloc failed");
         delete mp3;
+        delete scratch;
         delete[] pcm;
         return;
     }
@@ -286,6 +291,8 @@ void PumpDecoderMain(Pump* p) {
     uint64_t skip_remaining = 0;
     const int64_t start_us = esp_timer_get_time();
     int64_t last_log_us = start_us;
+    // 分段耗时探针（真机排查解码追不上实时用；随 5s wall 日志打印后清零）
+    int64_t us_decode = 0, us_resamp = 0, us_feed = 0;
     uint64_t cleared_tail = 0;  // 丢弃的无法成帧尾部字节（诊断，正常仅曲末 < 1 帧）
     // 本曲是否已上报过 OnPlaybackFlowing（Loading→Playing）：每接手一个新 epoch（新曲）
     // 重置，跳过阶段（续播 seek）不算数——必须真有样本喂进播放管线才算"在出声"。
@@ -323,9 +330,8 @@ void PumpDecoderMain(Pump* p) {
                 flowing_reported = false;  // 新曲：Loading→Playing 需要重新用首帧触发
             }
             if (!p->ring.empty()) {
-                size_t take = std::min(p->ring.size(), kDecoderPull);
-                pulled.assign(p->ring.begin(), p->ring.begin() + take);
-                p->ring.erase(p->ring.begin(), p->ring.begin() + take);
+                pulled.resize(std::min(p->ring.size(), kDecoderPull));
+                p->ring.pop_front(pulled.data(), pulled.size());
             }
             input_done_snap = p->input_done;
             ring_empty_snap = p->ring.empty();
@@ -339,7 +345,9 @@ void PumpDecoderMain(Pump* p) {
         const bool at_eof = input_done_snap && ring_empty_snap;
         while (!win.empty() && (win.size() >= kDecodeReserve || at_eof)) {
             mp3dec_frame_info_t info;
-            int samples = mp3dec_decode_frame(mp3, win.data(), (int)win.size(), pcm, &info);
+            int64_t tp = esp_timer_get_time();
+            int samples = mp3dec_decode_frame_ex(mp3, scratch, win.data(), (int)win.size(), pcm, &info);
+            us_decode += esp_timer_get_time() - tp;
             if (info.frame_bytes == 0) {
                 break;  // 当前窗不足一帧，需更多输入
             }
@@ -348,18 +356,29 @@ void PumpDecoderMain(Pump* p) {
             if (samples > 0) {
                 p->decoded_frames++;
                 out.clear();
+                tp = esp_timer_get_time();
                 resampler.Process(pcm, samples, info.channels, info.hz, out);
+                us_resamp += esp_timer_get_time() - tp;
                 p->resampled_samples += out.size();
+                tp = esp_timer_get_time();
                 size_t fed = FeedWithSkip(p, out, skip_remaining,
 #ifndef ESP_PLATFORM
                                           wav,
 #endif
                                           p->playback_gen);
+                us_feed += esp_timer_get_time() - tp;
                 // 首个真正喂进播放管线的帧（跳过阶段不算）：Loading→Playing 的唯一触发
                 // 点。修复此前"源一打开就报 Playing"导致从未连上的流长时间误报播放中。
                 if (fed > 0 && !flowing_reported) {
                     flowing_reported = true;
                     if (p->host) p->host->OnPlaybackFlowing(p, p->cur_index.load());
+                }
+                // 追赶限速：缓冲已 ≥1s 后每帧让出 2ms。此前起播/切曲要全速灌满 3s 水位，
+                // decoder 连续满负荷 5-8s 与 LVGL 同核同优先级抢时间片（真机实测该窗口
+                // 每帧解码从稳态 1.3ms 劣化到 25ms、核1 拉满、UI 掉帧卡顿）。限速后
+                // 首秒仍全速（快出声），其后 ~8×实时温和填充，3s 水位 <1s 建立。
+                if (!p->stop && mhal::audio_pipeline::PlaybackFilled() >= (size_t)(sr * 2)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
             }
             if (p->stop) break;
@@ -370,11 +389,14 @@ void PumpDecoderMain(Pump* p) {
         if (now - last_log_us >= 5000000) {
             last_log_us = now;
             ESP_LOGI(TAG,
-                     "wall=%ds state=%s pos=%ds frames=%u resamp=%u ring=%uB ring_hi=%uB",
+                     "wall=%ds state=%s pos=%ds frames=%u resamp=%u ring=%uB ring_hi=%uB "
+                     "dec=%dms rs=%dms feed=%dms",
                      (int)((now - start_us) / 1000000), StateName(MediaController::Instance().state()),
                      MediaController::Instance().position_s(),
                      (unsigned)p->decoded_frames.load(), (unsigned)p->resampled_samples.load(),
-                     (unsigned)p->ring.size(), (unsigned)p->ring_high_water.load());
+                     (unsigned)p->ring.size(), (unsigned)p->ring_high_water.load(),
+                     (int)(us_decode / 1000), (int)(us_resamp / 1000), (int)(us_feed / 1000));
+            us_decode = us_resamp = us_feed = 0;
         }
 
         // 本曲是否解码搬完：input_done + 字节环空（at_eof）即榨干完毕（上面的解码在 EOF 下
@@ -402,7 +424,22 @@ void PumpDecoderMain(Pump* p) {
              (unsigned)p->decoded_frames.load(), (unsigned)p->resampled_samples.load(),
              (unsigned)p->fed_samples.load(), (unsigned)cleared_tail);
     delete mp3;
+    delete scratch;
     delete[] pcm;
+}
+
+// ============================ 线程入口包装 ============================
+
+// 跑完线程体后发退出信号：设备端 teardown 靠它等线程真正结束（不能 pthread_join，
+// 见 media_internal.h Pump::exit_sem 注释）。PumpSignalExit 之后不得再触碰 p。
+void PumpReaderMain(Pump* p) {
+    ReaderRun(p);
+    PumpSignalExit(p);
+}
+
+void PumpDecoderMain(Pump* p) {
+    DecoderRun(p);
+    PumpSignalExit(p);
 }
 
 }  // namespace media

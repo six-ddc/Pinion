@@ -1,18 +1,37 @@
 #include "pi_media.h"
 
+#include <sys/stat.h>
+
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"  // 播控图元画布显式 PSRAM 分配
+#include "esp_pthread.h"  // 后台封面读盘 worker 的栈配置（仅真机路径）
+#include "freertos/FreeRTOS.h"  // worker 退出握手信号量（设备端不能 join，见 StopCoverWorker）
+#include "freertos/semphr.h"
+#include "metalio_hal/display.h"  // worker 线程投递 lv_async_call 前须持 LVGL 锁
+#endif
+
+#include "cJSON.h"                     // 断点续播记录：JSON 序列化/解析
 #include "esp_log.h"
 #include "media_player/media_id3.h"
 #include "media_player/media_player.h"
+#include "media_player/radio_stations.h"  // 电台续播：station index -> 名称/URL
+#include "metalio_hal/audio.h"         // Now-Playing 页音量条
+#include "metalio_hal/network.h"       // 电台续播的联网判定
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "screen_util.h"
+#include "settings.h"                  // NVS 持久化「media/last」
 
 // lv_image_decoder_dsc_t 的字段（.header/.decoded）只在私有头里给了完整定义
 // （公开头 lv_types.h 只 forward-declare）；LVGL_ROOT_DIR（managed_components/
@@ -96,7 +115,16 @@ lv_obj_t* MakeTri(lv_obj_t* parent, int32_t size, int dir, Tok tok) {
     lv_obj_remove_flag(cv, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(cv, LV_OBJ_FLAG_CLICKABLE);
     size_t buf_size = 4u * (size + LV_DRAW_BUF_STRIDE_ALIGN - 1) * size + LV_DRAW_BUF_ALIGN;
+#ifdef ESP_PLATFORM
+    // 30px 档 (~3.6KB) 低于 SPIRAM_MALLOC_ALWAYSINTERNAL(4096) 会落内部堆——低水位
+    // 时拿到 NULL 曾致：按钮画残 + 每帧 esp_cache_msync(NULL) 报错。像素缓冲 CPU
+    // 软绘，显式 PSRAM 优先，不占内部 RAM。
+    void* buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    if (buf == nullptr) buf = malloc(buf_size);
+#else
     void* buf = malloc(buf_size);
+#endif
+    if (buf == nullptr) return cv;  // 极端低内存：无图元退化，绝不给 canvas 空缓冲
     lv_canvas_set_buffer(cv, buf, size, size, LV_COLOR_FORMAT_ARGB8888);
     lv_obj_add_event_cb(cv, OnGlyphDeleted, LV_EVENT_DELETE, buf);
     s_glyphs.push_back({cv, size, dir, tok});
@@ -364,12 +392,16 @@ lv_obj_t* s_prog_fill = nullptr;
 lv_obj_t* s_time_cur = nullptr;
 lv_obj_t* s_time_dur = nullptr;
 lv_obj_t* s_play_host = nullptr;  // 88 圆内的图元容器
+lv_obj_t* s_vol_slider = nullptr;  // Now-Playing 页音量条（任务C）
+lv_obj_t* s_vol_val = nullptr;
+uint32_t s_vol_last_apply_ms = 0;
 lv_obj_t* s_drawer_root = nullptr;
 lv_obj_t* s_drawer_list = nullptr;
 std::vector<lv_obj_t*> s_drawer_rows;
 
-constexpr int32_t kArt = 330;
+constexpr int32_t kArt = 300;  // 任务C：为音量条腾出竖向空间（原 330）
 constexpr int32_t kProgW = kW - 96;
+constexpr uint32_t kVolApplyGapMs = 150;  // 拖动中节流写 NVS（同快捷面板 VOL 语义）
 
 struct PageCache {
     int index = -2;
@@ -377,6 +409,137 @@ struct PageCache {
     bool is_stream = false;
     std::string title;
 } s_page_cache;
+
+// ---------------------------------------------------------------------------
+// 断点续播持久化（体验优化 任务A）：pi_media 层用 Settings 写 NVS "media"/"last"
+// 一条 JSON 记录（组件层 media_player 保持无 UI/NVS 依赖）。写磨损保护：值不变
+// 不写；pos 只在 60s 周期采样进 JSON，稳态播放约 60s 才落一次盘。NVS 字符串 ~4000B
+// 上限——文件路径列表超预算时以当前曲为中心截窗，丢弃两端并记录。
+// ---------------------------------------------------------------------------
+constexpr char kNvsNs[] = "media";
+constexpr char kNvsKey[] = "last";
+constexpr size_t kPathBudget = 3400;  // 路径部分字节预算（留 JSON scaffolding 余量）
+constexpr int kMaxTracks = 60;        // 记录曲目数上限（兼顾 NVS 尺寸 + 续播时 ID3 回读耗时）
+
+std::string s_last_saved;   // 去重：与上次写入完全一致则不写
+std::string s_persist_sig;  // 不含 pos 的签名（state:index:size:path），变则立即存
+int s_persist_tick = 0;     // TimerCb 计数，用于 60s 周期采样
+
+std::string BaseNoExt(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    return (dot == std::string::npos) ? name : name.substr(0, dot);
+}
+std::string ParentDirName(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return {};
+    size_t p = path.find_last_of('/', slash - 1);
+    return (p == std::string::npos) ? path.substr(0, slash) : path.substr(p + 1, slash - p - 1);
+}
+// 与 pi_card_media 的 ApplyId3Meta 等价（那份是另一 TU 的私有 static，不可跨文件复用）。
+void ApplyId3(std::string& title, std::string& sub, const std::string& path) {
+    media_id3::Tags t = media_id3::ReadTags(path);
+    if (!t.title.empty()) title = t.title;
+    if (!t.album.empty() && !t.artist.empty())
+        sub = t.album + " \xc2\xb7 " + t.artist;  // "专辑 · 艺人"
+    else if (!t.album.empty())
+        sub = t.album;
+    else if (!t.artist.empty())
+        sub = t.artist;
+}
+// url -> kRadioStations 下标；找不到返回 -1。
+int StationIndexOfUrl(const std::string& url) {
+    for (size_t i = 0; i < media::kRadioStationCount; i++) {
+        if (url == media::kRadioStations[i].url) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// 序列化当前 MediaController 播放态为 JSON；空列表返回 ""。
+std::string BuildLastJson() {
+    media::MediaController& mc = media::MediaController::Instance();
+    int n = mc.playlist_size();
+    if (n <= 0) return {};
+    int idx = mc.index();
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    media::MediaItem cur = mc.current();
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) return {};
+
+    if (cur.is_stream) {
+        cJSON_AddStringToObject(root, "type", "radio");
+        cJSON_AddNumberToObject(root, "index", idx);
+        cJSON_AddNumberToObject(root, "pos_s", 0);  // 直播无位置
+        cJSON* arr = cJSON_AddArrayToObject(root, "stations");
+        for (int i = 0; i < n; i++) {
+            int sidx = StationIndexOfUrl(mc.item_at(i).path_or_url);
+            if (sidx >= 0) cJSON_AddItemToArray(arr, cJSON_CreateNumber(sidx));
+        }
+    } else {
+        std::vector<std::string> paths;
+        paths.reserve(n);
+        for (int i = 0; i < n; i++) paths.push_back(mc.item_at(i).path_or_url);
+        // 以当前曲为中心对称扩窗（字节预算 + 曲目数上限双钳制）。
+        int lo = idx, hi = idx;
+        size_t used = paths[idx].size() + 8;
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            if (hi + 1 < n && (hi - lo + 1) < kMaxTracks &&
+                used + paths[hi + 1].size() + 8 <= kPathBudget) {
+                used += paths[++hi].size() + 8;
+                grew = true;
+            }
+            if (lo - 1 >= 0 && (hi - lo + 1) < kMaxTracks &&
+                used + paths[lo - 1].size() + 8 <= kPathBudget) {
+                used += paths[--lo].size() + 8;
+                grew = true;
+            }
+        }
+        if (lo > 0 || hi < n - 1) {
+            ESP_LOGW(TAG, "media last: playlist windowed [%d,%d]/%d (dropped head=%d tail=%d)", lo, hi,
+                     n, lo, n - 1 - hi);
+        }
+        cJSON_AddStringToObject(root, "type", "file");
+        cJSON_AddNumberToObject(root, "index", idx - lo);  // 窗内相对下标
+        cJSON_AddNumberToObject(root, "pos_s", mc.position_s());
+        cJSON* arr = cJSON_AddArrayToObject(root, "paths");
+        for (int i = lo; i <= hi; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(paths[i].c_str()));
+    }
+
+    char* txt = cJSON_PrintUnformatted(root);
+    std::string out = (txt != nullptr) ? txt : std::string();
+    if (txt != nullptr) cJSON_free(txt);
+    cJSON_Delete(root);
+    return out;
+}
+
+void DoSaveLast() {
+    std::string j = BuildLastJson();
+    if (j.empty() || j == s_last_saved) return;  // 无内容 / 未变化：不写（NVS 磨损保护）
+    Settings s(kNvsNs, /*read_write=*/true);
+    s.SetString(kNvsKey, j);
+    s_last_saved = j;
+    ESP_LOGI(TAG, "media last saved (%zuB)", j.size());
+}
+
+// TimerCb 每秒调：曲目/状态/列表变化立即存；稳态播放每 60s 采样一次 pos。
+void PersistPoll() {
+    media::MediaController& mc = media::MediaController::Instance();
+    if (mc.playlist_size() <= 0) return;  // 无内容可存（不擦除既有记录）
+    media::MediaState st = mc.state();
+    std::string sig = std::to_string(static_cast<int>(st)) + ":" + std::to_string(mc.index()) + ":" +
+                      std::to_string(mc.playlist_size()) + ":" + mc.current().path_or_url;
+    bool changed = (sig != s_persist_sig);
+    s_persist_tick++;
+    bool periodic = (st == media::MediaState::Playing && (s_persist_tick % 60 == 0));
+    if (!changed && !periodic) return;
+    s_persist_sig = sig;
+    DoSaveLast();
+}
 
 // ---------------------------------------------------------------------------
 // 封面预解码（Stage E）：换曲时把内嵌 APIC（JPEG via tjpgd / PNG via lodepng）
@@ -402,6 +565,32 @@ void FreeCoverBitmap(CoverBitmap* cb) {
     cb->dsc = lv_image_dsc_t{};
 }
 
+// ---- 封面后台加载（Stage E fix）：把 APIC 读盘（可达 4MB、SD 变长延迟）挪出
+// LVGL 线程；只保留"解码 + 叠图"在 LVGL 线程（经 lv_async_call 回调完成——LVGL
+// 解码器/位图操作非线程安全，必须在 LVGL 线程做）。generation 计数处理换曲/连跳
+// 竞态：过期结果一律释放不上屏。worker 为单线程 latest-wins，避免连跳时多份并发
+// 大读盘与内存尖峰。设备端用 esp_pthread 抬栈；sim 端普通 std::thread。
+std::atomic<uint32_t> s_cover_gen{0};  // 每次换曲/关页 +1，作废在途封面加载
+std::thread s_cover_worker;
+std::mutex s_cover_mtx;
+std::condition_variable s_cover_cv;
+std::string s_cover_req_path;  // 最新一次请求路径（latest-wins）
+uint32_t s_cover_req_gen = 0;
+bool s_cover_req_pending = false;
+bool s_cover_worker_stop = false;
+// worker 存活标记（s_cover_mtx 保护）：设备端线程创建后立即 detach，joinable() 恒为
+// false，不能再拿它当"worker 在跑"的判据。
+bool s_cover_worker_alive = false;
+#ifdef ESP_PLATFORM
+SemaphoreHandle_t s_cover_exit_sem = nullptr;  // worker 退出信号（懒创建、常驻；见 StopCoverWorker）
+#endif
+
+struct CoverReady {
+    uint32_t gen;
+    uint8_t* bytes;  // ReadCover 的 malloc 缓冲；OnCoverReady 所有分支负责 free
+    size_t size;
+};
+
 // bytes/len：APIC 原始编码字节（调用方持有，本函数只读不释放）。成功时 out
 // 持有一份自己 malloc 的位图（cf/w/h/stride 取自解码器实际结果）。
 bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
@@ -409,15 +598,39 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
     if (!media_id3::PeekImageSize(bytes, len, &w, &h)) return false;
     if (w <= 0 || h <= 0 || w > 800 || h > 800) return false;  // 防御性尺寸门控
 
+    // EXIF/非标 APP0 的 baseline JPEG：底层 tjpgd 能解，但 LVGL 包装层 is_jpg() 只
+    // 认精确 JFIF 签名。喂解码器前做 JFIF 归一化（插入标准 APP0）。尺寸/progressive
+    // 门控已在原始 bytes 上判完——归一化逐字节保留 SOF/扫描段，尺寸不变。
+    const uint8_t* dec_bytes = bytes;
+    size_t dec_len = len;
+    size_t norm_len = 0;
+    uint8_t* norm = media_id3::NormalizeJpegHeader(bytes, len, &norm_len);
+    if (norm != nullptr) {
+        dec_bytes = norm;
+        dec_len = norm_len;
+    }
+
     lv_image_dsc_t src{};
-    src.data = bytes;
-    src.data_size = static_cast<uint32_t>(len);
+    src.data = dec_bytes;
+    src.data_size = static_cast<uint32_t>(dec_len);
     src.header.cf = LV_COLOR_FORMAT_RAW;  // 让解码器按魔数自行识别 JPEG/PNG
     src.header.w = static_cast<uint32_t>(w);
     src.header.h = static_cast<uint32_t>(h);
 
     lv_image_decoder_dsc_t dsc{};
-    if (lv_image_decoder_open(&dsc, &src, nullptr) != LV_RESULT_OK) return false;
+    if (lv_image_decoder_open(&dsc, &src, nullptr) != LV_RESULT_OK) {
+        if (norm != nullptr) free(norm);
+        return false;
+    }
+    // 兜底防御：若没有真正的解码器接手（tjpgd/lodepng 都不认——如归一化也救不了的
+    // 畸形/progressive-被-info-放行-但-open-失败之外的变体），LVGL 会退到 bin_decoder，
+    // 它把 RAW 原样包成一份 decoded（cf 仍为 RAW）。此时绝不能把未解码的编码字节当
+    // 位图整块拷出去（会显示成花屏），一律当解码失败处理，退回生成式母题。
+    if (dsc.header.cf == LV_COLOR_FORMAT_RAW) {
+        lv_image_decoder_close(&dsc);
+        if (norm != nullptr) free(norm);
+        return false;
+    }
 
     uint8_t* buf = nullptr;
     size_t buf_size = 0;
@@ -449,8 +662,11 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
             lv_area_t full_area{0, 0, static_cast<int32_t>(out_w) - 1, static_cast<int32_t>(out_h) - 1};
             lv_area_t tile{LV_COORD_MIN, LV_COORD_MIN, LV_COORD_MIN, LV_COORD_MIN};
             lv_result_t res = LV_RESULT_OK;
+            // tile 数上限按最小 MCU 8×8 估 ceil(w/8)*ceil(h/8) + 余量：之前硬编码 4096
+            // 会把大尺寸低子采样（4:4:4/灰度，8×8 MCU）JPEG 的下半部截成黑块。
+            int max_tiles = ((static_cast<int>(out_w) + 7) / 8) * ((static_cast<int>(out_h) + 7) / 8) + 16;
             int guard = 0;
-            while (res == LV_RESULT_OK && guard++ < 4096) {  // guard：绝不死循环
+            while (res == LV_RESULT_OK && guard++ < max_tiles) {  // guard：绝不死循环
                 res = lv_image_decoder_get_area(&dsc, &full_area, &tile);
                 if (res != LV_RESULT_OK) break;
                 const lv_draw_buf_t* db = dsc.decoded;
@@ -474,6 +690,7 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
         cf = LV_COLOR_FORMAT_RGB888;
     }
     lv_image_decoder_close(&dsc);
+    if (norm != nullptr) free(norm);  // 归一化缓冲仅解码期间被 memfs 引用，此刻可释放
 
     if (buf == nullptr) return false;
     s_cover_alloc_count++;
@@ -488,30 +705,29 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
     return true;
 }
 
-// 换曲时调用：读 APIC → 门控尺寸 → 预解码 → 成功则在 s_art_host 内叠一张
-// LV_IMAGE_ALIGN_COVER 图（裁切铺满 330×330，圆角由 s_art_host 的 clip_corner
-// 兜底）。失败（无 APIC/超尺寸/解码失败——含约 10-20% 的 progressive JPEG，
-// tjpgd 不支持）时静默什么都不做，art_host 保留 BuildArt 已画好的生成式母题。
-void TryLoadCover(const std::string& path) {
-    uint32_t t0 = lv_tick_get();
-    size_t sz = 0;
-    std::string mime;
-    uint8_t* bytes = media_id3::ReadCover(path, &sz, &mime);
-    uint32_t t1 = lv_tick_get();
-    if (bytes == nullptr) {
-        ESP_LOGI(TAG, "cover: no APIC (read %ums)", static_cast<unsigned>(t1 - t0));
+// LVGL 线程（lv_async_call 回调）：解码 worker 读回的封面字节，成功则在 s_art_host
+// 内叠一张 LV_IMAGE_ALIGN_COVER 图（裁切铺满 330×330，圆角由 s_art_host 的
+// clip_corner 兜底）。全程复核 generation + 页面状态：过期（用户又换了曲）或页面
+// 已关则释放不上屏。失败（超尺寸/progressive/解码失败）静默保留生成式母题。
+void OnCoverReady(void* p) {
+    CoverReady* cr = static_cast<CoverReady*>(p);
+    if (cr->gen != s_cover_gen.load() || s_art_host == nullptr) {  // 已过期/页已关
+        free(cr->bytes);
+        delete cr;
         return;
     }
-
     CoverBitmap cb;
-    bool ok = DecodeCoverBytes(bytes, sz, &cb);
-    uint32_t t2 = lv_tick_get();
-    ESP_LOGI(TAG, "cover: %s mime=%s bytes=%zu read=%ums decode=%ums total=%ums", ok ? "OK" : "FAIL",
-             mime.c_str(), sz, static_cast<unsigned>(t1 - t0), static_cast<unsigned>(t2 - t1),
-             static_cast<unsigned>(t2 - t0));
-    free(bytes);  // 原始编码字节仅解码期间需要，位图已自持一份
-    if (!ok) return;
-
+    bool ok = DecodeCoverBytes(cr->bytes, cr->size, &cb);
+    free(cr->bytes);  // 原始编码字节仅解码期间需要
+    if (!ok) {
+        delete cr;
+        return;
+    }
+    if (cr->gen != s_cover_gen.load() || s_art_host == nullptr) {  // 解码期间又换曲
+        FreeCoverBitmap(&cb);  // 丢弃这份，不泄漏、不上屏
+        delete cr;
+        return;
+    }
     FreeCoverBitmap(&s_cover);
     s_cover = cb;
 
@@ -522,6 +738,124 @@ void TryLoadCover(const std::string& path) {
     lv_image_set_src(img, &s_cover.dsc);
     lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);  // 保持比例铺满+居中裁切
     lv_obj_center(img);
+    delete cr;
+}
+
+// 后台 worker（非 LVGL 线程）：只做 ReadCover（SD 读盘，可达 4MB、变长延迟），读到
+// 后经 lv_async_call 把字节交回 LVGL 线程解码。latest-wins：连跳时旧请求在取出前
+// 就被覆盖，读盘期间换曲的结果按 generation 丢弃。
+void CoverWorkerRun() {
+    for (;;) {
+        std::string path;
+        uint32_t gen;
+        {
+            std::unique_lock<std::mutex> lk(s_cover_mtx);
+            s_cover_cv.wait(lk, [] { return s_cover_req_pending || s_cover_worker_stop; });
+            if (s_cover_worker_stop) return;
+            path = s_cover_req_path;
+            gen = s_cover_req_gen;
+            s_cover_req_pending = false;
+        }
+        if (gen != s_cover_gen.load()) continue;  // 取出前已被更新请求超越
+        uint32_t t0 = lv_tick_get();
+        size_t sz = 0;
+        std::string mime;
+        uint8_t* bytes = media_id3::ReadCover(path, &sz, &mime);
+        uint32_t t1 = lv_tick_get();
+        if (bytes == nullptr) {
+            ESP_LOGI(TAG, "cover: no APIC (read %ums)", static_cast<unsigned>(t1 - t0));
+            continue;
+        }
+        if (gen != s_cover_gen.load()) {  // 读盘期间换曲：丢弃，不泄漏
+            free(bytes);
+            continue;
+        }
+        ESP_LOGI(TAG, "cover: read %zuB in %ums mime=%s -> decode on LVGL thread", sz,
+                 static_cast<unsigned>(t1 - t0), mime.c_str());
+        // lv_async_call 操作 LVGL 内部链表，非线程安全：设备端持 esp_lv_adapter 锁，
+        // sim 端（LV_USE_OS=PTHREAD）持 lv_lock，与各自的 lv_timer_handler 泵互斥。
+#ifdef ESP_PLATFORM
+        mhal::display::Lock();
+        lv_async_call(OnCoverReady, new CoverReady{gen, bytes, sz});
+        mhal::display::Unlock();
+#else
+        lv_lock();
+        lv_async_call(OnCoverReady, new CoverReady{gen, bytes, sz});
+        lv_unlock();
+#endif
+    }
+}
+
+// 线程入口包装：跑完线程体后发退出信号（设备端）。信号之后不得再触碰任何 s_cover_* 状态。
+void CoverWorkerMain() {
+    CoverWorkerRun();
+#ifdef ESP_PLATFORM
+    xSemaphoreGive(s_cover_exit_sem);
+#endif
+}
+
+void StopCoverWorker() {
+    bool was_alive;
+    {
+        std::lock_guard<std::mutex> lk(s_cover_mtx);
+        was_alive = s_cover_worker_alive;
+        s_cover_worker_stop = true;
+    }
+    s_cover_cv.notify_one();
+#ifdef ESP_PLATFORM
+    // 设备端不能 join：本函数跑在 LVGL 任务上，esp_pthread 的 join 等在 task notification
+    // 槽 0 上，会被 VSync/跨线程唤醒等对 LVGL 任务的无关 notify 假唤醒，随即 vTaskDelete
+    // 掉还阻塞在 cv 里的 worker（栈被释放、cv 等待节点悬挂）——与媒体泵"下一台"崩溃同一
+    // 根因（详见 media_player/src/media_internal.h Pump::exit_sem 注释）。worker 已
+    // detach，这里改等它的退出信号量。
+    if (was_alive) xSemaphoreTake(s_cover_exit_sem, portMAX_DELAY);
+#else
+    (void)was_alive;
+    if (s_cover_worker.joinable()) s_cover_worker.join();
+#endif
+    {
+        std::lock_guard<std::mutex> lk(s_cover_mtx);
+        s_cover_worker_alive = false;
+    }
+}
+
+// 换曲时调用（LVGL 线程）：把封面加载请求交给后台 worker（懒创建）。gen 已在
+// RefreshPage 换曲分支 +1，这里取当前 gen 作为本请求版本。电台不调本函数。
+void TryLoadCover(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lk(s_cover_mtx);
+        if (!s_cover_worker_alive) {
+            s_cover_worker_stop = false;
+#ifdef ESP_PLATFORM
+            if (s_cover_exit_sem == nullptr) s_cover_exit_sem = xSemaphoreCreateBinary();
+            if (s_cover_exit_sem == nullptr) return;  // 极端低内存：放弃本次封面加载
+            // esp_pthread_set_cfg 影响本任务（LVGL）今后创建的所有 pthread，用完即还原
+            //（同 media_controller.cc StartPump 的处理与理由）。
+            esp_pthread_cfg_t prev_cfg;
+            const bool had_prev_cfg = esp_pthread_get_cfg(&prev_cfg) == ESP_OK;
+            esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+            cfg.stack_size = 6144;  // ReadCover fread + std::string；无 minmp3，栈占用小
+            cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;  // 栈放 PSRAM（只做 SD 读）
+            cfg.thread_name = "cover_ld";
+            esp_pthread_set_cfg(&cfg);
+            s_cover_worker = std::thread(CoverWorkerMain);
+            s_cover_worker.detach();  // 生死由 s_cover_exit_sem 握手（见 StopCoverWorker）
+            if (had_prev_cfg) {
+                esp_pthread_set_cfg(&prev_cfg);
+            } else {
+                esp_pthread_cfg_t def = esp_pthread_get_default_config();
+                esp_pthread_set_cfg(&def);
+            }
+#else
+            s_cover_worker = std::thread(CoverWorkerMain);
+#endif
+            s_cover_worker_alive = true;
+        }
+        s_cover_req_path = path;
+        s_cover_req_gen = s_cover_gen.load();
+        s_cover_req_pending = true;
+    }
+    s_cover_cv.notify_one();
 }
 
 void BuildArt(bool is_stream, bool playing) {
@@ -704,6 +1038,27 @@ void OnPrev(lv_event_t*) { MediaController::Instance().Prev(); }
 void OnNext(lv_event_t*) { MediaController::Instance().Next(); }
 void OnPlay(lv_event_t*) { MediaController::Instance().Toggle(); }
 
+// 音量条（任务C）：拖动即时生效，NVS 持久化收敛到松手 + 拖动中按 kVolApplyGapMs
+// 节流（mhal::audio::SetVolume 内部永远持久化，语义同快捷面板 VOL 滑条）。
+void OnVolChanged(lv_event_t*) {
+    if (s_vol_slider == nullptr) return;
+    int v = static_cast<int>(lv_slider_get_value(s_vol_slider));
+    if (s_vol_val != nullptr) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%d", v);
+        lv_label_set_text(s_vol_val, buf);
+    }
+    uint32_t now = lv_tick_get();
+    if (now - s_vol_last_apply_ms >= kVolApplyGapMs) {
+        s_vol_last_apply_ms = now;
+        mhal::audio::SetVolume(v, true);
+    }
+}
+void OnVolReleased(lv_event_t*) {
+    if (s_vol_slider == nullptr) return;
+    mhal::audio::SetVolume(static_cast<int>(lv_slider_get_value(s_vol_slider)), true);
+}
+
 // 顶栏图元小钮（back / list），48px 触区、透明底。
 lv_obj_t* MakeTopBtn(lv_obj_t* parent, lv_event_cb_t cb, int32_t x) {
     lv_obj_t* b = lv_obj_create(parent);
@@ -822,6 +1177,50 @@ void BuildPage() {
     s_time_dur = Label(s_root, "--:--", &font_pi_mono_14, Tok::Faint);
     lv_obj_align(s_time_dur, LV_ALIGN_TOP_RIGHT, -48, prog_y + 14);
 
+    // 音量条（任务C）：VOL caption + slider + value，位于时间行与传输排之间。尺寸/
+    // 触区同快捷面板 VOL 滑条；滑条起于 x=48（屏内），不触发 edge-swipe 屏缘拦截层
+    // （indev 级只拦真正屏缘起手，内部横向拖动归控件本身）。
+    lv_obj_t* vol_row = lv_obj_create(s_root);
+    screen_strip_obj_chrome(vol_row);
+    lv_obj_remove_flag(vol_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(vol_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(vol_row, kProgW, 40);
+    lv_obj_set_pos(vol_row, 48, prog_y + 40);
+    lv_obj_set_style_bg_opa(vol_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(vol_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(vol_row, 16, LV_PART_MAIN);
+
+    lv_obj_t* vol_lbl = Label(vol_row, "VOL", &font_pi_mono_14, Tok::Faint);
+    lv_obj_set_style_text_letter_space(vol_lbl, 2, LV_PART_MAIN);
+    lv_obj_set_width(vol_lbl, 40);
+
+    s_vol_slider = lv_slider_create(vol_row);
+    lv_slider_set_range(s_vol_slider, 0, 100);
+    lv_obj_set_height(s_vol_slider, 6);
+    lv_obj_set_flex_grow(s_vol_slider, 1);
+    pi_theme::ApplyBg(s_vol_slider, Tok::Card2);
+    lv_obj_set_style_bg_opa(s_vol_slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_vol_slider, 3, LV_PART_MAIN);
+    pi_theme::ApplyBg(s_vol_slider, Tok::Accent, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_vol_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    pi_theme::ApplyBg(s_vol_slider, Tok::Accent, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_vol_slider, 14, LV_PART_KNOB);
+    lv_obj_set_style_radius(s_vol_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(s_vol_slider, 22);
+    lv_slider_set_value(s_vol_slider, mhal::audio::GetVolume(), LV_ANIM_OFF);
+    lv_obj_add_event_cb(s_vol_slider, OnVolChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(s_vol_slider, OnVolReleased, LV_EVENT_RELEASED, nullptr);
+
+    s_vol_val = Label(vol_row, "", &font_pi_mono_20, Tok::Tx);
+    lv_obj_set_width(s_vol_val, 44);
+    lv_obj_set_style_text_align(s_vol_val, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    {
+        char vbuf[8];
+        std::snprintf(vbuf, sizeof(vbuf), "%d", mhal::audio::GetVolume());
+        lv_label_set_text(s_vol_val, vbuf);
+    }
+
     // 传输排：prev(64) / play(88) / next(64)，居中于底部带
     const int32_t cy = kH - kBandH / 2 - 6;
     lv_obj_t* ph = nullptr;
@@ -855,6 +1254,7 @@ void RefreshPage() {
         lv_label_set_text(s_eyebrow, cur.is_stream ? "LIVE RADIO" : "NOW PLAYING");
         lv_label_set_text(s_title, cur.title.empty() ? "--" : cur.title.c_str());
         lv_label_set_text(s_sub, cur.subtitle.c_str());
+        s_cover_gen.fetch_add(1);             // 作废任何在途封面加载（含切到电台的情形）
         FreeCoverBitmap(&s_cover);            // 换曲：先释放上一曲的解码位图
         BuildArt(cur.is_stream, playing);     // 生成式母题打底（clean 掉旧封面 img）
         ESP_LOGI(TAG, "track_changed idx=%d is_stream=%d path=%s", idx, cur.is_stream,
@@ -892,6 +1292,19 @@ void RefreshPage() {
         if (pct > 100) pct = 100;
         lv_obj_set_width(s_prog_fill, kProgW * pct / 100);
     }
+
+    // 音量条：非拖动时跟随硬件音量（如快捷面板/按键改了音量）保持同步。
+    if (s_vol_slider != nullptr && !lv_obj_has_state(s_vol_slider, LV_STATE_PRESSED)) {
+        int hv = mhal::audio::GetVolume();
+        if (static_cast<int>(lv_slider_get_value(s_vol_slider)) != hv) {
+            lv_slider_set_value(s_vol_slider, hv, LV_ANIM_OFF);
+            if (s_vol_val != nullptr) {
+                char vb[8];
+                std::snprintf(vb, sizeof(vb), "%d", hv);
+                lv_label_set_text(s_vol_val, vb);
+            }
+        }
+    }
 }
 
 void OnThemeChanged() {
@@ -906,6 +1319,7 @@ void OnThemeChanged() {
 void TimerCb(lv_timer_t*) {
     RefreshMini();
     RefreshPage();
+    PersistPoll();  // 断点续播：变化即存、稳态播放每 60s 采样一次
 }
 
 }  // namespace
@@ -944,7 +1358,9 @@ void Close() {
         s_root = nullptr;
         s_eyebrow = s_art_host = s_title = s_sub = nullptr;
         s_prog_track = s_prog_fill = s_time_cur = s_time_dur = s_play_host = nullptr;
+        s_vol_slider = s_vol_val = nullptr;
     }
+    s_cover_gen.fetch_add(1);   // 作废任何在途封面加载（页面关闭）
     FreeCoverBitmap(&s_cover);  // 页面不可见时不留一份解码位图在内存里
     s_page_cache.index = -2;    // 逼下次 Open() 重新走 track_changed（含重新预解码封面）
 }
@@ -959,7 +1375,110 @@ void Back() {
     Close();
 }
 
+bool HasResumable() {
+    if (media::MediaController::Instance().state() != media::MediaState::Stopped) return true;
+    Settings s(kNvsNs);  // 只读
+    return !s.GetString(kNvsKey, "").empty();
+}
+
+ResumeResult ResumeLast() {
+    media::MediaController& mc = media::MediaController::Instance();
+    if (mc.state() != media::MediaState::Stopped) {  // 正在播/暂停/加载：直接开页
+        Open();
+        return ResumeResult::Opened;
+    }
+    Settings s(kNvsNs);  // 只读
+    std::string j = s.GetString(kNvsKey, "");
+    if (j.empty()) return ResumeResult::NoRecord;
+    cJSON* root = cJSON_Parse(j.c_str());
+    if (root == nullptr) {
+        ESP_LOGW(TAG, "ResumeLast: corrupt record, ignoring");
+        return ResumeResult::NoRecord;
+    }
+
+    cJSON* jtype = cJSON_GetObjectItem(root, "type");
+    cJSON* jindex = cJSON_GetObjectItem(root, "index");
+    const char* type = cJSON_IsString(jtype) ? jtype->valuestring : "";
+    int saved_index = cJSON_IsNumber(jindex) ? jindex->valueint : 0;
+    ResumeResult result = ResumeResult::NoRecord;
+
+    if (std::strcmp(type, "radio") == 0) {
+        // 电台是外拨 http，4G/WiFi 皆可（不像文件后台需 WiFi）；只判有无联网。
+        if (!mhal::network::IsConnected()) {
+            cJSON_Delete(root);
+            return ResumeResult::NoNetwork;
+        }
+        cJSON* arr = cJSON_GetObjectItem(root, "stations");
+        int cnt = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+        std::vector<media::MediaItem> items;
+        for (int i = 0; i < cnt; i++) {
+            cJSON* e = cJSON_GetArrayItem(arr, i);
+            if (!cJSON_IsNumber(e)) continue;
+            int sidx = e->valueint;
+            if (sidx < 0 || sidx >= static_cast<int>(media::kRadioStationCount)) continue;
+            const media::RadioStation& rs = media::kRadioStations[sidx];
+            media::MediaItem m;
+            m.title = rs.name;
+            m.subtitle = rs.genre;
+            m.path_or_url = rs.url;
+            m.is_stream = true;
+            m.duration_s = 0;
+            items.push_back(m);
+        }
+        if (items.empty()) {
+            cJSON_Delete(root);
+            return ResumeResult::NoRecord;
+        }
+        if (saved_index < 0 || saved_index >= static_cast<int>(items.size())) saved_index = 0;
+        mc.StagePlaylist(items, saved_index);
+        result = ResumeResult::Opened;
+    } else {  // file
+        cJSON* arr = cJSON_GetObjectItem(root, "paths");
+        int cnt = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+        std::vector<media::MediaItem> items;
+        int new_idx = 0;
+        bool idx_set = false;
+        uint32_t t0 = lv_tick_get();
+        for (int i = 0; i < cnt; i++) {
+            cJSON* e = cJSON_GetArrayItem(arr, i);
+            if (!cJSON_IsString(e) || e->valuestring == nullptr) continue;
+            std::string p = e->valuestring;
+            struct stat stt;
+            if (::stat(p.c_str(), &stt) != 0 || !S_ISREG(stt.st_mode)) continue;  // 已删除，跳过
+            if (!idx_set && i >= saved_index) {
+                new_idx = static_cast<int>(items.size());  // 存点或其后第一个幸存曲
+                idx_set = true;
+            }
+            media::MediaItem m;
+            m.title = BaseNoExt(p);
+            m.subtitle = ParentDirName(p);
+            ApplyId3(m.title, m.subtitle, p);  // 走现有 ID3 回填（同 pi_card_media 语义）
+            m.path_or_url = p;
+            m.is_stream = false;
+            m.duration_s = media_id3::ProbeDurationS(p);  // 0 = 未知，UI 显示 --:--
+            items.push_back(m);
+        }
+        if (items.empty()) {
+            cJSON_Delete(root);
+            return ResumeResult::FilesGone;
+        }
+        if (!idx_set) new_idx = static_cast<int>(items.size()) - 1;  // 存点在幸存曲之后
+        ESP_LOGI(TAG,
+                 "ResumeLast: file %d survivors start=%d id3=%ums (公有 API 无 seek，pos_s 仅记录，"
+                 "从曲首起播)",
+                 static_cast<int>(items.size()), new_idx,
+                 static_cast<unsigned>(lv_tick_get() - t0));
+        mc.StagePlaylist(items, new_idx);  // start_index>=0 立即起播
+        result = ResumeResult::Opened;
+    }
+
+    cJSON_Delete(root);
+    if (result == ResumeResult::Opened) Open();
+    return result;
+}
+
 void OnScreenUnloaded() {
+    DoSaveLast();  // 断点续播：屏卸载前最后落一次盘
     if (s_timer != nullptr) {
         lv_timer_delete(s_timer);
         s_timer = nullptr;
@@ -969,9 +1488,12 @@ void OnScreenUnloaded() {
     s_drawer_root = s_drawer_list = nullptr;
     s_drawer_rows.clear();
     s_root = nullptr;
+    s_art_host = nullptr;  // widget 随 screen 删除；防止在途 OnCoverReady 误用（gen 双保险）
     s_mini = s_mini_title = s_mini_sub = s_mini_btn = s_mini_glyph = s_mini_prog = nullptr;
     s_mini_shown = false;
     s_mini_cache = MiniCache{};
+    s_cover_gen.fetch_add(1);  // 作废在途封面加载
+    StopCoverWorker();         // 停后台 worker 并 join，避免其在 teardown 后再投递 async
     FreeCoverBitmap(&s_cover);
 }
 

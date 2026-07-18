@@ -9,6 +9,7 @@
 #include "metalio_hal/power.h"
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
+#include "pi_media.h"  // 「音乐」入口：继续上次播放
 #include "pi_theme.h"
 #include "screen_util.h"
 
@@ -376,6 +377,41 @@ void BuildActionGrid(lv_obj_t* parent) {
             pi_quick_panel::Close();
             if (s_hooks.on_files != nullptr)
                 s_hooks.on_files();
+        },
+        LV_EVENT_CLICKED, nullptr);
+
+    // 「♪ 音乐」：继续上次播放。正在播 / 有持久化记录则打开播放页续播；都没有点按
+    // 只吐 toast（不置灰——同「文件」的判定策略，点按时判一次足够）。
+    lv_obj_t* btn_music = MakeGridBtn(grid, "\xe9\x9f\xb3\xe4\xb9\x90");  // "音乐"
+    pi_card::MakeIcon(lv_obj_get_child(btn_music, 0), "music", 24, Tok::Dim);
+    lv_obj_add_event_cb(
+        btn_music,
+        [](lv_event_t*) {
+            // "没有可继续的播放"
+            const char* kNone =
+                "\xe6\xb2\xa1\xe6\x9c\x89\xe5\x8f\xaf\xe7\xbb\xa7\xe7\xbb\xad\xe7\x9a\x84\xe6\x92\xad\xe6\x94\xbe";
+            if (!pi_media::HasResumable()) {
+                ShowToast(kNone, &font_puhui_20_4, Tok::Dim);
+                return;
+            }
+            switch (pi_media::ResumeLast()) {
+                case pi_media::ResumeResult::Opened:
+                    pi_quick_panel::Close();
+                    break;
+                case pi_media::ResumeResult::NoNetwork:
+                    // "无网络连接"
+                    ShowToast("\xe6\x97\xa0\xe7\xbd\x91\xe7\xbb\x9c\xe8\xbf\x9e\xe6\x8e\xa5",
+                              &font_puhui_20_4, Tok::Dim);
+                    break;
+                case pi_media::ResumeResult::FilesGone:
+                    // "文件已不存在"
+                    ShowToast("\xe6\x96\x87\xe4\xbb\xb6\xe5\xb7\xb2\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8",
+                              &font_puhui_20_4, Tok::Dim);
+                    break;
+                default:
+                    ShowToast(kNone, &font_puhui_20_4, Tok::Dim);
+                    break;
+            }
         },
         LV_EVENT_CLICKED, nullptr);
 

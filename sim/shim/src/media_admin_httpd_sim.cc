@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <csignal>
@@ -41,6 +42,7 @@ const char* StatusStr(int code) {
         case 403: return "403 Forbidden";
         case 404: return "404 Not Found";
         case 409: return "409 Conflict";
+        case 411: return "411 Length Required";
         case 413: return "413 Payload Too Large";
         case 429: return "429 Too Many Requests";
         case 500: return "500 Internal Server Error";
@@ -60,11 +62,13 @@ void SendAll(int fd, const char* data, size_t len) {
 }
 
 void SendResponse(int fd, int code, const char* ctype, const std::string& body) {
-    char hdr[256];
+    char hdr[320];
     int hn = std::snprintf(hdr, sizeof(hdr),
                            "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-                           "Connection: close\r\n\r\n",
+                           "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
                            StatusStr(code), ctype, body.size());
+    if (hn < 0) return;
+    if (hn > static_cast<int>(sizeof(hdr))) hn = sizeof(hdr);  // 防截断时越界读
     SendAll(fd, hdr, hn);
     SendAll(fd, body.data(), body.size());
 }
@@ -115,6 +119,14 @@ int ReadBody(BodyReader* br, char* buf, size_t max) {
 }
 
 void HandleConn(int fd) {
+    // 给连接设 recv 超时：慢速/停顿客户端不再占死本连接线程。sim 侧简化为"一次 recv
+    // 超时即当断开中止"（device 壳则用累计超时预算重试）——两端都有界，sim 更严格；
+    // localhost 正常传输不会空闲到 5s，不影响大文件上传。
+    struct timeval tv {
+        5, 0
+    };
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     // 读到 header 结束（\r\n\r\n）；把多读的部分留作 body leftover。
     std::string raw;
     char tmp[4096];
@@ -177,7 +189,9 @@ void HandleConn(int fd) {
         std::string upath, over;
         QueryVal(query, "path", upath);
         QueryVal(query, "overwrite", over);
-        if (!media_admin::TryBeginUpload()) {
+        if (content_len == 0) {  // 无 Content-Length → 拒，勿静默落 0 字节文件（与 device 壳一致）
+            SendResponse(fd, 411, "application/json; charset=utf-8", "{\"error\":\"length required\"}");
+        } else if (!media_admin::TryBeginUpload()) {
             SendResponse(fd, 429, "application/json; charset=utf-8",
                          "{\"error\":\"another upload in progress\"}");
         } else {
@@ -248,6 +262,7 @@ bool Start() {
         std::fprintf(stderr, "[sim][admin] bind/listen :%d failed\n", kPort);
         return false;
     }
+    media_admin::SweepOrphans();  // 清上次遗留的 .part / .old 孤儿（与 device 壳一致）
     s_running.store(true);
     s_accept_thread = std::thread(AcceptLoop);
     std::fprintf(stderr, "[sim][admin] media admin server on http://127.0.0.1:%d\n", kPort);

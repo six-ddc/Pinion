@@ -154,3 +154,24 @@ target_include_directories(id3_test PRIVATE
     ${CLAW_ROOT}/components/media_player/include
 )
 target_link_libraries(id3_test PRIVATE iconv)
+
+# ---- media_stress: ASan/UBSan 泵切换压力测试（无头，复现真机切曲堆破坏用） ----
+add_executable(media_stress
+    media_stress.cc
+    shim/src/audio_pipeline_shim.cc
+    shim/src/media_http_curl.cc
+    ${CLAW_ROOT}/components/media_player/src/media_controller.cc
+    ${CLAW_ROOT}/components/media_player/src/media_pump.cc
+    ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
+    ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
+)
+target_include_directories(media_stress PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/shim/include
+    ${PI_C_DIR}/include
+    ${PI_C_DIR}/port/posix
+    ${CLAW_ROOT}/components/media_player/include
+    ${CLAW_ROOT}/components/media_player/src
+)
+target_compile_options(media_stress PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+target_link_options(media_stress PRIVATE -fsanitize=address,undefined)
+target_link_libraries(media_stress PRIVATE curl)

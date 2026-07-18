@@ -3,9 +3,11 @@
 //
 // 并发模型：两把锁。
 //   mu_    —— 保护状态快照（state/index/playlist/pump_ 指针/位置）。所有快照读接口与
-//             pump→controller 回调只碰这把锁，短临界区、绝不在持锁期间 join 线程。
-//   ctrl_mu_ —— 串行化控制操作（Play/Stop/Next/…）。teardown 的线程 join 在此锁下、
-//             但**不持 mu_** 时进行，规避「持 mu_ join 一个正等 mu_ 的 pump 线程」死锁。
+//             pump→controller 回调只碰这把锁，短临界区、绝不在持锁期间等线程退出。
+//   ctrl_mu_ —— 串行化控制操作（Play/Stop/Next/…）。teardown 等线程退出（JoinPump）在此
+//             锁下、但**不持 mu_** 时进行，规避「持 mu_ 等一个正等 mu_ 的 pump 线程」死锁。
+//             设备端等退出用 Pump::exit_sem 而非 pthread_join（假唤醒杀线程，见
+//             media_internal.h 注释）。
 //
 // pump 回调用 Pump* 指针身份与当前 pump_ 比对丢弃陈旧事件（换曲/停止 teardown 期间在途）。
 #include "media_player/media_player.h"
@@ -22,6 +24,7 @@
 #include "metalio_hal/audio_pipeline.h"
 
 #ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"  // MALLOC_CAP_SPIRAM：泵线程栈放 PSRAM
 #include "esp_pthread.h"
 #endif
 
@@ -53,24 +56,79 @@ struct MediaController::Impl : public PumpHost {
 
     std::vector<Pump*> zombies_;  // 已自然结束（OnAllFinished/OnTrackError）待回收的 pump
 
-    // —— 生命周期辅助（均要求已持 ctrl_mu_、且调用点不持 mu_，因为要 join 线程）——
+    // —— 生命周期辅助（均要求已持 ctrl_mu_、且调用点不持 mu_，因为要等线程退出）——
 
-    // 回收自然结束的 pump（线程已 stop，join 立即返回）。
+    // 等 pump 两条线程真正退出。设备端**不能用 std::thread::join**（esp_pthread 的 join
+    // 会被调用任务收到的无关 task notification 假唤醒，进而 vTaskDelete 掉还阻塞在 lwip
+    // select 里的线程——"下一台"必现崩溃的根因，详见 media_internal.h Pump::exit_sem
+    // 注释），改为等泵线程退出信号量；线程句柄在创建后已 detach。sim 端仍走 join。
+    static void JoinPump(Pump* p) {
+#ifdef ESP_PLATFORM
+        while (p->threads_started > 0) {
+            xSemaphoreTake(p->exit_sem, portMAX_DELAY);
+            p->threads_started--;
+        }
+#else
+        if (p->reader_thr.joinable()) p->reader_thr.join();
+        if (p->decoder_thr.joinable()) p->decoder_thr.join();
+#endif
+    }
+
+    // JoinPump 的非阻塞版：线程都退了返回 true（可安全 delete），否则 false。
+    // teardown 现在是异步的（见 TeardownCurrent），旧泵的 reader 可能还要至多一个
+    // socket 超时（~2.5s）才退出——控制操作不能为它卡住 UI，收不动就留到下次再收。
+    static bool TryJoinPump(Pump* p) {
+#ifdef ESP_PLATFORM
+        while (p->threads_started > 0) {
+            if (xSemaphoreTake(p->exit_sem, 0) != pdTRUE) return false;
+            p->threads_started--;
+        }
+        return true;
+#else
+        if (p->threads_exited.load(std::memory_order_acquire) < p->threads_started) return false;
+        // 线程体都跑完了，join 只等 pthread 尾声，毫秒级。
+        if (p->reader_thr.joinable()) p->reader_thr.join();
+        if (p->decoder_thr.joinable()) p->decoder_thr.join();
+        return true;
+#endif
+    }
+
+    // 回收已结束的 pump；还没退干净的留在 zombies_ 里下次再收（非阻塞）。
     void ReapZombies() {
         std::vector<Pump*> dead;
         {
             std::lock_guard<std::mutex> lk(mu_);
             dead.swap(zombies_);
         }
+        std::vector<Pump*> keep;
         for (Pump* p : dead) {
-            if (p->reader_thr.joinable()) p->reader_thr.join();
-            if (p->decoder_thr.joinable()) p->decoder_thr.join();
+            if (TryJoinPump(p)) {
+                delete p;
+            } else {
+                keep.push_back(p);
+            }
+        }
+        if (!keep.empty()) {
+            std::lock_guard<std::mutex> lk(mu_);
+            zombies_.insert(zombies_.end(), keep.begin(), keep.end());
+        }
+    }
+
+    // 析构专用：阻塞等所有 zombie 线程退出后释放（进程退出路径，不在 UI 线程上）。
+    void DrainZombiesBlocking() {
+        std::vector<Pump*> dead;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            dead.swap(zombies_);
+        }
+        for (Pump* p : dead) {
+            JoinPump(p);
             delete p;
         }
     }
 
-    // 干净停掉当前 pump：置 stop、唤醒、Flush 播放队列静音，然后 join+delete（不持 mu_）。
-    // 返回停掉的 pump 在停前的已喂样本数（供暂停记位）。
+    // 停掉当前 pump：置 stop、Abort 字节源、唤醒、Flush 播放队列静音，旧泵挂 zombies_
+    // 异步回收（不在本线程等它退出，见函数尾注释）。返回停前的已喂样本数（供暂停记位）。
     uint64_t TeardownCurrent() {
         Pump* old = nullptr;
         {
@@ -84,17 +142,24 @@ struct MediaController::Impl : public PumpHost {
         // 若 reader 线程此刻正阻塞在网络流的 Read() 里，跨线程 Abort() 让它在有界延迟内
         // （见 media_http_esp.cc/media_http_curl.cc 的 Abort 实现）返回，而不必等完整的
         // socket 超时/重连退避——这是 Stop/切曲不卡秒级的关键（本模块早期版本的遗留问题）。
-        MediaSource* src = nullptr;
+        // Abort() 必须在持 old->mu 时调：reader 侧"清 current_source → Close → 析构 src"
+        // 的第一步也在同一把锁下，出锁即拿不到指针，堵死"放锁后 Abort 撞上已析构 src"的
+        // 微秒级 UAF 窗口（Abort 只置原子标志，不阻塞，持锁无害）。
         {
             std::lock_guard<std::mutex> lk(old->mu);
-            src = old->current_source;
+            if (old->current_source != nullptr) old->current_source->Abort();
         }
-        if (src != nullptr) src->Abort();
         old->cv.notify_all();
         mhal::audio_pipeline::FlushPlayback();  // 解阻 decoder 的 FeedPlayback + 立即静音
-        if (old->reader_thr.joinable()) old->reader_thr.join();
-        if (old->decoder_thr.joinable()) old->decoder_thr.join();
-        delete old;
+        // 异步收尸：不在调用线程（通常是 LVGL 任务）上等泵线程退出——reader 若正阻塞在
+        // 网络 Read 里，最长要一个 socket 超时（~2.5s）才观察到 Abort，同步等会把 UI 冻住
+        // （真机切台卡顿的主因之一）。旧泵已收到 stop/Abort 自行退出，挂 zombies_ 由下次
+        // 控制操作 ReapZombies 非阻塞补收。期间的陈旧回调由 p != pump_ 判据丢弃，残余
+        // FeedPlayback 由播放代次（playback_gen，StartPump 的 Flush 已推进）丢弃。
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            zombies_.push_back(old);
+        }
         return fed;
     }
 
@@ -105,6 +170,20 @@ struct MediaController::Impl : public PumpHost {
 
         Pump* p = new Pump();
         p->host = this;
+#ifdef ESP_PLATFORM
+        // 线程退出握手信号量必须先于线程存在（见 media_internal.h Pump::exit_sem 注释）。
+        p->exit_sem = xSemaphoreCreateCounting(2, 0);
+        if (p->exit_sem == nullptr) {
+            ESP_LOGE("media_ctrl", "pump exit_sem alloc failed");
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                state_ = MediaState::Error;
+            }
+            delete p;
+            NotifyState();
+            return;
+        }
+#endif
         {
             std::lock_guard<std::mutex> lk(mu_);
             p->session = ++session_gen_;
@@ -122,14 +201,67 @@ struct MediaController::Impl : public PumpHost {
             track_has_flowed_ = false;
         }
 #ifdef ESP_PLATFORM
-        // ESP-IDF 默认 pthread 栈对 minimp3 偏紧：spawn 前抬到 16KB（仅真机路径）。
+        // esp_pthread_set_cfg 改的是"调用任务今后创建的**所有** pthread"的默认配置，
+        // 用完必须还原，否则 UI/agent 任务后续任何 std::thread 都会静默继承 16KB/PSRAM/
+        // prio1（低优先级 + 小栈，对 TLS 等深栈线程是隐雷）。
+        esp_pthread_cfg_t prev_cfg;
+        const bool had_prev_cfg = esp_pthread_get_cfg(&prev_cfg) == ESP_OK;
         esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+        // prio 与 LVGL 适配层同级（1）：解码若追不上实时会长期不阻塞，任何更高
+        // 优先级都会把 LVGL/IDLE 饿死（真机实测 UI 整机冻结 + task_wdt）。同级
+        // 靠 FreeRTOS 时间片轮转与 UI 分享核，播放任务(prio 4)消费侧不受影响。
+        //
+        // 栈放 PSRAM（SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY 已开）：内部 SRAM 占用归零。
+        // 曾用 28KB 内部栈装 minimp3 scratch，低内存时拿不出连续内部块，pthread 建不
+        // 出来 → std::thread 抛异常 terminate 重启（真机实测）。scratch 现走 _ex 堆
+        // 分配（见 media_pump），16KB PSRAM 栈绰绰有余。约束：这两线程不得做需要
+        // 关 cache 的 flash 操作（SD 走 SDMMC、网络走 esp-hosted，均不涉及）。
+        cfg.prio = 1;
         cfg.stack_size = 16 * 1024;
-        cfg.prio = 4;  // 对齐播放任务优先级
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
         esp_pthread_set_cfg(&cfg);
 #endif
-        p->reader_thr = std::thread(PumpReaderMain, p);
-        p->decoder_thr = std::thread(PumpDecoderMain, p);
+        // 建线程可能因低内存失败抛 std::system_error：不接就是 std::terminate 整机
+        // 重启。失败时优雅收场——已建的 reader 停掉等退出，撤销 pump 登记，报 Error。
+        // 设备端线程创建成功即 detach（退出走 esp_pthread 自删除路径，永不被外部
+        // vTaskDelete），生死改由 exit_sem 握手（见 JoinPump）。
+        try {
+            p->reader_thr = std::thread(PumpReaderMain, p);
+#ifdef ESP_PLATFORM
+            p->reader_thr.detach();
+#endif
+            p->threads_started = 1;
+            p->decoder_thr = std::thread(PumpDecoderMain, p);
+#ifdef ESP_PLATFORM
+            p->decoder_thr.detach();
+#endif
+            p->threads_started = 2;
+        } catch (const std::exception& e) {
+            ESP_LOGE("media_ctrl", "pump thread spawn failed: %s", e.what());
+            p->stop = true;
+            {
+                std::lock_guard<std::mutex> lk(p->mu);
+                if (p->current_source != nullptr) p->current_source->Abort();
+            }
+            p->cv.notify_all();
+            JoinPump(p);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (pump_ == p) pump_ = nullptr;
+                state_ = MediaState::Error;
+            }
+            delete p;
+            NotifyState();
+        }
+#ifdef ESP_PLATFORM
+        // 还原调用任务原有的 pthread 默认配置（无先前配置则还原为系统默认）。
+        if (had_prev_cfg) {
+            esp_pthread_set_cfg(&prev_cfg);
+        } else {
+            esp_pthread_cfg_t def = esp_pthread_get_default_config();
+            esp_pthread_set_cfg(&def);
+        }
+#endif
     }
 
     void NotifyState() {
@@ -260,8 +392,8 @@ MediaController::MediaController() : impl_(new Impl()) {}
 MediaController::~MediaController() {
     {
         std::lock_guard<std::mutex> lk(impl_->ctrl_mu_);
-        impl_->TeardownCurrent();
-        impl_->ReapZombies();
+        impl_->TeardownCurrent();          // 异步：旧泵进 zombies_
+        impl_->DrainZombiesBlocking();     // 析构必须等干净（不在 UI 线程上跑）
     }
     delete impl_;
 }

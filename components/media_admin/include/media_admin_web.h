@@ -119,7 +119,7 @@ inline const char* Html() {
 <script>
 "use strict";
 var curDir = "";            // 当前浏览目录（"" = 两个根）
-var queue = [], qActive = false, qDone = 0;
+var queue = [], qActive = false;
 var allOverwrite = false, allSkip = false;
 var conflictResolver = null;
 
@@ -157,8 +157,14 @@ function renderCrumbs(){
 }
 
 // ---- 列表 ----
-function go(dir){ curDir=dir; renderCrumbs(); loadList(); }
-function loadList(){
+function go(dir){
+  var prev=curDir;
+  curDir=dir; renderCrumbs();
+  // 读取失败回滚：面包屑/curDir 已切到新目录但列表尚未替换，失败时退回旧目录，
+  // 保持 面包屑·curDir·当前列表 三者一致（列表仍显示着 prev 的内容）。
+  loadList(function(){ curDir=prev; renderCrumbs(); });
+}
+function loadList(onFail){
   fetch("/api/list?dir="+encodeURIComponent(curDir)).then(function(r){
     if(!r.ok) throw 0; return r.json();
   }).then(function(d){
@@ -166,7 +172,7 @@ function loadList(){
     var ents=d.entries||[];
     $("empty").style.display = ents.length ? "none" : "block";
     ents.forEach(function(e){ ul.appendChild(rowEl(e)); });
-  }).catch(function(){ toast("读取目录失败", 1); });
+  }).catch(function(){ toast("读取目录失败", 1); if(onFail) onFail(); });
 }
 function rowEl(e){
   var li=document.createElement("li"); li.className="row";
@@ -268,10 +274,18 @@ function collectEntries(entries, done){
 
 // ---- 上传队列 ----
 function enqueue(arr){
+  // 新批次 = 入队时队列为空或现存条目全部已终态（done/skip/err）。新批次开始时
+  // 重置「全部覆盖/全部跳过」选择，并把已终态条目清出队列（进行中的保留），使
+  // 冲突选择与进度汇总严格限定在当前批次内，绝不跨批次泄漏。
+  var isTerm = function(q){ return q.status==="done"||q.status==="skip"||q.status==="err"; };
+  if(queue.every(isTerm)){
+    allOverwrite=false; allSkip=false;
+    queue = queue.filter(function(q){ return !isTerm(q); });  // 全终态 -> 清空；有进行中则此分支不进
+  }
   arr.forEach(function(it){
     var mp3 = isMp3(it.file.name);
     queue.push({file:it.file, rel:it.rel.replace(/^\/+/,""), size:it.file.size,
-                status: mp3 ? "wait" : "skip", progress:0, tries:0, el:null, mp3:mp3});
+                status: mp3 ? "wait" : "skip", progress:0, tries:0, over:0, el:null, mp3:mp3});
   });
   renderQueue();
   if(!qActive) runQueue();
@@ -322,14 +336,14 @@ function runQueue(){
 }
 function uploadItem(it, done){
   it.status="up"; it.progress=0; updateItem(it);
-  var over = allOverwrite ? 1 : 0;
+  var over = (it.over || allOverwrite) ? 1 : 0;  // 条目自身覆盖标志（单个「覆盖」选择）优先，自动重试沿用
   send(it, over, function(status){
     if(status===200){ it.status="done"; it.progress=1; updateItem(it); updateSummary(); done(); return; }
     if(status===409){
       if(allSkip){ it.status="skip"; updateItem(it); updateSummary(); done(); return; }
       askConflict(it.rel, function(choice){
-        if(choice==="over"){ send(it,1,function(s2){ finishItem(it,s2,done); }); }
-        else if(choice==="overAll"){ allOverwrite=true; send(it,1,function(s2){ finishItem(it,s2,done); }); }
+        if(choice==="over"){ it.over=1; send(it,1,function(s2){ finishItem(it,s2,done); }); }
+        else if(choice==="overAll"){ allOverwrite=true; it.over=1; send(it,1,function(s2){ finishItem(it,s2,done); }); }
         else if(choice==="skipAll"){ allSkip=true; it.status="skip"; updateItem(it); updateSummary(); done(); }
         else { it.status="skip"; updateItem(it); updateSummary(); done(); }  // skip this
       });

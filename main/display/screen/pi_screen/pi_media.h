@@ -44,4 +44,22 @@ void Back();
 // 屏卸载清理（定时器/静态指针；widget 树随 screen 删除）。
 void OnScreenUnloaded();
 
+// ---- 断点续播（体验优化）------------------------------------------------
+// ResumeLast 的结果：调用方（快捷面板「音乐」）据此决定关面板 or 吐 toast。
+enum class ResumeResult {
+    Opened,     // 已恢复并打开播放页（正在播/暂停直接开；否则从 NVS 记录重建）
+    NoRecord,   // 无正在播放，也无持久化记录 —— 无可续
+    FilesGone,  // 文件类记录里的曲目已全部被删
+    NoNetwork,  // 电台类记录但当前无网络
+};
+
+// 是否有可继续的播放：MediaController 非 Stopped（正在播/暂停）或存在 NVS 记录。
+// 快捷面板据此在点击时决定是否吐「没有可继续的播放」。
+bool HasResumable();
+
+// 继续上次播放。非 Stopped 直接 Open()；否则读 NVS "media"/"last" 重建播放列表
+// 后 Open()。因 MediaController 公有 API 无 seek，文件类从曲目开头起播（保存的
+// pos_s 仅记录、不用于定位，日志注明）。见 ResumeResult。
+ResumeResult ResumeLast();
+
 }  // namespace pi_media

@@ -121,7 +121,9 @@ input is swallowed). `pi_theme::Init()` must run before any widget is built.
   (`mhal::network::OnEvent` — UI side multiplexes it via `pi_net_events` since it is a single
   overwrite-style callback — and `mhal::bt::SetCallbacks`).
 - UI-owned NVS keys: `ui/theme` (0 dark / 1 light), `ui/sleep_s` (screen-off seconds, 0 = never),
-  `bt/last_name` + `bt/last_addr` (UI-side cache of the last successfully connected BT device).
+  `bt/last_name` + `bt/last_addr` (UI-side cache of the last successfully connected BT device),
+  `media/last` (JSON: last playback for resume — `type` file|radio, `paths`/`stations`, `index`,
+  `pos_s`; written by `pi_media` with change-dedup + 60s sampling, path list windowed to fit NVS).
 - pi_screen is the validated product UI — keep changes to it adaptation-only.
 
 For every capability's API and a call example, read `docs/EXTRACTION.md` §2.

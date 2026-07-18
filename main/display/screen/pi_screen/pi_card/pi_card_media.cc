@@ -229,8 +229,8 @@ char* BuildPlayResult(bool* is_error, const std::vector<MediaItem>& items, int s
     }
     cJSON_AddStringToObject(out, "hint",
                             "now render a control card with ui_render (bind media.title/media.state/"
-                            "media.progress_pct; list rows set media.play_index; invoke media.toggle/"
-                            "next/prev)");
+                            "media.progress_pct; list rows set media.play_index; buttons "
+                            "{icon:'skip-back'|'play'|'skip-forward'} invoke media.prev/toggle/next)");
     char* printed = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     if (printed == nullptr) return Fail(is_error, "OOM");
@@ -274,7 +274,9 @@ char* RunPlay(const cJSON* args, bool* is_error) {
             ApplyId3Meta(m.title, m.subtitle, el->valuestring);  // ID3 覆盖（Stage E）
             m.path_or_url = el->valuestring;
             m.is_stream = false;
-            m.duration_s = 0;
+            // Xing/VBRI 帧数或 CBR 码率估算（同一文件已开过一次读 tag，这里再开一次只
+            // 读首帧头几 KB）；0 = 未知，UI 显示 --:--。
+            m.duration_s = media_id3::ProbeDurationS(el->valuestring);
             items.push_back(std::move(m));
         }
         if (items.empty()) return Fail(is_error, "paths is empty or has no valid file path");
@@ -289,16 +291,75 @@ char* RunPlay(const cJSON* args, bool* is_error) {
     return Fail(is_error, "play needs paths:[...] (local files from search) or station_indices:[...]");
 }
 
+// control：语音里的"暂停/继续/下一首/上一首/停/打开播放页"直接落地，不走 search+play 接力。
+// toggle/next/prev/stop 直接转发 MediaController（同 RegisterCommands 里的 invoke 命令）；
+// pause/resume 该控制器没有独立方法，只有 Toggle（Playing<->Paused），故按当前状态判断
+// 幂等语义：已是目标态就什么都不做（成功返回原状态），否则调 Toggle。open 不受 Stopped
+// 门槛限制（全屏播放页任何时候都能开，Stage C 语义）；其余 action 在 Stopped/Error（无东西
+// 可控）下返回明确错误 JSON，不去碰 Toggle/Next 等——它们在空列表上本就是安全 no-op，但
+// 那样会让 AI 误判"已执行"，不如显式告知"当前没有在播的东西"。
+char* RunControl(const cJSON* args, bool* is_error) {
+    const char* action = GetStr(args, "action");
+    if (action == nullptr) {
+        return Fail(is_error, "control needs action: toggle|pause|resume|next|prev|stop|open");
+    }
+    MediaController& mc = MediaController::Instance();
+
+    if (std::strcmp(action, "open") == 0) {
+        pi_media::Open();
+        cJSON* out = cJSON_CreateObject();
+        cJSON_AddBoolToObject(out, "ok", true);
+        cJSON_AddStringToObject(out, "state", StateName(mc.state()));
+        char* printed = cJSON_PrintUnformatted(out);
+        cJSON_Delete(out);
+        return printed != nullptr ? printed : Fail(is_error, "OOM");
+    }
+
+    MediaState st = mc.state();
+    if (st == MediaState::Stopped || st == MediaState::Error) {
+        *is_error = true;
+        return DupString("{\"error\":\"nothing playing\"}");
+    }
+
+    if (std::strcmp(action, "toggle") == 0) {
+        mc.Toggle();
+    } else if (std::strcmp(action, "pause") == 0) {
+        if (st == MediaState::Playing) mc.Toggle();  // 已暂停/加载中：无害 no-op
+    } else if (std::strcmp(action, "resume") == 0) {
+        if (st == MediaState::Paused) mc.Toggle();  // 已在播：无害 no-op
+    } else if (std::strcmp(action, "next") == 0) {
+        mc.Next();
+    } else if (std::strcmp(action, "prev") == 0) {
+        mc.Prev();
+    } else if (std::strcmp(action, "stop") == 0) {
+        mc.Stop();
+    } else {
+        return Fail(is_error, "unknown action (use toggle|pause|resume|next|prev|stop|open)");
+    }
+
+    MediaItem cur = mc.current();
+    cJSON* out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    cJSON_AddStringToObject(out, "state", StateName(mc.state()));
+    cJSON_AddNumberToObject(out, "index", mc.index());
+    if (!cur.title.empty()) cJSON_AddStringToObject(out, "title", cur.title.c_str());
+    char* printed = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    if (printed == nullptr) return Fail(is_error, "OOM");
+    return printed;
+}
+
 }  // namespace
 
 extern "C" char* pi_media_tool_run(const cJSON* args, bool* is_error) {
     *is_error = false;
     const char* mode = GetStr(args, "mode");
-    if (mode == nullptr) return Fail(is_error, "give mode: 'search' | 'radio' | 'play'");
+    if (mode == nullptr) return Fail(is_error, "give mode: 'search' | 'radio' | 'play' | 'control'");
     if (std::strcmp(mode, "search") == 0) return RunSearch(args, is_error);
     if (std::strcmp(mode, "radio") == 0) return RunRadio(args, is_error);
     if (std::strcmp(mode, "play") == 0) return RunPlay(args, is_error);
-    return Fail(is_error, "unknown mode (use 'search' | 'radio' | 'play')");
+    if (std::strcmp(mode, "control") == 0) return RunControl(args, is_error);
+    return Fail(is_error, "unknown mode (use 'search' | 'radio' | 'play' | 'control')");
 }
 
 // ---------------------------------------------------------------------------

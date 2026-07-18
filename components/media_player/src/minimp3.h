@@ -33,7 +33,11 @@ typedef int16_t mp3d_sample_t;
 typedef float mp3d_sample_t;
 void mp3dec_f32_to_s16(const float *in, int16_t *out, int num_samples);
 #endif /* MINIMP3_FLOAT_OUTPUT */
-int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_sample_t *pcm, mp3dec_frame_info_t *info);
+/* 本仓禁用：栈上放整个 mp3dec_scratch_t（~16.3KB 单帧栈开销），16KB 任务栈一脚踩穿——
+ * 真机两次 Stack protection fault 实锤（老构建 pump decoder）。一律用 mp3dec_decode_frame_ex
+ * + 堆分配 scratch（见 media_pump.cc）。deprecated 毒化防止再被引入。 */
+int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_sample_t *pcm, mp3dec_frame_info_t *info)
+    __attribute__((deprecated("16KB stack frame (on-stack scratch); use mp3dec_decode_frame_ex with heap scratch")));
 
 #ifdef __cplusplus
 }
@@ -1710,12 +1714,14 @@ void mp3dec_init(mp3dec_t *dec)
     dec->header[0] = 0;
 }
 
-int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_sample_t *pcm, mp3dec_frame_info_t *info)
+/* Metalio 补丁：scratch (~16KB) 原在栈上，嵌入式小栈线程会溢出/逼出巨栈需求。
+ * _ex 变体由调用方提供 scratch（可堆分配）；原 API 保留栈上行为不变。 */
+int mp3dec_decode_frame_ex(mp3dec_t *dec, mp3dec_scratch_t *scratch_mem, const uint8_t *mp3, int mp3_bytes, mp3d_sample_t *pcm, mp3dec_frame_info_t *info)
 {
     int i = 0, igr, frame_size = 0, success = 1;
     const uint8_t *hdr;
     bs_t bs_frame[1];
-    mp3dec_scratch_t scratch;
+    mp3dec_scratch_t &scratch = *scratch_mem;
 
     if (mp3_bytes > 4 && dec->header[0] == 0xff && hdr_compare(dec->header, mp3))
     {
@@ -1862,4 +1868,10 @@ void mp3dec_f32_to_s16(const float *in, int16_t *out, int num_samples)
     }
 }
 #endif /* MINIMP3_FLOAT_OUTPUT */
+int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_sample_t *pcm, mp3dec_frame_info_t *info)
+{
+    mp3dec_scratch_t scratch;
+    return mp3dec_decode_frame_ex(dec, &scratch, mp3, mp3_bytes, pcm, info);
+}
+
 #endif /* MINIMP3_IMPLEMENTATION && !_MINIMP3_IMPLEMENTATION_GUARD */

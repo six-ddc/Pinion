@@ -33,8 +33,8 @@
 // 线程模型：mhal::network::OnEvent / mhal::bt::SetCallbacks 的回调都在各自
 // 的后台任务线程触发，只写 s_mu 保护的快照 + dirty 标志；LVGL 侧由打开
 // 期间常驻的 500ms tick 定时器轮询落地（与 pi_screen 的 ASR 轮询同一套
-// 封送模式）。30s 无操作自动整栈退出也由该定时器检查
-// lv_display_get_inactive_time()。
+// 封送模式）。设置栈只随用户操作退出，绝不做无操作自动退回主屏
+// （曾有 30s 自动退栈，会打断文件管理页上传等长任务，已移除）。
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -47,7 +47,6 @@ constexpr int32_t kHeaderH = 56;
 constexpr int32_t kHintH = 84;    // Hub 底部提示条
 constexpr int32_t kHubRowH = 96;  // 触点 >= 96（6 行 + 5 条细线 ~ 581px，可微滚）
 constexpr int32_t kSegH = 96;     // 分段按钮行高
-constexpr uint32_t kAutoCloseMs = 30 * 1000;
 constexpr uint32_t kTickMs = 500;
 constexpr uint32_t kSliderApplyGapMs = 150;  // 拖动中节流写入（同快捷面板）
 
@@ -1774,16 +1773,9 @@ void Pop() {
         RefreshHub();
 }
 
-// ----- tick：30s 无操作自动退、跨线程快照落地、周期刷新 ---------------------
+// ----- tick：跨线程快照落地、周期刷新 ---------------------------------------
 void TickCb(lv_timer_t*) {
     s_ticks++;
-
-    // 配网进行中冻结 30s 自动退栈：中途被关掉会把用户正在用的热点弄没。
-    if (!mhal::network::IsConfigPortalActive() &&
-        lv_display_get_inactive_time(nullptr) > kAutoCloseMs) {
-        CloseAll();
-        return;
-    }
 
     // 网络事件快照落地（配网热点起、连接状态变化）
     {

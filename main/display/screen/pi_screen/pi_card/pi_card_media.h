@@ -24,29 +24,35 @@
 extern "C" {
 #endif
 
-// media 工具主体（agent worker 线程）。mode 分派 search / radio / play。
+// media 工具主体（agent worker 线程）。mode 分派 search / radio / play / control。
 char *pi_media_tool_run(const cJSON *args, bool *is_error);
 
-// 预算超标后精简（保留 mode 语义/search·radio·play 参数形状/接力引导本身，只删口水词）。
+// 预算超标后精简（保留 mode 语义/search·radio·play·control 参数形状/接力引导本身，只删口水词）。
 #define PI_MEDIA_TOOL_DESC                                                                            \
     "Play SD-card music/podcasts, or live radio. mode:'search' scans SD (Music/Podcasts "            \
     "subdirs=albums/shows) -> {items:[{index,title,album,path}]} (query=fuzzy filter); mode:'radio' " \
     "lists built-in CN stations -> {stations:[{index,name,genre}]} (query filters); mode:'play' "     \
     "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int] (from "    \
     "radio list) -> now-playing snapshot. After play succeeds, ui_render a control card: label "      \
-    "bind:'media.title'/'media.state', bar bind:'media.progress_pct', buttons invoke media.prev/"      \
-    "toggle/next, list bind_data:'tracks' rows {do:'set',path:'media.play_index',value:'{i}'}. "       \
+    "bind:'media.title'/'media.state', bar bind:'media.progress_pct', buttons "                        \
+    "{icon:'skip-back'|'play'|'skip-forward'} invoke media.prev/toggle/next, list bind_data:"          \
+    "'tracks' rows {do:'set',path:'media.play_index',value:'{i}'}. "                                   \
+    "mode:'control' with action runs pause/resume/next/prev/stop/open immediately, no search+play "   \
+    "round-trip — use it for spoken pause/continue/next/prev/stop/open-player requests. "              \
     "Never poll — media.* auto-refreshes."
 
 #define PI_MEDIA_TOOL_SCHEMA                                                                         \
     "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"search\","       \
-    "\"radio\",\"play\"],\"description\":\"search local mp3 | list radio | start playback\"},"        \
+    "\"radio\",\"play\",\"control\"],\"description\":\"search local mp3 | list radio | start "        \
+    "playback | pause/resume/next/prev/stop/open now\"},"                                             \
     "\"query\":{\"type\":\"string\",\"description\":\"fuzzy name filter for search/radio\"},"         \
     "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"local file "     \
     "paths (from search) to play\"},\"start_index\":{\"type\":\"number\",\"description\":\"index "    \
     "into paths to start at (default 0)\"},\"station_indices\":{\"type\":\"array\",\"items\":"        \
-    "{\"type\":\"number\"},\"description\":\"radio station indices (from the radio list) to play\"}}" \
-    ",\"required\":[\"mode\"]}"
+    "{\"type\":\"number\"},\"description\":\"radio station indices (from the radio list) to play\"},"  \
+    "\"action\":{\"type\":\"string\",\"enum\":[\"toggle\",\"pause\",\"resume\",\"next\",\"prev\","    \
+    "\"stop\",\"open\"],\"description\":\"for mode:'control' — what to do to the current playback\"}"  \
+    "},\"required\":[\"mode\"]}"
 
 #ifdef __cplusplus
 }  // extern "C"

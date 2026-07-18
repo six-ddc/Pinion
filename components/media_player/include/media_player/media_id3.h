@@ -45,4 +45,20 @@ uint8_t* ReadCover(const std::string& path, size_t* out_size, std::string* out_m
 // 算术编码变体——覆盖绝大多数真实封面）。
 bool PeekImageSize(const uint8_t* data, size_t len, int* out_w, int* out_h);
 
+// 估算 MP3 时长（秒）。跳过 ID3v2 tag 后在其后 64KB 内找首个合法 MPEG Layer III
+// 帧头（校验下一帧头以排除伪同步）：VBR 读 Xing/Info/VBRI 帧里的总帧数（准确）；
+// 否则按首帧码率 CBR 估算（音频区字节 = 文件大小 − v2 头 − v1 尾）。非 MP3/损坏/
+// 找不到帧头返回 0（调用方按"未知"处理，UI 显示 --:--）。安全契约同 ReadTags：
+// 所有读取带边界校验，畸形文件只会返回 0，不越界不死循环。
+int ProbeDurationS(const std::string& path);
+
+// JFIF 归一化：若 data 是 JPEG（FF D8 开头）但头部不匹配 LVGL tjpgd 包装层
+// is_jpg() 的精确 JFIF 签名（FF D8 FF E0 00 10 "JFIF"），返回一份新 malloc 的
+// 缓冲——在 SOI 之后插入一段标准 18 字节 JFIF APP0，使 is_jpg() 放行（底层
+// jd_prepare 会把随后原有的 APP1/Exif 等未知段按 default 跳过，能正常解 baseline
+// JPEG）。*out_len 置为新长度，调用方负责 free。无需改写（已是精确 JFIF / 非
+// JPEG / 数据过短）时返回 nullptr（*out_len 不动），调用方用原始字节。像素数据
+// （SOF/扫描段）逐字节保留，故尺寸门控在原始字节上判即可。
+uint8_t* NormalizeJpegHeader(const uint8_t* data, size_t len, size_t* out_len);
+
 }  // namespace media_id3

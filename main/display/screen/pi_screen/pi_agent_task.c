@@ -37,6 +37,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -174,6 +175,15 @@ static uint32_t g_active_gen = 0; /* 当前 run 所属代次，仅 worker 任务
 
 static volatile bool g_tts_enabled = true; /* 真值由 pi_screen 从 NVS 灌入 */
 
+/* TTS 连接级退避。speak_begin 每次失败重试都是一次完整 TLS 握手（重 CPU 重堆），
+ * agent 多轮工具调用下 failed 逐 run 复位会演成握手风暴——真机实测饿死解码线程
+ * 与 LVGL（音频蹦帧、UI 冻结），并把内部堆耗到 0 触发 esp-hosted sdio assert 重启。
+ * 故失败后指数退避（15s 起、10min 封顶），终身配额类错误（45000292）直接退避到
+ * 重启为止。秒数存 int32（RV32 对齐读写原子，跨 WS 回调线程与 pump 任务安全）。 */
+static volatile int32_t g_tts_backoff_until_s = 0;
+static volatile int32_t g_tts_fail_streak = 0;
+#define TTS_ERR_QUOTA_LIFETIME 45000292
+
 static SemaphoreHandle_t g_tts_lock;   /* 保护下面这组共享态 */
 static SemaphoreHandle_t g_tts_signal; /* binary：唤醒 pump */
 static char *g_tts_pending = NULL;      /* 当前 run 尚未喂给 TTS 的文本 */
@@ -202,6 +212,11 @@ static void tts_on_finished(void *ctx) {
 static void tts_on_error(int code, const char *msg, void *ctx) {
     (void)ctx;
     ESP_LOGW(TAG, "tts error %d: %s", code, msg);
+    if (code == TTS_ERR_QUOTA_LIFETIME) {
+        /* 终身配额耗尽：重试永远不会成功，本次开机不再发起任何 TTS 连接 */
+        g_tts_backoff_until_s = INT32_MAX;
+        ESP_LOGW(TAG, "tts lifetime quota exhausted, TTS disabled until reboot");
+    }
     /* 出错即作废本 run（翻代次让 pump 放弃该会话）并异步 stop：volc 层的 flush 已
      * 挪到持 api_lock 的收尾路径（emit_error 不再在 WS 回调里 FlushPlayback），不
      * stop 的话已缓冲的几秒音频会一直播到下一次 speak_begin 才被清；且 pump 私有
@@ -359,16 +374,29 @@ static void tts_pump(void *arg) {
 
         if (chunk && !failed) {
             if (!session_open) {
-                esp_err_t err = volc_tts_speak_begin(&TTS_CBS);
-                if (err == ESP_ERR_INVALID_STATE) { /* 上一场还在排空：打断后重试一次 */
-                    volc_tts_stop();
-                    err = volc_tts_speak_begin(&TTS_CBS);
-                }
-                if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "tts speak_begin failed (%d), muted for this run", (int)err);
-                    failed = true;
+                int32_t now_s = (int32_t)(esp_timer_get_time() / 1000000);
+                if (now_s < g_tts_backoff_until_s) {
+                    failed = true; /* 退避期内：本 run 静默，不发起 TLS 握手 */
                 } else {
-                    session_open = true;
+                    esp_err_t err = volc_tts_speak_begin(&TTS_CBS);
+                    if (err == ESP_ERR_INVALID_STATE) { /* 上一场还在排空：打断后重试一次 */
+                        volc_tts_stop();
+                        err = volc_tts_speak_begin(&TTS_CBS);
+                    }
+                    if (err != ESP_OK) {
+                        int32_t streak = g_tts_fail_streak + 1;
+                        g_tts_fail_streak = streak;
+                        int shift = streak - 1 > 5 ? 5 : streak - 1;
+                        int32_t backoff = 15 << shift; /* 15s..480s */
+                        if (g_tts_backoff_until_s != INT32_MAX)
+                            g_tts_backoff_until_s = now_s + backoff;
+                        ESP_LOGW(TAG, "tts speak_begin failed (%d), muted for this run, backoff %ds",
+                                 (int)err, (int)backoff);
+                        failed = true;
+                    } else {
+                        g_tts_fail_streak = 0;
+                        session_open = true;
+                    }
                 }
             }
             if (session_open) volc_tts_feed_text(chunk); /* 阻塞点落在 pump，不碰读循环 */
@@ -484,7 +512,18 @@ static void enqueue(pi_ui_kind_t kind, char *s1, char *s2, int i1, int i2) {
     evt.gen = g_active_gen;
     QueueHandle_t q = pi_ui_queue();
     if (xQueueSend(q, &evt, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "pi_ui_queue full, dropping evt kind=%d", (int)kind);
+        /* 大工具调用（如整卡 JSON）流式期间每个增量都可能撞满队列，逐条告警会以
+         * ~20Hz 刷串口并加剧 CPU 饥饿（真机实测 30s 刷 1686 条），聚合到每秒一条。 */
+        static int drop_count = 0;
+        static int64_t drop_last_us = 0;
+        drop_count++;
+        int64_t now = esp_timer_get_time();
+        if (now - drop_last_us >= 1000000) {
+            ESP_LOGW(TAG, "pi_ui_queue full, dropped %d evts this sec (last kind=%d)", drop_count,
+                     (int)kind);
+            drop_count = 0;
+            drop_last_us = now;
+        }
         free(s1);
         free(s2);
     }

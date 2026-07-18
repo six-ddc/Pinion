@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #include "esp_http_server.h"
@@ -22,11 +23,20 @@ namespace {
 constexpr char TAG[] = "media_admin";
 constexpr int64_t kIdleStopUs = 10ll * 60 * 1000 * 1000;  // 10 分钟无请求自动停
 constexpr int64_t kIdleCheckUs = 60ll * 1000 * 1000;      // 每分钟检查一次
+constexpr int kFormRecvMaxTimeouts = 3;                   // mkdir/delete body 累计超时上限
+constexpr int kUploadMaxTimeouts = 20;                    // 整个上传累计超时上限（跨 chunk）
 
-httpd_handle_t s_server = nullptr;
+// s_server 用 atomic：Stop（LVGL 线程）与 IdleCheck（esp_timer 线程）会并发读它，
+// 置空/读取都走原子避免数据竞争；Start/Stop 的"检查-动作"复合序用 s_lifecycle_mtx
+// 串行化（见 Start/Stop 注释）。
+std::atomic<httpd_handle_t> s_server{nullptr};
 esp_timer_handle_t s_idle_timer = nullptr;
 std::atomic<int64_t> s_last_activity{0};
+std::mutex s_lifecycle_mtx;
 
+// Touch 只做一次原子写，故意不进 s_lifecycle_mtx：它在 httpd 任务的每个 handler 里
+// 被调，而 Stop() 持锁时会调 httpd_stop 等待 httpd 任务收尾——若 Touch 也抢这把锁，
+// 在途 handler 的 Touch 会与 Stop 互等成死锁。s_last_activity 本身是 atomic，无需锁。
 void Touch() { s_last_activity.store(esp_timer_get_time()); }
 
 const char* StatusStr(int code) {
@@ -36,6 +46,7 @@ const char* StatusStr(int code) {
         case 403: return "403 Forbidden";
         case 404: return "404 Not Found";
         case 409: return "409 Conflict";
+        case 411: return "411 Length Required";
         case 413: return "413 Payload Too Large";
         case 429: return "429 Too Many Requests";
         case 500: return "500 Internal Server Error";
@@ -48,6 +59,7 @@ const char* StatusStr(int code) {
 esp_err_t SendJson(httpd_req_t* req, int code, const std::string& body) {
     httpd_resp_set_status(req, StatusStr(code));
     httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -74,9 +86,13 @@ std::string ReadFormBody(httpd_req_t* req) {
     size_t remaining = req->content_len;
     if (remaining > 2048) remaining = 2048;
     char buf[512];
+    int timeouts = 0;
     while (remaining > 0) {
         int r = httpd_req_recv(req, buf, remaining < sizeof(buf) ? remaining : sizeof(buf));
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts >= kFormRecvMaxTimeouts) break;  // 累计超时上限，放弃而非无限等
+            continue;
+        }
         if (r <= 0) break;
         body.append(buf, r);
         remaining -= r;
@@ -88,6 +104,7 @@ std::string ReadFormBody(httpd_req_t* req) {
 esp_err_t RootGet(httpd_req_t* req) {
     Touch();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, media_admin_web::Html());
 }
 
@@ -107,6 +124,9 @@ esp_err_t SpaceGet(httpd_req_t* req) {
 
 esp_err_t UploadPost(httpd_req_t* req) {
     Touch();
+    // 无 Content-Length（含 chunked）→ 无法预检大小/空间，且会静默落 0 字节文件，直接拒。
+    if (req->content_len == 0) return SendJson(req, 411, "{\"error\":\"length required\"}");
+
     std::string q = QueryStr(req);
     std::string path, over;
     QueryVal(q, "path", path);
@@ -120,28 +140,29 @@ esp_err_t UploadPost(httpd_req_t* req) {
     //
     // 控制流：httpd_req_recv 在 recv_wait_timeout（见 Start() 里的 30s）内没等到
     // 数据会返回 HTTPD_SOCK_ERR_TIMEOUT（负值）——这只代表"这次没读到"，不是连接
-    // 已断，弱 WiFi 一次瞬时 stall 很常见。之前的 bug：直接把超时重试那次 recv 的
-    // 返回值当结果 return，既跳过了成功路径的 `remaining -= r` 记账，又会把连续
-    // 两次超时的第二个负 sentinel 当"读到的字节数"吐给上层，导致已收全的上传被
-    // 误判失败、.part 被删。
+    // 已断，弱 WiFi 一次瞬时 stall 很常见，因此超时时 continue 重试而非直接判失败；
+    // 成功路径(r>0)统一在循环里扣减 remaining 并 return；r<=0 且非超时（客户端断开 /
+    // 其他错误）立即 -1（Upload() 会 unlink .part）。
     //
-    // 修复：整个 reader 是一个有限重试的 while 循环——超时 continue 重新 recv
-    // （不 return），最多连续重试 kMaxTimeoutRetries 次；成功路径(r>0)统一在循环
-    // 外扣减 remaining 并 return；r<=0 且非超时（客户端断开 / 其他错误）立即 -1。
-    // 重试次数耗尽仍超时，视为连接确已死，返回 -1（Upload() 会 unlink .part）。
+    // 超时预算 timeout_budget 是**整个上传累计**（跨 chunk 不重置，捕获引用），耗尽即
+    // 判连接已死返回 -1——避免"每 chunk 重置预算"被慢速滴送的客户端利用无限占用单
+    // 线程 httpd 任务。上限 kUploadMaxTimeouts * 30s ≈ 10min 总容忍。
     uint64_t remaining = req->content_len;
-    auto reader = [req, &remaining](char* buf, size_t max) -> int {
+    int timeout_budget = kUploadMaxTimeouts;
+    auto reader = [req, &remaining, &timeout_budget](char* buf, size_t max) -> int {
         if (remaining == 0) return 0;  // EOF
         size_t want = remaining < max ? static_cast<size_t>(remaining) : max;
-        constexpr int kMaxTimeoutRetries = 5;  // 5 次 * 30s recv_wait_timeout ≈ 2.5min 弱网容忍
-        for (int tries = 0; tries <= kMaxTimeoutRetries; tries++) {
+        for (;;) {
             int r = httpd_req_recv(req, buf, want);
-            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;  // 瞬时 stall，重试而非直接判失败
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) {          // 瞬时 stall，重试而非直接判失败
+                if (--timeout_budget <= 0) return -1;   // 累计预算耗尽，判连接已死
+                continue;
+            }
             if (r <= 0) return -1;  // 断开 / 其他错误
             remaining -= r;
+            Touch();  // 单个大文件传输可能超过闲置阈值，按 chunk 刷新防止中途被自停
             return r;
         }
-        return -1;  // 连续超时耗尽重试预算，判连接已死
     };
 
     std::string msg;
@@ -179,21 +200,22 @@ void Register(const char* uri, httpd_method_t method, esp_err_t (*fn)(httpd_req_
     u.uri = uri;
     u.method = method;
     u.handler = fn;
-    httpd_register_uri_handler(s_server, &u);
+    httpd_register_uri_handler(s_server.load(), &u);
 }
 
 void IdleCheck(void*) {
-    if (s_server == nullptr) return;
+    if (s_server.load() == nullptr) return;
     if (esp_timer_get_time() - s_last_activity.load() > kIdleStopUs) {
         ESP_LOGI(TAG, "idle 10min, auto-stopping");
-        Stop();
+        Stop();  // Stop 内部再持锁复检，与 LVGL 线程的并发 Stop 互斥
     }
 }
 
 }  // namespace
 
 bool Start() {
-    if (s_server != nullptr) return true;
+    std::lock_guard<std::mutex> lk(s_lifecycle_mtx);  // 与 Stop 串行化，防 Start/Stop 交错
+    if (s_server.load() != nullptr) return true;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
@@ -201,11 +223,13 @@ bool Start() {
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;  // 大文件上传放宽
     config.send_wait_timeout = 30;
-    if (httpd_start(&s_server, &config) != ESP_OK) {
-        s_server = nullptr;
+    httpd_handle_t srv = nullptr;
+    if (httpd_start(&srv, &config) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         return false;
     }
+    s_server.store(srv);
+    media_admin::SweepOrphans();  // 清上次崩溃/掉电遗留的 .part / .old 孤儿
     Register("/", HTTP_GET, RootGet);
     Register("/api/list", HTTP_GET, ListGet);
     Register("/api/space", HTTP_GET, SpaceGet);
@@ -226,17 +250,26 @@ bool Start() {
 }
 
 void Stop() {
-    if (s_server == nullptr) return;
-    if (s_idle_timer != nullptr) esp_timer_stop(s_idle_timer);
-    httpd_stop(s_server);
-    s_server = nullptr;
+    // 锁内只做"检查并置空 s_server"这段短临界区：并发的第二个 Stop（或 IdleCheck 触发
+    // 的 Stop）进来看到已是 nullptr 即早退，只有抢到非空的那一个继续 httpd_stop，从而
+    // 消除双重 httpd_stop 竞态。httpd_stop 本身放到锁外执行——它可能阻塞（等 httpd 任务
+    // 收尾在途 handler），不占 lifecycle 锁，避免拖住并发的 Start/Stop 与 esp_timer 任务。
+    httpd_handle_t srv;
+    {
+        std::lock_guard<std::mutex> lk(s_lifecycle_mtx);
+        srv = s_server.load();
+        if (srv == nullptr) return;
+        if (s_idle_timer != nullptr) esp_timer_stop(s_idle_timer);
+        s_server.store(nullptr);
+    }
+    httpd_stop(srv);
     ESP_LOGI(TAG, "media admin server stopped");
 }
 
-bool IsRunning() { return s_server != nullptr; }
+bool IsRunning() { return s_server.load() != nullptr; }
 
 std::string GetUrl() {
-    if (s_server == nullptr) return "";
+    if (s_server.load() == nullptr) return "";
     std::string ip = mhal::network::GetIpAddress();
     if (ip.empty()) return "";
     return "http://" + ip;

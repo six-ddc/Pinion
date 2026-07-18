@@ -125,6 +125,12 @@ void* ChunkAlloc(size_t n) {
     return std::malloc(n);
 }
 
+// name 是否以 suffix 结尾（大小写敏感，孤儿后缀 .part/.old 始终小写生成）。
+bool EndsWith(const char* name, const char* suffix) {
+    size_t nl = std::strlen(name), sl = std::strlen(suffix);
+    return nl >= sl && std::strcmp(name + nl - sl, suffix) == 0;
+}
+
 }  // namespace
 
 void JsonEscapeInto(std::string& out, const std::string& s) {
@@ -397,12 +403,29 @@ int Upload(const std::string& rel, uint64_t content_len, bool overwrite, const R
         return 507;
     }
 
-    if (exists) unlink(abs.c_str());  // overwrite：先删旧文件再落位
+    // 覆盖写的原子落位：不直接删旧文件，而是先把旧文件挪到 <abs>.old 备份，再
+    // rename(.part → abs)；成功后删备份，失败则把备份转回原位复原旧文件。任一步都
+    // 不出现"旧文件已毁、新文件未成"的裸窗口（除非连复原 rename 也失败，此时同时
+    // 保留 .part 与 .old 供人工挽救）。FatFs 的 rename 不覆盖已存在目标，故先 unlink
+    // 掉可能的历史 .old。
+    std::string old_bak = abs + ".old";
+    if (exists) {
+        unlink(old_bak.c_str());
+        if (rename(abs.c_str(), old_bak.c_str()) != 0) {
+            unlink(part.c_str());  // 旧文件挪不动 → 保持旧文件原样，丢弃本次上传
+            msg = "{\"error\":\"rename failed\"}";
+            return 500;
+        }
+    }
     if (rename(part.c_str(), abs.c_str()) != 0) {
-        unlink(part.c_str());
+        if (exists && rename(old_bak.c_str(), abs.c_str()) == 0) {
+            unlink(part.c_str());  // 旧文件已复原，丢弃半成品
+        }
+        // 复原也失败时保留 .part（完整新数据）与 .old（旧数据），不再动它们
         msg = "{\"error\":\"rename failed\"}";
         return 500;
     }
+    if (exists) unlink(old_bak.c_str());  // 落位成功，删旧备份
     msg = "{\"ok\":true}";
     return 200;
 }
@@ -454,5 +477,33 @@ bool TryBeginUpload() {
 }
 
 void EndUpload() { s_upload_busy.store(false); }
+
+void SweepOrphans() {
+    if (!mhal::storage::IsSdMounted()) return;
+    // 显式栈迭代（非深递归），栈里存待扫目录的绝对路径；从两个根开始。
+    std::vector<std::string> stack;
+    for (const char* r : kRoots) stack.push_back(Base() + "/" + r);
+    int visited = 0;
+    while (!stack.empty()) {
+        if (++visited > kSweepMaxDirs) break;  // 病态目录树防护
+        std::string dir = std::move(stack.back());
+        stack.pop_back();
+        DIR* d = opendir(dir.c_str());
+        if (d == nullptr) continue;
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) continue;
+            std::string child = dir + "/" + ent->d_name;
+            struct stat st;
+            if (stat(child.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                stack.push_back(std::move(child));
+            } else if (EndsWith(ent->d_name, ".part") || EndsWith(ent->d_name, ".old")) {
+                unlink(child.c_str());  // 半成品/覆盖备份孤儿：直接清掉
+            }
+        }
+        closedir(d);
+    }
+}
 
 }  // namespace media_admin
