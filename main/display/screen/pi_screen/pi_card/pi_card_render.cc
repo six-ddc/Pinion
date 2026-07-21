@@ -1468,7 +1468,8 @@ void RefreshPreviewDataLabels(lv_obj_t* obj) {
     for (uint32_t i = 0; i < n; i++) RefreshPreviewDataLabels(lv_obj_get_child(obj, i));
 }
 
-lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count) {
+lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
+                            int parent_flow) {
     EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
     if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
     if (depth > kPreviewMaxDepth) return MakePreviewPlaceholder(parent);
@@ -1550,16 +1551,13 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         cur_row = 0;
         cJSON_ArrayForEach(ch, children) {
             int span = place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
-            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count);  // 失败即占位，永不 null
-            // RenderPreviewNode 尾部的 ApplySizing 统一按 FLOW_COL 近似，会给 label/growable 铺
-            // PCT(100)——grid cell 的宽度语义归 set_grid_cell 的 col_align 管（正式渲染对 grid 子项
-            // 跳过全部 flex 默认，见 ApplySizing 的 FLOW_GRID 分支），这里撤回内容宽再按正式渲染
-            // 同款规则决定 STRETCH/START，保证预览↔正式一帧换装不跳布局。
+            // FLOW_GRID：子项跳过全部 flex 尺寸默认（同正式渲染），宽度语义归 set_grid_cell
+            // 的 col_align 管；STRETCH/START 判据逐字镜像 RenderNode 的 grid 分支。
+            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count, FLOW_GRID);  // 失败即占位，永不 null
             const char* ct = GetStr(ch, "type");
             lv_grid_align_t col_align = LV_GRID_ALIGN_START;
             if (!HasKey(ch, "w") && ct != nullptr &&
                 (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
-                lv_obj_set_width(cobj, LV_SIZE_CONTENT);
                 col_align = LV_GRID_ALIGN_STRETCH;
             }
             lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
@@ -1665,17 +1663,17 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
     if (HasKey(node, "pad")) lv_obj_set_style_pad_all(obj, GetInt(node, "pad", 0), LV_PART_MAIN);
     ApplyFill(obj, node);
     if (GetBool(node, "hidden")) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    // ApplySizing 需要 parent_flow 判默认 grow/宽度，预览不追踪真实父容器主轴（这条信息只有
-    // 显式声明 w/h 时才不需要它），统一按 FLOW_COL 取默认值——近似，预览允许，真实渲染
-    // （RenderNode）才是权威。
-    ApplySizing(obj, type, node, FLOW_COL);
+    // 自适应尺寸按真实父容器主轴走（曾经统一按 FLOW_COL 近似——row 里铺满宽的 label 会把
+    // icon+标题挤成两行，adopt 才并回一行，真机抓到的跳变；现与正式渲染同口径）。
+    ApplySizing(obj, type, node, parent_flow);
 
     if (is_container) {
+        const int child_flow = std::strcmp(type, "row") == 0 ? FLOW_ROW : FLOW_COL;
         const cJSON* children = GetItem(node, "children");
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) {
-                RenderPreviewNode(obj, child, depth + 1, node_count);  // 静默跳过失败子节点
+                RenderPreviewNode(obj, child, depth + 1, node_count, child_flow);  // 静默跳过失败子节点
             }
         }
         // 打预览容器记号 + 记 committed 游标：认定最后一个已建子节点仍是"生长边"，留给下次
@@ -1689,7 +1687,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
 }
 
 lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count) {
+                          int& node_count, int parent_flow) {
     const char* type = GetStr(node_spec, "type");
     if (!type) {
         // 类型还没吐出来：维持原状——但这个位置必须有个占位对齐下标（首次到达这个位置，
@@ -1698,11 +1696,11 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
     }
     if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
         if (existing && lv_obj_has_flag(existing, LV_OBJ_FLAG_USER_2)) {
-            PreviewSyncContainer(existing, node_spec, depth, node_count);
+            PreviewSyncContainer(existing, node_spec, depth, node_count, parent_flow);
             return existing;  // 指针不变——递归深入继续生长，不推倒重来
         }
         if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算，不在此回补
-        return RenderPreviewNode(parent, node_spec, depth, node_count);
+        return RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
     }
     if (std::strcmp(type, "grid") == 0) {
         // grid 不做逐子增量生长：行主序落位使 cols/children/span 任一变化都可能让所有 cell
@@ -1713,7 +1711,7 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
         const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
         if (existing && cacheable && s_leaf_sig[depth] == sig) return existing;
         if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
         if (cacheable) s_leaf_sig[depth] = sig;
         return obj;
     }
@@ -1735,7 +1733,7 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
             return existing;  // 原地更新文本，不重建——长文本不闪烁
         }
         if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
         if (cacheable) s_leaf_sig[depth] = sig;
         return obj;
     }
@@ -1743,13 +1741,13 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
     // label 那样的原地更新通道，签名不变原对象不动、变了删旧重渲。
     if (same_sig) return existing;
     if (existing) lv_obj_delete(existing);
-    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
     if (cacheable) s_leaf_sig[depth] = sig;
     return obj;
 }
 
 void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
-                          int& node_count) {
+                          int& node_count, int parent_flow) {
     if (depth > kPreviewMaxDepth) return;
     // 生长路径容器每帧幂等重打容器级属性：gap/pad/fill/bg/w/grow/justify/align/hidden + 顶层
     // 卡片外观。SyncPreviewNode 已保证走到这里 type 一定是 column/row，以下全是幂等 style
@@ -1764,10 +1762,11 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
         lv_obj_set_style_pad_all(lv_container, GetInt(json_container, "pad", 0), LV_PART_MAIN);
     }
     ApplyFill(lv_container, json_container);
-    ApplySizing(lv_container, type, json_container, FLOW_COL);
+    ApplySizing(lv_container, type, json_container, parent_flow);
     if (GetBool(json_container, "hidden")) lv_obj_add_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
 
+    const int child_flow = std::strcmp(type, "row") == 0 ? FLOW_ROW : FLOW_COL;
     const cJSON* children = GetItem(json_container, "children");
     int n = (children && cJSON_IsArray(children)) ? cJSON_GetArraySize(children) : 0;
     if (n == 0) return;  // 还没孩子，等下一帧
@@ -1783,7 +1782,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
             lv_n = lv_obj_get_child_count(lv_container);
         }
         RenderPreviewNode(lv_container, cJSON_GetArrayItem(children, static_cast<int>(committed)),
-                          depth + 1, node_count);
+                          depth + 1, node_count, child_flow);
         lv_n = lv_obj_get_child_count(lv_container);
         committed++;
     }
@@ -1792,7 +1791,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     lv_obj_t* existing_edge =
         (lv_n > committed) ? lv_obj_get_child(lv_container, static_cast<uint32_t>(committed)) : nullptr;
     SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1), depth + 1,
-                    node_count);
+                    node_count, child_flow);
     lv_obj_set_user_data(lv_container, reinterpret_cast<void*>(static_cast<intptr_t>(committed)));
 }
 

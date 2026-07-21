@@ -77,14 +77,19 @@ void PlayCardEntrance(lv_obj_t* tree, bool adopted);
 // PreviewSyncContainer 继续增量同步"）+ user_data 记一个 committed 游标（= 已建子节点数-1，
 // 即认定最后一个子节点仍是"生长边"，留给下一次调用去继续对齐）。grid 不打 USER_2：它整块
 // 渲染、整块重建（见 SyncPreviewNode），cols 还没吐出第一列前占位等待。
-lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count);
+// parent_flow：父容器主轴（0=column 含 root、1=row、2=grid，与 render.cc 内部 FLOW_* 枚举
+// 一致），决定子控件的自适应尺寸默认（column 里 label/growable 铺满全宽、row 里保持自然宽/
+// 按比例分配、grid 里交给 set_grid_cell）。曾经预览统一按 column 近似，row 里的 icon+标题
+// 被铺满宽的 label 挤成两行、adopt 后又并回一行——真机抓到的跳变，故改为全程如实传递。
+lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
+                            int parent_flow = 0);
 
 // 位置游标增量对齐：lv_container 是先前调用建出的、打了 USER_2 标记的容器；json_container 是
 // 它这次收到的最新 partial 节点（读它的 "children" 数组，N 个孩子）。[0, N-2]（如果还没被上
 // 一轮标成 committed）逐个渲成最终形；第 N-1 个（生长边）走 SyncPreviewNode 原地更新/递归/
 // 删旧重建。已定稿区间的 lv_obj 指针跨调用不变——只有生长边那一个位置会被反复替换或原地更新。
 void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
-                          int& node_count);
+                          int& node_count, int parent_flow = 0);
 
 // 单个位置的"生长边"同步：existing 是当前挂在这个位置的 lv 对象（可为 nullptr，表示这个位置
 // 之前还没能渲出东西）；node_spec 是这个位置最新的 partial 节点。返回这个位置最终对应的 lv
@@ -96,7 +101,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
 // 它们没有原地文本通道）变了删旧重渲（成本低，也是团队定稿点名的做法）。这是
 // PreviewSyncContainer 的生长边分支与流式会话顶层 tree 同步共用的唯一入口。
 lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count);
+                          int& node_count, int parent_flow = 0);
 
 // 预算重算：删除节点时不精确回补 node_count（子树带走几个节点不值得追踪），调用方
 // （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后应该用这个函数对整棵预览树重新计数，
