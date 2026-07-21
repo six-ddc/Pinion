@@ -157,6 +157,17 @@ target_include_directories(id3_test PRIVATE
 )
 target_link_libraries(id3_test PRIVATE iconv)
 
+# ---- ts_demux_test: MPEG-TS 解封装单测（真实 CNR 分片 fixture + 合成 TS + 变异 fuzz，ASan/UBSan） ----
+add_executable(ts_demux_test
+    ts_demux_test.cc
+    ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
+)
+target_include_directories(ts_demux_test PRIVATE
+    ${CLAW_ROOT}/components/media_player/src
+)
+target_compile_options(ts_demux_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+target_link_options(ts_demux_test PRIVATE -fsanitize=address,undefined)
+
 # ---- media_stress: ASan/UBSan 泵切换压力测试（无头，复现真机切曲堆破坏用） ----
 add_executable(media_stress
     media_stress.cc
