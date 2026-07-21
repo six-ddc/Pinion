@@ -12,9 +12,7 @@ void Resampler::Reset() {
     has_prev_ = false;
     frac_q16_ = 0;
     lp_enabled_ = false;
-    b0_ = 1;
-    b1_ = b2_ = a1_ = a2_ = 0;
-    x1_ = x2_ = y1_ = y2_ = 0;
+    for (int i = 0; i < kLpStages; i++) lp_[i] = Biquad{};
 }
 
 void Resampler::Configure(int in_hz, int channels) {
@@ -23,10 +21,12 @@ void Resampler::Configure(int in_hz, int channels) {
     // 重采样比率（Q16）：输出一个样本，输入相位推进 in_hz/out_hz。
     ratio_q16_ = (uint32_t)(((uint64_t)in_hz_ << 16) / kOutHz);
 
-    // RBJ 低通 biquad，截止 ~7kHz、Q=0.707。截止逼近输入奈奎斯特时旁路（输入率已够低，
-    // 降采样不会折叠——如输入本就 16k mono，fc 7k < 8k 仍开着做温和限带亦可，这里以 0.95
-    // 奈奎斯特为界避免系数病态）。
-    const double fc = 7000.0;
+    // 抗混叠：4 级 RBJ 低通 biquad 级联成 8 阶 Butterworth，截止 6.6kHz。
+    // 每级 Q 为 8 阶 Butterworth 极点对的标准值；级按 Q 从低到高排，减小级间过冲。
+    // 截止逼近输入奈奎斯特时旁路（输入率已够低，降采样不会折叠），以 0.95 奈奎斯特
+    // 为界避免系数病态。
+    static const double kStageQ[kLpStages] = {0.50980, 0.60134, 0.89998, 2.56292};
+    const double fc = 6600.0;
     const double fs = (double)in_hz_;
     if (fc >= fs * 0.5 * 0.95) {
         lp_enabled_ = false;
@@ -34,31 +34,40 @@ void Resampler::Configure(int in_hz, int channels) {
         const double w0 = 2.0 * M_PI * fc / fs;
         const double cosw0 = std::cos(w0);
         const double sinw0 = std::sin(w0);
-        const double alpha = sinw0 / (2.0 * 0.70710678);
-        const double a0 = 1.0 + alpha;
-        b0_ = (float)(((1.0 - cosw0) / 2.0) / a0);
-        b1_ = (float)((1.0 - cosw0) / a0);
-        b2_ = (float)(((1.0 - cosw0) / 2.0) / a0);
-        a1_ = (float)((-2.0 * cosw0) / a0);
-        a2_ = (float)((1.0 - alpha) / a0);
+        for (int i = 0; i < kLpStages; i++) {
+            const double alpha = sinw0 / (2.0 * kStageQ[i]);
+            const double a0 = 1.0 + alpha;
+            lp_[i].b0 = (float)(((1.0 - cosw0) / 2.0) / a0);
+            lp_[i].b1 = (float)((1.0 - cosw0) / a0);
+            lp_[i].b2 = (float)(((1.0 - cosw0) / 2.0) / a0);
+            lp_[i].a1 = (float)((-2.0 * cosw0) / a0);
+            lp_[i].a2 = (float)((1.0 - alpha) / a0);
+        }
         lp_enabled_ = true;
     }
     // 换配置时清滤波器记忆，避免旧率的历史样本污染新率响应。
-    x1_ = x2_ = y1_ = y2_ = 0;
+    for (int i = 0; i < kLpStages; i++) {
+        lp_[i].x1 = lp_[i].x2 = lp_[i].y1 = lp_[i].y2 = 0;
+    }
 }
 
 int32_t Resampler::LowPass(int32_t x) {
     if (!lp_enabled_) return x;
-    const float xf = (float)x;
-    // Direct Form 1：y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
-    float y = b0_ * xf + b1_ * x1_ + b2_ * x2_ - a1_ * y1_ - a2_ * y2_;
-    x2_ = x1_;
-    x1_ = xf;
-    y2_ = y1_;
-    y1_ = y;
-    if (y > 32767.0f) y = 32767.0f;
-    if (y < -32768.0f) y = -32768.0f;
-    return (int32_t)y;
+    // 级联 Direct Form 1：y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2，逐级串联。
+    // 级间不截断（高 Q 级瞬态可能过冲 int16 范围，float 域无损通过），只在末端钳位。
+    float v = (float)x;
+    for (int i = 0; i < kLpStages; i++) {
+        Biquad& s = lp_[i];
+        const float y = s.b0 * v + s.b1 * s.x1 + s.b2 * s.x2 - s.a1 * s.y1 - s.a2 * s.y2;
+        s.x2 = s.x1;
+        s.x1 = v;
+        s.y2 = s.y1;
+        s.y1 = y;
+        v = y;
+    }
+    if (v > 32767.0f) v = 32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    return (int32_t)v;
 }
 
 void Resampler::Interpolate(int32_t sample, std::vector<int16_t>& out) {
