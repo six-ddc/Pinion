@@ -59,6 +59,11 @@ std::atomic<bool> g_quit{false};
 std::atomic<bool> g_pwr_key_held{false};  // F1 held = PWR_KEY pressed (press-and-hold)
 std::atomic<bool> g_shot_pending{false};
 std::atomic<bool> g_demo_pending{false};  // F9 = 渲染一张 pi_card 演示卡（overlay，任何视图可见）
+// TEMP SCAFFOLD: previewscene 延迟截图倒计时 — feed 完最后一帧后，布局要再跑几个主循环
+// 迭代才稳定，所以不能在 ExecCmd 里立即截图。-1 = 空闲；PollCmdFile/ExecCmd 与 Pump() 都在
+// 主线程跑，不需要原子/锁。
+int g_previewscene_countdown = -1;
+std::string g_previewscene_shot_path;
 
 // pi_card 声明式 UI 演示卡：覆盖 icon/slider/bar/label(mono+puhui)/switch/button/
 // divider/spacer + 双向 bind + tone 语义色 + 自适应布局。走完整管道（校验→入队→
@@ -677,7 +682,7 @@ void ExecStrSet(const std::string& path, const std::string& text) {
 // subtrees keep the same lv_obj_t* (the acceptance criterion).
 void DumpPreviewNode(lv_obj_t* obj, int depth);  // 前向声明：定义见下方（迟到属性取证要逐帧转储）
 
-void ExecPreviewFeed(const std::string& path) {
+void ExecPreviewFeed(const std::string& path, int max_lines = -1) {
     std::ifstream f(path);
     if (!f.good()) {
         std::fprintf(stderr, "[sim] previewfeed: can't open '%s'\n", path.c_str());
@@ -689,6 +694,7 @@ void ExecPreviewFeed(const std::string& path) {
     int frame = 0;
     while (std::getline(f, line)) {
         if (line.empty()) continue;
+        if (max_lines > 0 && frame >= max_lines) break;  // previewscene 截断喂帧数
         frame++;
         pi_card::PreviewOnArgs(line.c_str(), gen);
         lv_obj_t* tree = pi_card::PreviewDebugTree();
@@ -755,6 +761,19 @@ void ExecPreviewEnd() {
 void ExecBargeIn() {
     pi_agent_task_new_session();
     std::fprintf(stderr, "[sim] bargein: session gen bumped\n");
+}
+
+// TEMP SCAFFOLD: previewscene <frames_file> <n_lines> <shot_path> — "流式渲染到一半 -> 截图"
+// 一条龙取证：先兜底撤除任何存活预览（PreviewTeardown 内部已判断 active，未活着时是空操作），
+// 强制切到 Chat 视图（预览树只在 Chat 可见），喂前 n_lines 帧（<=0 = 全部）后不收尾
+// （预览树留在屏上），然后交给 Pump() 里的延迟计数器在几个主循环迭代后截图 —— 喂完当帧
+// LVGL 布局还没跑，立即截图会拍到上一帧。
+void ExecPreviewScene(const std::string& path, int n_lines, const std::string& shot_path) {
+    pi_card::PreviewTeardown();
+    PiScreen::DebugGoChat();
+    ExecPreviewFeed(path, n_lines);
+    g_previewscene_shot_path = shot_path;
+    g_previewscene_countdown = 4;
 }
 
 // TEMP SCAFFOLD (merge regression: preview vs. formal render visual A/B): rendercard <file> —
@@ -1794,6 +1813,11 @@ void ExecCmd(const std::string& line) {
         ExecPreviewDump();
     } else if (cmd == "previewend") {  // TEMP SCAFFOLD: simulate UI_TOOL_END without a card render
         ExecPreviewEnd();
+    } else if (cmd == "previewscene") {  // TEMP SCAFFOLD: previewscene <frames_file> <n_lines> <shot_path>
+        std::string path, shot_path;
+        int n_lines = -1;
+        ss >> path >> n_lines >> shot_path;
+        ExecPreviewScene(path, n_lines, shot_path);
     } else if (cmd == "bargein") {  // TEMP SCAFFOLD: simulate a barge-in/new-session gen bump
         ExecBargeIn();
     } else if (cmd == "rendercard") {  // TEMP SCAFFOLD: rendercard <file> — real ui_render from raw JSON file
@@ -2132,6 +2156,10 @@ void Pump() {
     }
     if (g_demo_pending.exchange(false)) RenderDemoCard();  // 校验+入队；drain 下一拍渲染
     if (g_shot_pending.exchange(false)) TakeScreenshot(ShotPath());
+    if (g_previewscene_countdown > 0 && --g_previewscene_countdown == 0) {
+        TakeScreenshot(g_previewscene_shot_path.c_str());
+        std::fprintf(stderr, "[sim][previewscene] shot -> %s\n", g_previewscene_shot_path.c_str());
+    }
     if (shot_ms > 0 && !shot_done && now > shot_ms) {
         shot_done = true;
         TakeScreenshot(ShotPath());

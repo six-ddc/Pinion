@@ -3861,3 +3861,6 @@ void PiScreen::LifecycleCallback(screen_lifecycle_event_t event) {
         IOExpander::getInstance().offRelease(IOExpander::Pin::PWR_KEY);
     }
 }
+
+// sim 取证脚手架专用：强制切到 Chat 视图。产品代码不得调用。
+void PiScreen::DebugGoChat() { Go(ViewState::Chat); }

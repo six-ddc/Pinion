@@ -19,4 +19,7 @@ class PiScreen {
  public:
     static lv_obj_t* Create();
     static void LifecycleCallback(screen_lifecycle_event_t event);
+
+    // sim 取证脚手架专用：强制切到 Chat 视图。产品代码不得调用。
+    static void DebugGoChat();
 };
