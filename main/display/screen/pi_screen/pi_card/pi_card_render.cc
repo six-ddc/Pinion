@@ -1452,7 +1452,9 @@ void PreviewLabelText(lv_obj_t* lbl, const cJSON* node) {
             return;
         }
         SetPreviewLabelText(lbl, txt);
+        return;
     }
+    lv_label_set_text(lbl, "");  // text/bind/bind_data 全都还没流出来：置空，别渲 LVGL 默认 "Text"
 }
 
 void PreviewSetData(const cJSON* data) { s_preview_data = cJSON_IsObject(data) ? data : nullptr; }
