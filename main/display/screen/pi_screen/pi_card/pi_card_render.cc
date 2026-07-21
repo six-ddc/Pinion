@@ -1339,6 +1339,54 @@ void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
     }
 }
 
+// 预览期 bind 一次性取值（流式期 bind 控件不再空转占位）：不走 Acquire——那会动 refcount、
+// 触发种子/活性刷新、对动态路径还会启动异步拉取，预览"零 bind 零 DataConsumer"的零副作用
+// 契约不能破。用 ReadForWorker 直跑 getter 读快照：它只对 WorkerRead::Safe 的静态路径放行
+// （getter 均非阻塞、线程安全，在 LVGL 线程跑与在 worker 线程跑等同安全，见 pi_card_data.h
+// 头注），动态路径（stock.*）恒 false、Unsafe/未注册也 false——这些场景返回 false，调用方
+// 维持缺省占位（"--"/0/JSON 静态值），等 adopt 后正式 bind 接管。取值是建控件时的一次快照，
+// 不随流持续刷新（流式期就几秒，不值得为它加订阅生命周期）；label 走每帧原地更新通道，
+// 天然逐帧重读。
+bool PreviewPeekInt(const char* path, int& out) {
+    if (path == nullptr) return false;
+    HubValue v;
+    if (!DataHub::Instance().ReadForWorker(path, v)) return false;
+    if (const int* iv = std::get_if<int>(&v)) {
+        out = *iv;
+        return true;
+    }
+    if (const bool* bv = std::get_if<bool>(&v)) {
+        out = *bv ? 1 : 0;
+        return true;
+    }
+    return false;
+}
+
+// bind label 的预览直显：镜像 ApplyBind 的 label 分支口径——Int/Bool 走 fmt（缺省 "%d"，
+// FmtSafeForType 兜底防 %s 套 int 崩 vsnprintf），String 直显 + SafeFont 防 mono 字体渲
+// 中文豆腐块。返回是否成功取到值并落了文本；false 时调用方维持 "--" 占位。
+bool PreviewSeedBindLabel(lv_obj_t* lbl, const cJSON* node, const char* path) {
+    HubValue v;
+    if (path == nullptr || !DataHub::Instance().ReadForWorker(path, v)) return false;
+    if (const std::string* sv = std::get_if<std::string>(&v)) {
+        const lv_font_t* f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+        if (SafeFont(f, sv->c_str())) lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+        lv_label_set_text(lbl, sv->c_str());
+        return true;
+    }
+    int iv = 0;
+    if (const int* ip = std::get_if<int>(&v)) iv = *ip;
+    else if (const bool* bp = std::get_if<bool>(&v)) iv = *bp ? 1 : 0;
+    else return false;
+    HubType t = HubType::Int;
+    DataHub::Instance().TypeOf(path, t);
+    const char* fmt = GetStr(node, "fmt", "%d");
+    std::string ferr;
+    if (!FmtSafeForType(fmt, t, ferr)) fmt = "%d";
+    lv_label_set_text_fmt(lbl, fmt, iv);
+    return true;
+}
+
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count) {
     EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
     if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
@@ -1437,13 +1485,16 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
+        lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        ApplyLabelStyle(obj, node);  // 先落字体/角色，PreviewSeedBindLabel 的 SafeFont 才有正确基准
         if (const char* txt = GetStr(node, "text")) {
             SetPreviewLabelText(obj, txt);
-        } else if (GetStr(node, "bind") || GetStr(node, "bind_data")) {
-            lv_label_set_text(obj, "--");  // 绑定类 label 还没吐 text：占位，预览不读硬件值
+        } else if (const char* bind = GetStr(node, "bind");
+                   bind == nullptr || !PreviewSeedBindLabel(obj, node, bind)) {
+            if (bind != nullptr || GetStr(node, "bind_data")) {
+                lv_label_set_text(obj, "--");  // 取不到快照（Unsafe/动态路径）或 bind_data：占位
+            }
         }
-        lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
-        ApplyLabelStyle(obj, node);
     } else if (std::strcmp(type, "icon") == 0) {
         Tok tok = Tok::Dim;
         ToneTok(GetStr(node, "tone", "dim"), tok);
@@ -1467,29 +1518,39 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
             lv_obj_center(lbl);
         }
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);  // 预览不可交互，不挂 on_click
-    } else if (std::strcmp(type, "slider") == 0) {
-        obj = lv_slider_create(parent);
+    } else if (std::strcmp(type, "slider") == 0 || std::strcmp(type, "arc") == 0 ||
+               std::strcmp(type, "bar") == 0) {
+        // 三个数值控件同构：JSON min/max/value 先落，bind 时镜像 ApplyBind 口径——DataHub
+        // 量程（RangeOf）盖过 JSON 区间、快照值（PreviewPeekInt）盖过 JSON 静态 value，让
+        // 流式期就显示真实音量/亮度/电量，adopt 换装零跳变；取不到快照（Unsafe/动态路径）
+        // 维持 JSON 值或控件默认（0），不算错。
+        const bool is_arc = std::strcmp(type, "arc") == 0;
+        const bool is_bar = std::strcmp(type, "bar") == 0;
+        obj = is_arc ? lv_arc_create(parent) : is_bar ? lv_bar_create(parent) : lv_slider_create(parent);
         int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
         if (mx <= mn) mx = mn + 1;
-        lv_slider_set_range(obj, mn, mx);
-        if (HasKey(node, "value")) lv_slider_set_value(obj, GetInt(node, "value", 0), LV_ANIM_OFF);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-    } else if (std::strcmp(type, "arc") == 0) {
-        obj = lv_arc_create(parent);
-        int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
-        if (mx <= mn) mx = mn + 1;
-        lv_arc_set_range(obj, mn, mx);
-        if (HasKey(node, "value")) lv_arc_set_value(obj, GetInt(node, "value", 0));
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-    } else if (std::strcmp(type, "bar") == 0) {
-        obj = lv_bar_create(parent);
-        int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
-        if (mx <= mn) mx = mn + 1;
-        lv_bar_set_range(obj, mn, mx);
-        if (HasKey(node, "value")) lv_bar_set_value(obj, GetInt(node, "value", 0), LV_ANIM_OFF);
+        const char* bind = GetStr(node, "bind");
+        int lo = 0, hi = 0;
+        if (bind != nullptr && DataHub::Instance().RangeOf(bind, lo, hi)) { mn = lo; mx = hi; }
+        int val = GetInt(node, "value", 0);
+        bool has_val = HasKey(node, "value");
+        if (int pv = 0; bind != nullptr && PreviewPeekInt(bind, pv)) { val = pv; has_val = true; }
+        if (is_arc) {
+            lv_arc_set_range(obj, mn, mx);
+            if (has_val) lv_arc_set_value(obj, val);
+        } else if (is_bar) {
+            lv_bar_set_range(obj, mn, mx);
+            if (has_val) lv_bar_set_value(obj, val, LV_ANIM_OFF);
+        } else {
+            lv_slider_set_range(obj, mn, mx);
+            if (has_val) lv_slider_set_value(obj, val, LV_ANIM_OFF);
+        }
+        if (!is_bar) lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
     } else if (std::strcmp(type, "switch") == 0) {
         obj = lv_switch_create(parent);
-        if (GetBool(node, "checked")) lv_obj_add_state(obj, LV_STATE_CHECKED);
+        bool checked = GetBool(node, "checked");
+        if (int pv = 0; PreviewPeekInt(GetStr(node, "bind"), pv)) checked = pv != 0;  // 快照盖静态值
+        if (checked) lv_obj_add_state(obj, LV_STATE_CHECKED);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
     } else if (std::strcmp(type, "qrcode") == 0) {
         obj = lv_qrcode_create(parent);
@@ -1503,6 +1564,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         lv_qrcode_update(obj, txt, static_cast<uint32_t>(std::strlen(txt)));
     } else if (std::strcmp(type, "choice") == 0) {
         obj = MakeChoice(parent, node);
+        if (int pv = 0; PreviewPeekInt(GetStr(node, "bind"), pv)) ChoiceSetValue(obj, pv);  // 快照选中真实档位
     } else if (std::strcmp(type, "divider") == 0) {
         obj = lv_obj_create(parent);
         screen_strip_obj_chrome(obj);
@@ -1597,8 +1659,11 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
         if (same_sig && lv_obj_check_type(existing, &lv_label_class)) {
             if (const char* txt = GetStr(node_spec, "text")) {
                 SetPreviewLabelText(existing, txt);
-            } else if (GetStr(node_spec, "bind") || GetStr(node_spec, "bind_data")) {
-                lv_label_set_text(existing, "--");
+            } else if (const char* bind = GetStr(node_spec, "bind");
+                       bind == nullptr || !PreviewSeedBindLabel(existing, node_spec, bind)) {
+                if (bind != nullptr || GetStr(node_spec, "bind_data")) {
+                    lv_label_set_text(existing, "--");
+                }
             }
             return existing;  // 原地更新文本，不重建——长文本不闪烁
         }

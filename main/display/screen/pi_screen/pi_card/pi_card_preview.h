@@ -5,8 +5,10 @@
 //
 // ui_render 的参数在 SSE 流入期间，pi_agent_task.c 每收到一片 delta 就把当前累积文本重新
 // parse 成一棵"尽力而为"的 partial cJSON 树，序列化后经 UI_TOOL_ARGS 事件传到这里（drain
-// 侧，LVGL 线程）。本模块据此在聊天流里实时长出一张"预览卡"（只画外观：零 bind、零事件、
-// 零 id 注册、零 DataConsumer——因为这时既没有 UiCard，也没有校验过的合法路径），流吐完、
+// 侧，LVGL 线程）。本模块据此在聊天流里实时长出一张"预览卡"（零订阅：零 bind observer、零
+// 事件、零 id 注册、零 DataConsumer——因为这时既没有 UiCard，也没有校验过的合法路径；bind
+// 控件的值走 DataHub::ReadForWorker 一次性快照直读，安全路径流式期即显真实值，读不到的
+// 维持 "--"/缺省占位，见 pi_card_render.cc 的 PreviewPeekInt/PreviewSeedBindLabel），流吐完、
 // 真正的 pi_card_tool_render 校验通过、UI_CARD_RENDER 到达时，由正式渲染在同一个 row 容器里
 // "adopt"（接管）这个预览、原地换装成带真实 bind/事件的正式卡，观感上是一帧换装、不跳行。
 //
