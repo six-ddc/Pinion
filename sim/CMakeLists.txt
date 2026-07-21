@@ -95,7 +95,10 @@ add_executable(pi_sim
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
     ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
     ${CLAW_ROOT}/components/media_player/src/media_id3.cc
+    ${CLAW_ROOT}/components/media_player/src/media_hls.cc
+    ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
     shim/src/media_http_curl.cc
+    shim/src/media_http_fetch_curl.cc
     shim/src/media_textconv_sim.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
@@ -157,16 +160,23 @@ target_include_directories(id3_test PRIVATE
 )
 target_link_libraries(id3_test PRIVATE iconv)
 
-# ---- ts_demux_test: MPEG-TS 解封装单测（真实 CNR 分片 fixture + 合成 TS + 变异 fuzz，ASan/UBSan） ----
+# ---- ts_demux_test: TS 解封装 + HLS playlist 解析单测（真实 fixture + 合成 + 变异 fuzz，ASan/UBSan） ----
 add_executable(ts_demux_test
     ts_demux_test.cc
     ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
+    ${CLAW_ROOT}/components/media_player/src/media_hls.cc
+    shim/src/media_http_fetch_curl.cc
 )
 target_include_directories(ts_demux_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/shim/include
+    ${PI_C_DIR}/include
+    ${PI_C_DIR}/port/posix
+    ${CLAW_ROOT}/components/media_player/include
     ${CLAW_ROOT}/components/media_player/src
 )
 target_compile_options(ts_demux_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(ts_demux_test PRIVATE -fsanitize=address,undefined)
+target_link_libraries(ts_demux_test PRIVATE curl)
 
 # ---- media_stress: ASan/UBSan 泵切换压力测试（无头，复现真机切曲堆破坏用） ----
 add_executable(media_stress
@@ -178,6 +188,9 @@ add_executable(media_stress
     ${CLAW_ROOT}/components/media_player/src/media_decoder_minimp3.cc
     ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
+    ${CLAW_ROOT}/components/media_player/src/media_hls.cc
+    ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
+    shim/src/media_http_fetch_curl.cc
 )
 target_include_directories(media_stress PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include

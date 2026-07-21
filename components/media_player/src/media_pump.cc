@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "media_decoder.h"
+#include "media_hls.h"
 #include "media_internal.h"
 #include "media_player/media_http_stream.h"
 #include "media_player/media_source.h"
@@ -149,9 +150,13 @@ static void ReaderRun(Pump* p) {
         auto on_reconnecting = [p](bool reconnecting) {
             if (p->host) p->host->OnReconnecting(p, reconnecting);
         };
+        // 源/编解码三分路由：.m3u8 → HLS 源（TS 解封装吐 ADTS，AAC 解码）；
+        // 其余流 → 裸 MP3 无限流；文件 → SD MP3。
+        const bool is_hls = item.is_stream && UrlIsHls(item.path_or_url.c_str());
         std::unique_ptr<MediaSource> src =
-            item.is_stream ? OpenHttpStreamSource(item.path_or_url.c_str(), on_reconnecting)
-                           : OpenFileSource(item.path_or_url.c_str());
+            is_hls           ? OpenHlsStreamSource(item.path_or_url.c_str(), on_reconnecting)
+            : item.is_stream ? OpenHttpStreamSource(item.path_or_url.c_str(), on_reconnecting)
+                             : OpenFileSource(item.path_or_url.c_str());
         if (!src) {
             if (p->host) p->host->OnTrackError(p, idx, "open failed");
             break;
@@ -167,7 +172,7 @@ static void ReaderRun(Pump* p) {
             std::lock_guard<std::mutex> lk(p->mu);
             p->input_done = false;
             p->reader_epoch++;
-            p->track_codec = MediaCodec::Mp3;  // 目前全 MP3；HLS(.m3u8→AAC) 路由在此接入
+            p->track_codec = is_hls ? MediaCodec::AacAdts : MediaCodec::Mp3;
         }
         p->cv.notify_all();
         if (p->host) p->host->OnTrackStarted(p, idx);

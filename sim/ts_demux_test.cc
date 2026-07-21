@@ -9,7 +9,18 @@
 #include <string>
 #include <vector>
 
+#include "media_hls.h"
 #include "media_ts_demux.h"
+
+// shim esp_log.h 的落点（正经实现在 esp_shim.c，但它牵 pi-c 运行时，测试不值当）：直印 stderr。
+extern "C" void sim_log_write(char level, const char* tag, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    std::fprintf(stderr, "%c %s: ", level, tag);
+    std::vfprintf(stderr, fmt, ap);
+    std::fprintf(stderr, "\n");
+    va_end(ap);
+}
 
 namespace {
 
@@ -225,10 +236,64 @@ void TestFixture(const std::vector<uint8_t>& ts) {
     dj.Feed(junk.data(), junk.size(), sink);
 }
 
+// —— HLS playlist 纯解析层（media_hls.h）——
+
+void TestHlsParse() {
+    // JoinUrl：绝对透传 / 根相对 / 目录相对 / query 逐字节保留 / base 的 query 剥离
+    CHECK(media::JoinUrl("http://a.cn/live/x/playlist.m3u8", "http://b.cn/y.ts") == "http://b.cn/y.ts",
+          "绝对 URL 应透传\n");
+    CHECK(media::JoinUrl("http://a.cn/live/x/playlist.m3u8", "seg1.ts") == "http://a.cn/live/x/seg1.ts",
+          "目录相对拼接错误\n");
+    CHECK(media::JoinUrl("http://a.cn/live/x/playlist.m3u8", "/z/seg.ts") == "http://a.cn/z/seg.ts",
+          "根相对拼接错误\n");
+    // satellitepull 形态：base 带会话 token（拼接时剥离），分片自带 token（逐字节保留）
+    const std::string base = "http://112.192.19.74/satellitepull.cnr.cn/live/wxszfy971/playlist.m3u8"
+                             "?wsSession=abc-123&wsIPSercert=DEF&wsBindIP=2";
+    const std::string seg = "1784647643.ts?wsSession=abc-123&wsIPSercert=DEF&wsBindIP=2&wsApp=HLS";
+    CHECK(media::JoinUrl(base, seg) ==
+              "http://112.192.19.74/satellitepull.cnr.cn/live/wxszfy971/" + seg,
+          "token query 应逐字节保留且 base query 不参与拼接\n");
+
+    CHECK(media::UrlIsHls("http://x/index.m3u8") && media::UrlIsHls("http://x/a.M3U8?tok=1") &&
+              !media::UrlIsHls("http://x/64k.mp3") && !media::UrlIsHls("http://x/m3u8"),
+          "UrlIsHls 判定错误\n");
+
+    // master playlist：选最高带宽变体
+    const std::string master = "#EXTM3U\r\n"
+                               "#EXT-X-STREAM-INF:PROGRAM-ID=1, BANDWIDTH=230000\r\n"
+                               "http://edge/a/playlist.m3u8?tok=1\r\n"
+                               "#EXT-X-STREAM-INF:PROGRAM-ID=1, BANDWIDTH=64000\r\n"
+                               "low/playlist.m3u8\r\n";
+    auto mp = media::ParseM3u8(master, "http://cnr/live/x/playlist.m3u8");
+    CHECK(mp.is_master && mp.variants.size() == 2 && mp.variants[0].bandwidth == 230000 &&
+              mp.variants[0].url == "http://edge/a/playlist.m3u8?tok=1" &&
+              mp.variants[1].url == "http://cnr/live/x/low/playlist.m3u8",
+          "master 解析错误\n");
+
+    // media playlist：SEQ/TARGETDURATION/分片序
+    const std::string mediapl = "#EXTM3U\n"
+                                "#EXT-X-VERSION:3\n"
+                                "#EXT-X-MEDIA-SEQUENCE:15461468\n"
+                                "#EXT-X-TARGETDURATION:10\n"
+                                "#EXTINF:10.006,\n"
+                                "15461468.ts\n"
+                                "#EXTINF:10.005,\n"
+                                "15461469.ts\n";
+    auto pl = media::ParseM3u8(mediapl, "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8");
+    CHECK(!pl.is_master && pl.media_sequence == 15461468 && pl.target_duration_s == 10 &&
+              pl.segment_urls.size() == 2 && !pl.endlist &&
+              pl.segment_urls[0] == "http://ngcdn001.cnr.cn/live/zgzs/15461468.ts",
+          "media playlist 解析错误\n");
+
+    auto vod = media::ParseM3u8("#EXTM3U\n#EXTINF:3,\na.ts\n#EXT-X-ENDLIST\n", "http://x/i.m3u8");
+    CHECK(vod.endlist && vod.segment_urls.size() == 1, "ENDLIST 解析错误\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const char* fixture = argc > 1 ? argv[1] : "sim/testdata/cnr_seg.ts";
+    TestHlsParse();
     TestSynthetic();
     auto ts = ReadFile(fixture);
     if (ts.empty()) {
