@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "src/media_controller.cc"
         "src/media_pump.cc"
+        "src/media_decoder_minimp3.cc"
         "src/media_resampler.cc"
         "src/media_file_source.cc"
         "src/media_http_esp.cc"

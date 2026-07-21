@@ -4,8 +4,9 @@
 //   曲末（文件 EOF）与 decoder 握手后推进下一曲（自动连播），播完最后一曲 → OnAllFinished；
 //   无限流不 EOF。流式播放用 PlaybackFilled() 做节流阀：已缓冲 PCM > kStreamBufferMaxSec 秒
 //   就暂停读，让整条链路自时钟、字节环有界。
-// decoder 线程：从字节环取压缩字节 → minimp3 滑窗榨干 → 降混+重采样到 16k mono →
-//   FeedPlayback（带 pump 起播代次，打断残音竞态收口，背压落在本线程）。
+// decoder 线程：从字节环取压缩字节 → MediaDecoder（按 track_codec 分派：真机
+//   esp_audio_codec / sim minimp3+helix，见 media_decoder.h）榨干 → 降混+重采样到
+//   16k mono → FeedPlayback（带 pump 起播代次，打断残音竞态收口，背压落在本线程）。
 //
 // 参照范式：components/volc_speech/src/volc_tts.cc 的 pump 任务（环形缓冲→解码器榨干→
 // FeedPlayback、滑窗 memmove 已消费字节）。
@@ -22,16 +23,12 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "media_decoder.h"
 #include "media_internal.h"
 #include "media_player/media_http_stream.h"
 #include "media_player/media_source.h"
 #include "media_resampler.h"
 #include "metalio_hal/audio_pipeline.h"
-
-// minimp3：仅在本编译单元展开实现（其余 TU 只用声明）。不用其 stdio 文件 API。
-#define MINIMP3_IMPLEMENTATION
-#define MINIMP3_NO_STDIO
-#include "minimp3.h"
 
 namespace media {
 
@@ -40,12 +37,7 @@ const char* TAG = "media_pump";
 
 constexpr uint32_t kFeedTimeoutMs = 10000;  // 抖动队列满时对 decoder 的最大背压时长
 constexpr size_t kReaderChunk = 4096;       // 单次 Read 上限
-constexpr size_t kDecoderPull = 16384;      // 单次从字节环搬进解码窗的上限
-// 解码窗保留水位：minimp3 需要看到当前帧**及其后续字节**才肯出音（比特储备/下一帧同步头
-// 校验）；窗内不足此量且未到输入末尾时先补数据再解码，否则边界帧会被判 samples==0 而丢音
-//（实测 8KB 分块解 sine440 丢 27 帧；保留 16KB 后与整段解码逐帧一致）。到 EOF 时此约束解除，
-// 榨干剩余。
-constexpr size_t kDecodeReserve = 16384;
+constexpr size_t kDecoderPull = 16384;      // 单次从字节环搬进解码器的上限
 constexpr int kDecoderPaceSec = 3;          // 解码喂入不超前播放缓冲这么多秒（自时钟节流阀）
 
 const char* StateName(MediaState s) {
@@ -169,12 +161,13 @@ static void ReaderRun(Pump* p) {
             p->current_source = src.get();  // teardown 路径据此 Abort() 快速打断阻塞的 Read()
         }
 
-        // 起新曲：清 input_done、bump epoch（通知 decoder 复位并接新流）。
+        // 起新曲：清 input_done、bump epoch（通知 decoder 复位并接新流）、标记本曲编解码。
         p->cur_index = idx;
         {
             std::lock_guard<std::mutex> lk(p->mu);
             p->input_done = false;
             p->reader_epoch++;
+            p->track_codec = MediaCodec::Mp3;  // 目前全 MP3；HLS(.m3u8→AAC) 路由在此接入
         }
         p->cv.notify_all();
         if (p->host) p->host->OnTrackStarted(p, idx);
@@ -264,23 +257,12 @@ static size_t FeedWithSkip(Pump* p, std::vector<int16_t>& pcm, uint64_t& skip_re
 }
 
 static void DecoderRun(Pump* p) {
-    mp3dec_t* mp3 = new (std::nothrow) mp3dec_t;
-    // scratch (~16KB) 堆分配（>4KB 落 PSRAM）走 _ex 变体：原版在 mp3dec_decode_frame
-    // 栈上放整个 scratch，逼得解码线程要 28KB 连续内部栈——低内存时 pthread 建不出
-    // 来，std::thread 抛异常直接 terminate 重启（真机实测）。
-    mp3dec_scratch_t* scratch = new (std::nothrow) mp3dec_scratch_t;
-    int16_t* pcm = new (std::nothrow) int16_t[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    if (mp3 == nullptr || scratch == nullptr || pcm == nullptr) {
-        ESP_LOGE(TAG, "decoder alloc failed");
-        delete mp3;
-        delete scratch;
-        delete[] pcm;
-        return;
-    }
+    // 解码器按 track_codec 惰性创建：codec 未变时换曲只 Reset() 复用（解码器大块状态
+    // 都在堆上，见 media_decoder.h 约定），变了才重建。
+    std::unique_ptr<MediaDecoder> decoder;
+    MediaCodec decoder_codec = MediaCodec::Mp3;
     Resampler resampler;
-    std::vector<uint8_t> win;   // minimp3 滑窗：保留未消费的压缩字节
     std::vector<int16_t> out;   // 重采样输出缓冲（复用）
-    win.reserve(kDecoderPull * 2);
 #ifndef ESP_PLATFORM
     WavDump wav;
     wav.MaybeOpen();
@@ -291,12 +273,44 @@ static void DecoderRun(Pump* p) {
     uint64_t skip_remaining = 0;
     const int64_t start_us = esp_timer_get_time();
     int64_t last_log_us = start_us;
-    // 分段耗时探针（真机排查解码追不上实时用；随 5s wall 日志打印后清零）
+    // 分段耗时探针（真机排查解码追不上实时用；随 5s wall 日志打印后清零）。
+    // us_decode 为 Feed 总耗时刨去回调内的重采样/喂入耗时，即纯解码时间。
     int64_t us_decode = 0, us_resamp = 0, us_feed = 0;
-    uint64_t cleared_tail = 0;  // 丢弃的无法成帧尾部字节（诊断，正常仅曲末 < 1 帧）
     // 本曲是否已上报过 OnPlaybackFlowing（Loading→Playing）：每接手一个新 epoch（新曲）
     // 重置，跳过阶段（续播 seek）不算数——必须真有样本喂进播放管线才算"在出声"。
     bool flowing_reported = false;
+
+    // 每帧回调：重采样 → 带 skip 喂播放管线 → 首帧触发 Loading→Playing → 追赶限速。
+    // 构造一次跨曲复用（捕获全为引用/指针）；返回 false 要求解码器尽快中止（stop 信号）。
+    const MediaDecoder::FrameFn on_frame = [&](const int16_t* pcm, int frames, int channels, int hz) -> bool {
+        p->decoded_frames++;
+        out.clear();
+        int64_t tp = esp_timer_get_time();
+        resampler.Process(pcm, frames, channels, hz, out);
+        us_resamp += esp_timer_get_time() - tp;
+        p->resampled_samples += out.size();
+        tp = esp_timer_get_time();
+        size_t fed = FeedWithSkip(p, out, skip_remaining,
+#ifndef ESP_PLATFORM
+                                  wav,
+#endif
+                                  p->playback_gen);
+        us_feed += esp_timer_get_time() - tp;
+        // 首个真正喂进播放管线的帧（跳过阶段不算）：Loading→Playing 的唯一触发点。
+        // 修复此前"源一打开就报 Playing"导致从未连上的流长时间误报播放中。
+        if (fed > 0 && !flowing_reported) {
+            flowing_reported = true;
+            if (p->host) p->host->OnPlaybackFlowing(p, p->cur_index.load());
+        }
+        // 追赶限速：缓冲已 ≥1s 后每帧让出 2ms。此前起播/切曲要全速灌满 3s 水位，
+        // decoder 连续满负荷 5-8s 与 LVGL 同核同优先级抢时间片（真机实测该窗口
+        // 每帧解码从稳态 1.3ms 劣化到 25ms、核1 拉满、UI 掉帧卡顿）。限速后
+        // 首秒仍全速（快出声），其后 ~8×实时温和填充，3s 水位 <1s 建立。
+        if (!p->stop && mhal::audio_pipeline::PlaybackFilled() >= (size_t)(sr * 2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return !p->stop;
+    };
 
     for (;;) {
         if (p->stop) break;
@@ -311,6 +325,8 @@ static void DecoderRun(Pump* p) {
 
         std::vector<uint8_t> pulled;
         bool input_done_snap = false, ring_empty_snap = false;
+        bool adopt_new = false;
+        MediaCodec adopt_codec = MediaCodec::Mp3;
         {
             std::unique_lock<std::mutex> lk(p->mu);
             p->cv.wait(lk, [&] {
@@ -319,15 +335,10 @@ static void DecoderRun(Pump* p) {
             });
             if (p->stop) break;
             if (p->reader_epoch > adopted) {
-                // 新曲：接手 epoch，复位解码器/重采样/窗，重置位置与 skip。
+                // 新曲：接手 epoch，快照本曲编解码（与 reader 同锁写读，无独立竞态）。
                 adopted = p->reader_epoch;
-                mp3dec_init(mp3);
-                resampler.Reset();
-                win.clear();
-                // skip 仅用于首曲（续播/恢复的起播索引）；自动连播的后续曲从 0 起。
-                skip_remaining = (adopted == 1) ? p->skip_out_samples : 0;
-                p->fed_samples = skip_remaining;
-                flowing_reported = false;  // 新曲：Loading→Playing 需要重新用首帧触发
+                adopt_new = true;
+                adopt_codec = p->track_codec;
             }
             if (!p->ring.empty()) {
                 pulled.resize(std::min(p->ring.size(), kDecoderPull));
@@ -338,50 +349,43 @@ static void DecoderRun(Pump* p) {
         }
         if (!pulled.empty()) p->cv.notify_all();  // 唤醒 reader（腾出空间）
 
-        win.insert(win.end(), pulled.begin(), pulled.end());
+        if (adopt_new) {
+            // 复位解码器（codec 不变则复用实例）与重采样，重置位置/skip/出声上报。
+            if (decoder == nullptr || decoder_codec != adopt_codec) {
+                decoder = CreateMediaDecoder(adopt_codec);
+                decoder_codec = adopt_codec;
+            } else {
+                decoder->Reset();
+            }
+            resampler.Reset();
+            // skip 仅用于首曲（续播/恢复的起播索引）；自动连播的后续曲从 0 起。
+            skip_remaining = (adopted == 1) ? p->skip_out_samples : 0;
+            p->fed_samples = skip_remaining;
+            flowing_reported = false;  // 新曲：Loading→Playing 需要重新用首帧触发
+            if (decoder == nullptr) {
+                // codec 无解码器（如 sim 端 AAC 未接入）或内存不足：报错停泵。
+                ESP_LOGE(TAG, "decoder create failed (codec=%d)", (int)adopt_codec);
+                if (p->host) p->host->OnTrackError(p, p->cur_index.load(), "decoder unavailable");
+                p->stop = true;
+                p->cv.notify_all();
+                break;
+            }
+        }
 
-        // 榨干滑窗：逐帧解码。仅当窗内保有 kDecodeReserve 字节（保证 minimp3 有足够后瞻）
-        // 或已到输入末尾时才解，否则先补数据——规避边界帧被判 samples==0 丢音。
+        // 榨干本次拉取：解码器逐帧回调 on_frame（重采样→喂入），at_eof 时放开水位榨干尾部。
         const bool at_eof = input_done_snap && ring_empty_snap;
-        while (!win.empty() && (win.size() >= kDecodeReserve || at_eof)) {
-            mp3dec_frame_info_t info;
-            int64_t tp = esp_timer_get_time();
-            int samples = mp3dec_decode_frame_ex(mp3, scratch, win.data(), (int)win.size(), pcm, &info);
-            us_decode += esp_timer_get_time() - tp;
-            if (info.frame_bytes == 0) {
-                break;  // 当前窗不足一帧，需更多输入
+        if (decoder != nullptr && (!pulled.empty() || at_eof)) {
+            const int64_t cb_before = us_resamp + us_feed;
+            const int64_t tp = esp_timer_get_time();
+            const bool ok = decoder->Feed(pulled.empty() ? nullptr : pulled.data(), pulled.size(), at_eof, on_frame);
+            us_decode += (esp_timer_get_time() - tp) - ((us_resamp + us_feed) - cb_before);
+            if (!ok && !p->stop) {
+                ESP_LOGE(TAG, "unrecoverable decode error (codec=%d)", (int)decoder_codec);
+                if (p->host) p->host->OnTrackError(p, p->cur_index.load(), "decode error");
+                p->stop = true;
+                p->cv.notify_all();
+                break;
             }
-            // 消费本帧字节（滑窗前移）
-            win.erase(win.begin(), win.begin() + info.frame_bytes);
-            if (samples > 0) {
-                p->decoded_frames++;
-                out.clear();
-                tp = esp_timer_get_time();
-                resampler.Process(pcm, samples, info.channels, info.hz, out);
-                us_resamp += esp_timer_get_time() - tp;
-                p->resampled_samples += out.size();
-                tp = esp_timer_get_time();
-                size_t fed = FeedWithSkip(p, out, skip_remaining,
-#ifndef ESP_PLATFORM
-                                          wav,
-#endif
-                                          p->playback_gen);
-                us_feed += esp_timer_get_time() - tp;
-                // 首个真正喂进播放管线的帧（跳过阶段不算）：Loading→Playing 的唯一触发
-                // 点。修复此前"源一打开就报 Playing"导致从未连上的流长时间误报播放中。
-                if (fed > 0 && !flowing_reported) {
-                    flowing_reported = true;
-                    if (p->host) p->host->OnPlaybackFlowing(p, p->cur_index.load());
-                }
-                // 追赶限速：缓冲已 ≥1s 后每帧让出 2ms。此前起播/切曲要全速灌满 3s 水位，
-                // decoder 连续满负荷 5-8s 与 LVGL 同核同优先级抢时间片（真机实测该窗口
-                // 每帧解码从稳态 1.3ms 劣化到 25ms、核1 拉满、UI 掉帧卡顿）。限速后
-                // 首秒仍全速（快出声），其后 ~8×实时温和填充，3s 水位 <1s 建立。
-                if (!p->stop && mhal::audio_pipeline::PlaybackFilled() >= (size_t)(sr * 2)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                }
-            }
-            if (p->stop) break;
         }
 
         // 每 5s 打一行进度（state/position/已解码帧数/重采样后样本数/字节环高水位）。
@@ -399,13 +403,9 @@ static void DecoderRun(Pump* p) {
             us_decode = us_resamp = us_feed = 0;
         }
 
-        // 本曲是否解码搬完：input_done + 字节环空（at_eof）即榨干完毕（上面的解码在 EOF 下
-        // 已放开保留约束逐帧到底）→ 丢弃无法成帧的尾部、握手告知 reader。
+        // 本曲是否解码搬完：input_done + 字节环空（at_eof）即榨干完毕（Feed 在 at_eof 下
+        // 已放开保留约束逐帧到底并丢弃无法成帧的尾部）→ 握手告知 reader。
         if (at_eof && !p->stop) {
-            if (!win.empty()) {
-                cleared_tail += win.size();
-                win.clear();  // 丢弃无法成帧的尾部垃圾
-            }
             {
                 std::lock_guard<std::mutex> lk(p->mu);
                 if (p->input_done && p->ring.empty()) p->decoder_epoch = adopted;
@@ -422,10 +422,7 @@ static void DecoderRun(Pump* p) {
 #endif
     ESP_LOGI(TAG, "decoder exit: frames=%u resamp=%u fed=%u cleared_tail=%uB",
              (unsigned)p->decoded_frames.load(), (unsigned)p->resampled_samples.load(),
-             (unsigned)p->fed_samples.load(), (unsigned)cleared_tail);
-    delete mp3;
-    delete scratch;
-    delete[] pcm;
+             (unsigned)p->fed_samples.load(), (unsigned)(decoder ? decoder->discarded_tail() : 0));
 }
 
 // ============================ 线程入口包装 ============================

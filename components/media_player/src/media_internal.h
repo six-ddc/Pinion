@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #endif
 
+#include "media_decoder.h"
 #include "media_player/media_player.h"
 #include "media_player/media_source.h"
 
@@ -133,6 +134,9 @@ struct Pump {
     ByteRing ring;                        // 压缩字节缓冲，容量上限 kByteRingCap
     bool input_done = false;              // reader 已读完当前曲输入
     int reader_epoch = 0;                 // reader 每开一曲 ++（含首曲：0→1）
+    // 当前曲编解码类型：reader 开源时按源推断（.m3u8→AacAdts，其余 Mp3），与 reader_epoch++
+    // 同临界区写入；decoder 接管新 epoch 时在同一把锁下快照——复用既有握手，无独立竞态。
+    MediaCodec track_codec = MediaCodec::Mp3;
     int decoder_epoch = 0;                // decoder 已完成解码收尾的 epoch（握手：==reader_epoch 表示当前曲搬完）
     // 当前打开的字节源：reader 线程 Open 成功后写入、Close 前清空，用 mu 保护。teardown
     // 路径（另一线程）借此拿到指针调 Abort()，快速打断可能阻塞在网络 Read() 里的 reader

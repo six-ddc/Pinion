@@ -91,6 +91,7 @@ add_executable(pi_sim
     # media_player 媒体播放核心（可移植源 device/sim 同源；HTTP 流用 libcurl shim）
     ${CLAW_ROOT}/components/media_player/src/media_controller.cc
     ${CLAW_ROOT}/components/media_player/src/media_pump.cc
+    ${CLAW_ROOT}/components/media_player/src/media_decoder_minimp3.cc
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
     ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
     ${CLAW_ROOT}/components/media_player/src/media_id3.cc
@@ -163,6 +164,7 @@ add_executable(media_stress
     shim/src/media_http_curl.cc
     ${CLAW_ROOT}/components/media_player/src/media_controller.cc
     ${CLAW_ROOT}/components/media_player/src/media_pump.cc
+    ${CLAW_ROOT}/components/media_player/src/media_decoder_minimp3.cc
     ${CLAW_ROOT}/components/media_player/src/media_file_source.cc
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
 )

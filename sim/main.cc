@@ -1803,6 +1803,20 @@ void ExecCmd(const std::string& line) {
         }
         media::MediaController::Instance().StagePlaylist(items, -1);
         std::fprintf(stderr, "[sim][mediastage] staged %zu stations (no autoplay)\n", items.size());
+    } else if (cmd == "mediaplay") {  // TEMP SCAFFOLD: mediaplay <path_or_url> — 单曲起播（金标 WAV
+                                      // dump / HLS 验收用）；.m3u8 或 http 前缀按流处理
+        std::string p;
+        std::getline(ss, p);
+        if (!p.empty() && p[0] == ' ') p.erase(0, 1);
+        if (!p.empty()) {
+            media::MediaItem m;
+            m.title = p;
+            m.path_or_url = p;
+            m.is_stream = (p.rfind("http://", 0) == 0 || p.rfind("https://", 0) == 0);
+            media::MediaController::Instance().StagePlaylist({std::move(m)}, -1);
+            media::MediaController::Instance().PlayIndex(0);
+            std::fprintf(stderr, "[sim][mediaplay] start %s\n", p.c_str());
+        }
     } else if (cmd == "growcard") {  // TEMP SCAFFOLD: render the reflow re-entrancy test card
         RenderGrowCard();
     } else if (cmd == "showrows") {  // TEMP SCAFFOLD: showrows <n> — real ui_update, drives reflow
