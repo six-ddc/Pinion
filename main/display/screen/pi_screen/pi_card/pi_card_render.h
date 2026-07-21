@@ -71,11 +71,12 @@ void PlayCardEntrance(lv_obj_t* tree, bool adopted);
 // 生命周期的类型直接跳过不建。限额沿用 64 节点/8 层，用独立计数（不占用正式渲染的
 // RenderLimits/node_count），超限只是静默停止生长，不报错——预览允许"半棵树"。
 
-// 一次性整棵渲染 node（及其全部子树，若是 column/row）：用于 (a) 流式会话第一次出现可渲染
-// 内容时的初始建树，(b) 位置游标推进时把"已确定不再变"的兄弟节点渲染成最终形。会给自己建出
-// 的每个 column/row 打 LV_OBJ_FLAG_USER_2（内部惯用记号，标记"这是一个预览容器，可以被
+// 一次性整棵渲染 node（及其全部子树，若是 column/row/grid）：用于 (a) 流式会话第一次出现可
+// 渲染内容时的初始建树，(b) 位置游标推进时把"已确定不再变"的兄弟节点渲染成最终形。会给自己
+// 建出的每个 column/row 打 LV_OBJ_FLAG_USER_2（内部惯用记号，标记"这是一个预览容器，可以被
 // PreviewSyncContainer 继续增量同步"）+ user_data 记一个 committed 游标（= 已建子节点数-1，
-// 即认定最后一个子节点仍是"生长边"，留给下一次调用去继续对齐）。
+// 即认定最后一个子节点仍是"生长边"，留给下一次调用去继续对齐）。grid 不打 USER_2：它整块
+// 渲染、整块重建（见 SyncPreviewNode），cols 还没吐出第一列前占位等待。
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count);
 
 // 位置游标增量对齐：lv_container 是先前调用建出的、打了 USER_2 标记的容器；json_container 是
@@ -89,8 +90,10 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
 // 之前还没能渲出东西）；node_spec 是这个位置最新的 partial 节点。返回这个位置最终对应的 lv
 // 对象（可能与 existing 相同——原地更新；也可能是新建的——删旧重建）。column/row 类型且
 // existing 已带 USER_2 标记时递归调 PreviewSyncContainer 继续往深处生长（保住已定稿的孙子）；
-// 类型不符/首次出现则整棵重建。label 类型原地 lv_label_set_text（不重建，长文本不闪烁）；
-// 其它叶子类型无状态可原地更新，统一删旧重渲（成本低，也是团队定稿点名的做法）。这是
+// 类型不符/首次出现则整棵重建。grid 类型不做逐子生长：整节点签名（含 cols/children），变了
+// 删旧整块重建（行主序落位使任何变化都可能整体重排，逐位对齐得不偿失）。label 类型原地
+// lv_label_set_text（不重建，长文本不闪烁）；其它叶子类型无状态可原地更新，签名（含 text——
+// 它们没有原地文本通道）变了删旧重渲（成本低，也是团队定稿点名的做法）。这是
 // PreviewSyncContainer 的生长边分支与流式会话顶层 tree 同步共用的唯一入口。
 lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
                           int& node_count);

@@ -165,8 +165,11 @@ bool HasCjk(const char* s) {
 // 静态 lv_style_t，各控件用 lv_obj_add_style 复用，替代每次渲染逐属性 set_local。
 // 颜色/背景全部继续走 pi_theme 令牌（local style），与这些几何属性集不相交——
 // 主题切换（改令牌 style 色值 + report_style_change）不受影响，无级联冲突。
-// 静态存储期永不销毁；EnsureCardStyles() 惰性初始化一次，RenderNode 顶部调用即覆盖
-// 全部入口（含 ApplyButtonStyle/ApplyDefaultStyle 等下游）。
+// 静态存储期永不销毁；EnsureCardStyles() 惰性初始化一次——RenderNode 和 RenderPreviewNode
+// 各自在自己入口顶部独立调用一次（后者是流式预览的入口，二者互不可达，缺一个都会在从未
+// 渲染过任何卡片的全新进程里对未初始化的静态 lv_style_t 调 lv_obj_add_style；真机
+// LV_USE_ASSERT_STYLE 开着，会硬挂起——这不是假设，是真实踩过的坑）。二者都覆盖后，
+// ApplyButtonStyle/ApplyDefaultStyle 等下游任意入口调用都安全。
 //
 // ⚠️ 边界：容器（column/row/list/spacer/divider/choice-box）都先过
 // screen_strip_obj_chrome，后者用 **local** style 把 pad/margin/border_width/radius
@@ -1261,13 +1264,90 @@ int CountPreviewNodes(lv_obj_t* obj) {
     return count;
 }
 
+// 预览容器（column/row）几何：初建（RenderPreviewNode）和生长期每帧幂等重打（见
+// PreviewSyncContainer）共用同一份代码，避免两处各写一份产生行为漂移。宽高/flex flow/gap/
+// justify(主轴)/align(交叉轴) 全是幂等 style setter，不新建/不删除对象、不碰子节点指针——
+// 生长路径上的容器每帧重调完全安全。缺省值与 RenderNode 的缺省一致（column START/START/
+// START、row START/CENTER/CENTER），未知枚举值静默回落（同 RenderNode；预览不做 Lint
+// 提示——那是校验期的事，见 pi_card_render.cc 顶部 Lint 分支）。
+void ApplyPreviewContainerGeom(lv_obj_t* obj, bool is_row, const cJSON* node) {
+    lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+    lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
+    int gap = GetInt(node, "gap", 12);
+    lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
+    lv_flex_align_t main_align = LV_FLEX_ALIGN_START;
+    lv_flex_align_t cross_align = is_row ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START;
+    FlexJustifyOf(GetStr(node, "justify"), main_align);
+    FlexCrossOf(GetStr(node, "align"), cross_align);
+    lv_obj_set_flex_align(obj, main_align, cross_align, cross_align);
+}
+
+// 生长边叶子属性签名缓存，按深度索引——生长边任意时刻只有一条从根到当前生长叶子的路径
+// （PreviewSyncContainer 每层只递归"最后一个孩子"），故 depth 足以唯一定位，不需要按对象
+// 存（叶子对象本身可能因签名变化被删旧重渲，指针不稳定；而且 choice 类型已经借
+// lv_obj_user_data 存 ChoiceCtx，不能再借它塞签名）。新会话的头一帧该深度上 existing 必为
+// nullptr（见 PreviewOnArgs：s_preview.tree 显式清空），天然不会读到上一次会话的陈旧值，故
+// 不需要在会话边界显式清零这个数组。
+uint32_t s_leaf_sig[kPreviewMaxDepth + 1] = {};
+
+// 节点 JSON 紧凑序列化做 FNV-1a 哈希，按调用方需要可选剔除 children/text。label 剔 text
+// （它有原地更新通道，混进签名只会让每帧都判"变了"白白重建）+ 剔 children；button/qrcode 等
+// 其它叶子**必须**把 text 算进签名——它们没有原地文本通道，text 迟到/生长只能靠签名变化触发
+// 删旧重渲（否则按钮文字永远停在建行那一帧，previewfeed 复现过的真实 bug）；grid 整节点全算
+// （children/cols 任一变化都可能整体重排，见 SyncPreviewNode 的 grid 分支）。不用哈希强度换
+// 正确性：碰撞后果只是漏判一次"没变"，晚一帧刷新，无正确性风险（同 TemplateUsesIndex 的
+// "宁可误判、代价可接受"取舍）。
+uint32_t PreviewNodeSignature(const cJSON* node, bool strip_children, bool strip_text) {
+    cJSON* clone = cJSON_Duplicate(node, true);
+    if (!clone) return 0;
+    if (strip_children) cJSON_DeleteItemFromObject(clone, "children");
+    if (strip_text) cJSON_DeleteItemFromObject(clone, "text");
+    char* s = cJSON_PrintUnformatted(clone);
+    cJSON_Delete(clone);
+    if (!s) return 0;
+    uint32_t h = 2166136261u;
+    for (const char* p = s; *p; ++p) {
+        h ^= static_cast<unsigned char>(*p);
+        h *= 16777619u;
+    }
+    cJSON_free(s);
+    return h;
+}
+
+// 尾部不完整 UTF-8 序列剪除后落 label：partial parser 补全未闭合字符串时按字节截断，快照
+// 可能停在多字节字符中间（"三城�"），LVGL 会渲出替换乱码一闪而过。渲进预览 label 前把结尾
+// 那半个字符剪掉（最多回看 3 字节找 lead byte，纯 ASCII 尾部零开销）。只影响预览观感；正式
+// 渲染拿到的是校验过的完整 JSON，不经过这里。
+void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
+    size_t len = std::strlen(txt);
+    size_t cut = len;
+    for (size_t back = 1; back <= 3 && back <= len; ++back) {
+        unsigned char c = static_cast<unsigned char>(txt[len - back]);
+        if ((c & 0xC0) == 0x80) continue;  // continuation byte，继续往前找 lead
+        if ((c & 0x80) == 0) break;        // ASCII 收尾：完整，不剪
+        size_t need = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+        if (need > back) cut = len - back;  // 序列没凑齐字节数 → 从 lead 处剪断
+        break;  // 找到 lead（或非法字节）即定论；再往前都是已完整的字符
+    }
+    if (cut == len) {
+        lv_label_set_text(lbl, txt);
+    } else {
+        std::string t(txt, cut);
+        lv_label_set_text(lbl, t.c_str());
+    }
+}
+
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count) {
+    EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
     if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
     if (depth > kPreviewMaxDepth) return MakePreviewPlaceholder(parent);
     const char* type = GetStr(node, "type");
-    if (!type) return MakePreviewPlaceholder(parent);  // 半吐的 type 字段（如 "labe）永远不会
-                                // 进树——partial parser 保证半个 key/value 不会出现，未识别
-                                // 只可能是"还没吐这个键"，占位等下一帧。
+    if (!type) return MakePreviewPlaceholder(parent);  // type 键还没吐出来：占位等下一帧。注意
+                                // partial parser 会补全未闭合的字符串**值**（半吐的 type 如
+                                // "labe 是会出现的），那种落到下方"未知 type"分支同样占位，
+                                // 下一帧吐全后经签名变化换成真身；只有半吐的 key 才被丢弃。
     if (std::strcmp(type, "list") == 0 || std::strcmp(type, "chart") == 0 ||
         std::strcmp(type, "stock_chart") == 0) {
         return MakePreviewPlaceholder(parent);  // 数据驱动/自管生命周期类型：预览没有
@@ -1284,20 +1364,81 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        ApplyPreviewContainerGeom(obj, is_row, node);
+    } else if (std::strcmp(type, "grid") == 0) {
+        // 预览版 grid：镜像 RenderNode 的 grid 分支（行主序自动放置 + span + 轨道 dsc 堆分配随
+        // DELETE 释放），去掉 bind/事件/id。流式期 cols 可能整个还没吐——一列都没有就占位等待
+        // （同"type 未吐"口径）；只吐了前缀就按前缀列数布局，签名含整个节点（见 SyncPreviewNode
+        // 的 grid 分支），cols/children 每变一次整块重建，最终收敛到与正式渲染一致的形状。
+        // 正式渲染有 Validate 兜底保证 cols 元素合法，这里没有——非法元素（半吐的 "aut"、越界
+        // 数值）按 fr 1 容错，不报错（预览不是校验器）。
+        const cJSON* cols = GetItem(node, "cols");
+        const int ncol = (cols && cJSON_IsArray(cols)) ? cJSON_GetArraySize(cols) : 0;
+        if (ncol < 1) return MakePreviewPlaceholder(parent);
+        obj = lv_obj_create(parent);
+        screen_strip_obj_chrome(obj);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
         lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
         int gap = GetInt(node, "gap", 12);
         lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
         lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-        if (is_row) {
-            lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                                  LV_FLEX_ALIGN_CENTER);
+
+        auto* dsc = new GridDsc();
+        dsc->cols.reserve(ncol + 1);
+        const cJSON* cel = nullptr;
+        cJSON_ArrayForEach(cel, cols) {
+            if (cJSON_IsString(cel)) dsc->cols.push_back(LV_GRID_CONTENT);  // "auto"：按内容宽
+            else if (cJSON_IsNumber(cel) && cel->valueint >= 1 && cel->valueint <= 20)
+                dsc->cols.push_back(LV_GRID_FR(cel->valueint));
+            else dsc->cols.push_back(LV_GRID_FR(1));  // 半吐/非法：fr 1 容错
+        }
+        dsc->cols.push_back(LV_GRID_TEMPLATE_LAST);
+
+        const cJSON* children = GetItem(node, "children");
+        auto place_next = [ncol](int span, int& cur, int& cur_row, int& col_out, int& row_out) {
+            if (span < 1) span = 1;
+            if (span > ncol) span = ncol;
+            if (cur + span > ncol) { ++cur_row; cur = 0; }  // 本行放不下 → 换到下一行
+            col_out = cur;
+            row_out = cur_row;
+            cur += span;
+            if (cur >= ncol) { ++cur_row; cur = 0; }  // 填满 → 为下一 cell 进位
+            return span;
+        };
+        int cursor = 0, cur_row = 0, col_out = 0, row_out = 0;
+        const cJSON* ch = nullptr;
+        cJSON_ArrayForEach(ch, children) place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
+        int nrow = (cursor > 0) ? cur_row + 1 : cur_row;  // 末行未满也计一行
+        if (nrow < 1) nrow = 1;
+        dsc->rows.assign(static_cast<size_t>(nrow), LV_GRID_CONTENT);
+        dsc->rows.push_back(LV_GRID_TEMPLATE_LAST);
+        lv_obj_set_grid_dsc_array(obj, dsc->cols.data(), dsc->rows.data());
+        lv_obj_add_event_cb(obj, GridDscFreeCb, LV_EVENT_DELETE, dsc);
+
+        cursor = 0;
+        cur_row = 0;
+        cJSON_ArrayForEach(ch, children) {
+            int span = place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
+            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count);  // 失败即占位，永不 null
+            // RenderPreviewNode 尾部的 ApplySizing 统一按 FLOW_COL 近似，会给 label/growable 铺
+            // PCT(100)——grid cell 的宽度语义归 set_grid_cell 的 col_align 管（正式渲染对 grid 子项
+            // 跳过全部 flex 默认，见 ApplySizing 的 FLOW_GRID 分支），这里撤回内容宽再按正式渲染
+            // 同款规则决定 STRETCH/START，保证预览↔正式一帧换装不跳布局。
+            const char* ct = GetStr(ch, "type");
+            lv_grid_align_t col_align = LV_GRID_ALIGN_START;
+            if (!HasKey(ch, "w") && ct != nullptr &&
+                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
+                lv_obj_set_width(cobj, LV_SIZE_CONTENT);
+                col_align = LV_GRID_ALIGN_STRETCH;
+            }
+            lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
         }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
         if (const char* txt = GetStr(node, "text")) {
-            lv_label_set_text(obj, txt);
+            SetPreviewLabelText(obj, txt);
         } else if (GetStr(node, "bind") || GetStr(node, "bind_data")) {
             lv_label_set_text(obj, "--");  // 绑定类 label 还没吐 text：占位，预览不读硬件值
         }
@@ -1312,7 +1453,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         obj = lv_button_create(parent);
         lv_obj_t* lbl = lv_label_create(obj);
         const char* text = GetStr(node, "text", "");
-        lv_label_set_text(lbl, text);
+        SetPreviewLabelText(lbl, text);
         Tok fg = ApplyButtonStyle(obj, lbl, node);
         if (const char* icon_name = GetStr(node, "icon")) {
             lv_obj_t* ic = MakeIcon(obj, icon_name, GetInt(node, "size", 20), fg);
@@ -1427,28 +1568,74 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
         if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算，不在此回补
         return RenderPreviewNode(parent, node_spec, depth, node_count);
     }
-    if (std::strcmp(type, "label") == 0) {
-        if (existing && lv_obj_check_type(existing, &lv_label_class)) {
+    if (std::strcmp(type, "grid") == 0) {
+        // grid 不做逐子增量生长：行主序落位使 cols/children/span 任一变化都可能让所有 cell
+        // 整体重排（换行点漂移），逐位对齐得不偿失。整节点签名（不剔 children/text），变了
+        // 删旧整块重建——规模受预览预算（≤64 节点）约束，重建成本可忽略；快照没碰这个子树
+        // 时签名不变，原对象一动不动。
+        const uint32_t sig = PreviewNodeSignature(node_spec, false, false);
+        const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
+        if (existing && cacheable && s_leaf_sig[depth] == sig) return existing;
+        if (existing) lv_obj_delete(existing);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+        if (cacheable) s_leaf_sig[depth] = sig;
+        return obj;
+    }
+    // 叶子（含 label）：属性签名变化 → 删旧重渲，把 role/tone/grow/w/h/size/mono/fill/icon/
+    // hidden 等一切"比 text 晚到"的属性一次性补齐（改造1 遗留的"迟到属性"问题）。签名口径
+    // 分型：label 剔 text（有原地更新通道，签名不变时走下方原地文本更新，长文本不闪烁）；
+    // 其它叶子（button/qrcode…）text 算进签名——它们没有原地通道，text 生长只能靠签名变化
+    // 触发重渲。按深度缓存签名，同一生长路径上一帧写、下一帧读，见 PreviewNodeSignature/
+    // s_leaf_sig 头注；depth 超出缓存范围（罕见的最大嵌套边界）时放弃比较、总是重渲，与
+    // RenderPreviewNode 在超深度时整体放弃生长的口径一致。
+    const bool is_label = std::strcmp(type, "label") == 0;
+    const uint32_t sig = PreviewNodeSignature(node_spec, true, is_label);
+    const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
+    const bool same_sig = existing && cacheable && s_leaf_sig[depth] == sig;
+
+    if (is_label) {
+        if (same_sig && lv_obj_check_type(existing, &lv_label_class)) {
             if (const char* txt = GetStr(node_spec, "text")) {
-                lv_label_set_text(existing, txt);
+                SetPreviewLabelText(existing, txt);
             } else if (GetStr(node_spec, "bind") || GetStr(node_spec, "bind_data")) {
                 lv_label_set_text(existing, "--");
             }
             return existing;  // 原地更新文本，不重建——长文本不闪烁
         }
         if (existing) lv_obj_delete(existing);
-        return RenderPreviewNode(parent, node_spec, depth, node_count);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+        if (cacheable) s_leaf_sig[depth] = sig;
+        return obj;
     }
-    // 其它叶子类型（button/icon/slider/arc/bar/switch/qrcode/choice/divider/spacer）：无状态
-    // 可原地更新，统一删旧重渲——这些类型的属性很少在生长过程中被反复触及，删旧重渲成本低、
-    // 实现也最不容易出错。
+    // 其它叶子类型（button/icon/slider/arc/bar/switch/qrcode/choice/divider/spacer）：没有
+    // label 那样的原地更新通道，签名不变原对象不动、变了删旧重渲。
+    if (same_sig) return existing;
     if (existing) lv_obj_delete(existing);
-    return RenderPreviewNode(parent, node_spec, depth, node_count);
+    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count);
+    if (cacheable) s_leaf_sig[depth] = sig;
+    return obj;
 }
 
 void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
                           int& node_count) {
     if (depth > kPreviewMaxDepth) return;
+    // 生长路径容器每帧幂等重打容器级属性：gap/pad/fill/bg/w/grow/justify/align/hidden + 顶层
+    // 卡片外观。SyncPreviewNode 已保证走到这里 type 一定是 column/row，以下全是幂等 style
+    // setter/flag，不新建/不删除对象、不碰子节点指针——覆盖"justify/align 等迟到属性只有
+    // adopt 那一刻才生效"的问题（container 版；叶子版见 SyncPreviewNode 的签名重渲）。hidden
+    // 单独拎出来双向纠正（不是"缺省不动"）：AI_TO_UI 文档明载"hidden:true 的块做展开详情"
+    // 这个用法，容器的 hidden 迟到会让本该藏起来的详情块生长期先闪现再消失，观感比不做还差。
+    const char* type = GetStr(json_container, "type");
+    ApplyPreviewContainerGeom(lv_container, std::strcmp(type, "row") == 0, json_container);
+    ApplyDefaultStyle(lv_container, type, depth);
+    if (HasKey(json_container, "pad")) {
+        lv_obj_set_style_pad_all(lv_container, GetInt(json_container, "pad", 0), LV_PART_MAIN);
+    }
+    ApplyFill(lv_container, json_container);
+    ApplySizing(lv_container, type, json_container, FLOW_COL);
+    if (GetBool(json_container, "hidden")) lv_obj_add_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
+
     const cJSON* children = GetItem(json_container, "children");
     int n = (children && cJSON_IsArray(children)) ? cJSON_GetArraySize(children) : 0;
     if (n == 0) return;  // 还没孩子，等下一帧
