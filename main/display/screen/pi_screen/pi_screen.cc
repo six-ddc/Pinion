@@ -2677,6 +2677,13 @@ void HandleAsrFinal() {
     }
     Go(ViewState::Chat);
     AppendUserRow(text);
+    // s_act_line 只在开机建一次（占 feed[0]），此后只在 FLOW 的 thinking/tool 行、或
+    // CardBeginRow 渲染卡片时才被顺手钉回末尾——ZEN 模式不建 thinking/tool 行，纯聊天
+    // 回合（不含卡片）这三处一个都不触发，s_act_line 停在上一次的位置（会话头一轮就是
+    // feed[0]），错位到本次刚追加的用户气泡上方。这里是唯一保证每轮必经的入口，无条件
+    // 钉一次，覆盖 ZEN/FLOW、有无卡片/工具调用的所有分支；已有三处 move_to_index 不必删，
+    // 幂等操作，多钉一次无副作用。
+    lv_obj_move_to_index(s_act_line, lv_obj_get_child_count(s_feed) - 1);
     ResetTurnState();
     ScrollFeedToBottom(true);  // 用户刚发言 → 强制回底
     s_last_user_prompt = text;
