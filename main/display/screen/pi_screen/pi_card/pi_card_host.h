@@ -64,6 +64,7 @@ struct UiCard {
     std::list<std::string> str_pool;
     std::list<LabelNumAnim> num_anims;        // 数值 label 插值动画状态，见上方结构体注释
     lv_timer_t* ttl_timer = nullptr;          // overlay 自动关闭（一次性）
+    bool is_media = false;                    // spec 引用了 media.*：聊天流同类卡只保留最新一张
 
     // ---- 卡级 data 模型（spec/data 分离，见 Phase2）----
     cJSON* data = nullptr;                    // 卡级 data（owned，object），OnRootDeleted 里 Delete

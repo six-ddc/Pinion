@@ -120,6 +120,10 @@ void pi_agent_task_inject(const char *text);
    任何消息时丢弃（没有"对话中"可言）。LVGL 线程调。 */
 void pi_agent_task_note(const char *text);
 
+/* 会话里是否已有消息（transcript 非空）。用户主动关闭（播放器 X / 卡片 X）走 inject
+   前的守卫：没对话过就不凭空起一轮。线程安全，LVGL 线程调。 */
+bool pi_agent_task_has_messages(void);
+
 #ifdef __cplusplus
 }
 #endif

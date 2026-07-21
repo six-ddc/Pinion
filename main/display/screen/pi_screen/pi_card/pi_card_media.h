@@ -67,6 +67,15 @@ void RegisterDataPaths();
 // 注册 media.* invoke 命令（toggle/next/prev/stop/open，全 Safe）。pi_card::Init 调，幂等。
 void RegisterCommands();
 
+// spec 树里是否引用了 media.*（bind/invoke/path 等任意字符串值以 "media." 开头）——
+// host 据此把卡标成媒体卡，聊天流里同类只保留最新一张（旧卡自动关）。
+bool SpecUsesMedia(const cJSON* spec_root);
+
+// tracks 兜底注入：spec 有 list bind_data:'tracks' 而 data 里 tracks 缺失/为空时，从
+// MediaController 当前播放列表直接构造（格式与 play 工具返回的 tracks 一致），不再依赖
+// LLM 把工具结果复制进 ui_render data。列表为空（没在播）则不动 data。
+void MaybeFillTracks(const cJSON* spec_root, cJSON* data);
+
 }  // namespace pi_card_media
 
 #endif  // __cplusplus

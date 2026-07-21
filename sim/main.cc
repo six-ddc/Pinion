@@ -41,6 +41,7 @@
 #include "settings.h"  // P1 grid rehydrate 测试：直写 standby pin 封套
 #include "pi_theme.h"  // T1 主题往返测试：pi_theme::Set
 #include "media_player/media_player.h"
+#include "media_player/radio_stations.h"  // mediastage 测试命令：不起播灌电台列表
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
@@ -1785,6 +1786,23 @@ void ExecCmd(const std::string& line) {
         std::getline(ss, p);
         if (!p.empty() && p[0] == ' ') p.erase(0, 1);
         TakeScreenshot(p.empty() ? ShotPath() : p.c_str());
+    } else if (cmd == "gochat") {  // TEMP SCAFFOLD: 直接切到 Chat 视图（媒体卡验收截图用）
+        PiScreen::DebugGoChat();
+    } else if (cmd == "mediastage") {  // TEMP SCAFFOLD: mediastage <n> — 灌 n 个电台进播放列表（不起播），
+                                       // 供 tracks 兜底注入（MaybeFillTracks）验收用
+        int n = 0;
+        ss >> n;
+        std::vector<media::MediaItem> items;
+        for (int i = 0; i < n && i < static_cast<int>(media::kRadioStationCount); i++) {
+            media::MediaItem m;
+            m.title = media::kRadioStations[i].name;
+            m.subtitle = media::kRadioStations[i].genre;
+            m.path_or_url = media::kRadioStations[i].url;
+            m.is_stream = true;
+            items.push_back(std::move(m));
+        }
+        media::MediaController::Instance().StagePlaylist(items, -1);
+        std::fprintf(stderr, "[sim][mediastage] staged %zu stations (no autoplay)\n", items.size());
     } else if (cmd == "growcard") {  // TEMP SCAFFOLD: render the reflow re-entrancy test card
         RenderGrowCard();
     } else if (cmd == "showrows") {  // TEMP SCAFFOLD: showrows <n> — real ui_update, drives reflow

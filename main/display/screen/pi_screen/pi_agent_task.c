@@ -929,6 +929,18 @@ void pi_agent_task_note(const char *text) {
     xSemaphoreGive(g_agent_mutex);
 }
 
+bool pi_agent_task_has_messages(void) {
+    bool has = false;
+    xSemaphoreTake(g_agent_mutex, portMAX_DELAY); /* 防撞 worker 的 rebuild 窗口 */
+    if (g_agent) {
+        size_t n = 0;
+        pi_agent_transcript(g_agent, &n);
+        has = n > 0;
+    }
+    xSemaphoreGive(g_agent_mutex);
+    return has;
+}
+
 void pi_agent_task_inject(const char *text) {
     if (!g_agent || !text || !text[0]) return;
     if (g_running) {

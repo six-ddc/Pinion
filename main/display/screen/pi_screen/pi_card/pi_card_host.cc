@@ -102,7 +102,15 @@ void OnRootDeleted(lv_event_t* e);
 
 void OverlayCloseCb(lv_event_t* e) {
     auto* card = static_cast<UiCard*>(lv_event_get_user_data(e));
-    if (card && card->root) lv_obj_delete_async(card->root);
+    if (card && card->root) {
+        // 与播放器 X 同范式（pi_media OnStopBtn）：inject 告知 LLM 卡已被用户关掉（空闲
+        // 起一轮、对话中插下一轮），免得它拿着一个不存在的 card id 继续 update/close。
+        // 静默 note 用户侧看不到任何反应，已按用户要求改成 inject。
+        std::string note = "「卡片」用户手动关闭了卡片 " + card->id;
+        // new_session 后关旧会话残留的卡不该凭空起一轮，守卫一下。
+        if (pi_agent_task_has_messages()) pi_agent_task_inject(note.c_str());
+        lv_obj_delete_async(card->root);
+    }
 }
 
 void OverlayTtlCb(lv_timer_t* t) {
@@ -334,6 +342,11 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         cJSON_Delete(card->data);
         card->data = cJSON_CreateObject();
     }
+    // 媒体卡兜底：LLM 渲控件卡时常忘把 play 返回的 tracks 复制进 data，list 会空渲成占位
+    // 白块。设备侧直接从 MediaController 补齐（与全屏抽屉同源），数据永远真实。
+    pi_card_media::MaybeFillTracks(root, card->data);
+    // 媒体卡标记：聊天流里同类只保留最新一张（渲染成功后关旧卡，见下）。
+    card->is_media = pi_card_media::SpecUsesMedia(root);
 
     lv_obj_t* delete_root = nullptr;
     lv_obj_t* render_parent = nullptr;
@@ -441,6 +454,15 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         // 像全新卡片一样往上滑一截，那样反而显得预览白长了。
         bool adopted = s_feed.last_row_adopted && s_feed.last_row_adopted();
         PlayCardEntrance(tree, adopted);
+        // 媒体控件卡全局唯一：新卡渲染成功即静默关掉聊天流里其它媒体卡（旧控件停留无意义，
+        // 且堆积会把 feed 撑满）。async 删除，清理统一走 OnRootDeleted；overlay/pin 不参与。
+        if (card->is_media) {
+            for (auto& [cid, other] : s_cards) {
+                if (other->is_media && other->display == Display::Chat && other->root) {
+                    lv_obj_delete_async(other->root);
+                }
+            }
+        }
     }
 
     s_last_id = id;
@@ -560,6 +582,17 @@ void RemoveListEmptyLabel(UiCard::DataConsumer& dc) {
     if (lv_obj_get_child_count(dc.obj) > 0) lv_obj_delete(lv_obj_get_child(dc.obj, 0));
 }
 
+// 无 empty 文案的 list 在 0 行时整体隐藏不占位（与 pi_card_render 渲染分支对应），数据
+// 到达/清空时在这里同步收放。有 empty 文案的 list 由占位 label 占场，不参与收放。
+void SyncListCollapse(UiCard::DataConsumer& dc) {
+    if (!dc.empty_text.empty()) return;
+    if (lv_obj_get_child_count(dc.obj) == 0) {
+        lv_obj_add_flag(dc.obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(dc.obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 // List 消费者的全量重建：lv_obj_clean 整个子树，按 card->data[key] 重新逐行渲染，保存/恢复
 // scroll_y 消除跳动。退回路径——SetWhole，或 tpl_uses_index 模板上的 RemoveIdx，都靠它兜底
 // （见 RefreshDataConsumers）。行定位不存指针，靠"子节点顺序==数组下标"这条不变量，全量重建
@@ -674,8 +707,10 @@ void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
             lv_label_set_text(dc.obj, txt.c_str());
         } else if (need_full) {
             RefreshListFull(card, dc);
+            SyncListCollapse(dc);
         } else {
             RefreshListFastPath(card, dc, ops);
+            SyncListCollapse(dc);
         }
     }
     if (touched) {

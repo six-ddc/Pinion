@@ -1025,16 +1025,18 @@ void OnListBtn(lv_event_t*) {
 void OnBackBtn(lv_event_t*) { pi_media::Back(); }
 
 // 叉掉播放器：停止播放（列表保留、NVS 续播记录不清，快捷面板「音乐」仍可续）并关页；
-// 紧凑媒体行随 Stopped 态在下一 tick 自动消失。停止前抓当前曲目名，静默备注给模型
-// （note 不起新一轮：对话中插下一轮，空闲排队到下次提问；无会话时被丢弃）——否则模型
-// 会一直以为还在播，后续 media.control 全踩 "nothing playing"。
+// 紧凑媒体行随 Stopped 态在下一 tick 自动消失。停止前抓当前曲目名，inject 告知模型
+// （空闲时主动起一轮让会话立刻有反应，对话中插到下一轮）——早前用静默 note 用户看不到
+// 任何动静，以为通知丢了；且不告知的话模型会一直以为还在播，后续 media.control 全踩
+// "nothing playing"。
 void OnStopBtn(lv_event_t*) {
     MediaItem cur = MediaController::Instance().current();
     MediaController::Instance().Stop();
     pi_media::Close();
     std::string note = "「播放器」用户手动关闭了播放器，停止播放";
     if (!cur.title.empty()) note += "：" + cur.title;
-    pi_agent_task_note(note.c_str());
+    // 没对话过（快捷面板直接放歌）就不凭空起一轮，静默即可。
+    if (pi_agent_task_has_messages()) pi_agent_task_inject(note.c_str());
 }
 void OnPrev(lv_event_t*) { MediaController::Instance().Prev(); }
 void OnNext(lv_event_t*) { MediaController::Instance().Next(); }

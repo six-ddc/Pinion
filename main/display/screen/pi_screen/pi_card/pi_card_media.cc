@@ -453,4 +453,65 @@ void RegisterCommands() {
     ESP_LOGI(TAG, "media.* invoke commands registered");
 }
 
+// 递归扫 spec：任意字符串值以 "media." 开头即视为媒体卡（bind:'media.title'、
+// invoke:'media.toggle'、action path:'media.play_index' 全覆盖；误报只可能来自
+// LLM 写的字面文案恰好以 media. 开头，可接受）。
+bool SpecUsesMedia(const cJSON* node) {
+    if (node == nullptr) return false;
+    if (cJSON_IsString(node)) {
+        const char* v = cJSON_GetStringValue(node);
+        return v != nullptr && std::strncmp(v, "media.", 6) == 0;
+    }
+    if (cJSON_IsObject(node) || cJSON_IsArray(node)) {
+        for (const cJSON* child = node->child; child != nullptr; child = child->next) {
+            if (SpecUsesMedia(child)) return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+
+// spec 里是否存在 bind_data == key 的节点（list 数据绑定声明）。
+bool SpecUsesBindData(const cJSON* node, const char* key) {
+    if (node == nullptr) return false;
+    if (cJSON_IsObject(node)) {
+        const cJSON* bd = cJSON_GetObjectItemCaseSensitive(node, "bind_data");
+        const char* v = cJSON_GetStringValue(bd);
+        if (v != nullptr && std::strcmp(v, key) == 0) return true;
+    }
+    if (cJSON_IsObject(node) || cJSON_IsArray(node)) {
+        for (const cJSON* child = node->child; child != nullptr; child = child->next) {
+            if (SpecUsesBindData(child, key)) return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void MaybeFillTracks(const cJSON* spec_root, cJSON* data) {
+    if (spec_root == nullptr || data == nullptr) return;
+    const cJSON* existing = cJSON_GetObjectItemCaseSensitive(data, "tracks");
+    if (cJSON_IsArray(existing) && cJSON_GetArraySize(existing) > 0) return;  // LLM 带了就尊重
+    if (!SpecUsesBindData(spec_root, "tracks")) return;
+    MediaController& mc = MediaController::Instance();
+    const int n = mc.playlist_size();
+    if (n <= 0) return;  // 没在播/没列表：留给 list 的空态处理（无 empty 文案则整体收起）
+    if (existing != nullptr) cJSON_DeleteItemFromObjectCaseSensitive(data, "tracks");
+    cJSON* tracks = cJSON_AddArrayToObject(data, "tracks");
+    if (tracks == nullptr) return;
+    // 窗口化：与 play 工具的列表上限一致，防超大歌单撑爆节点预算前的 data 内存。
+    const int cap = static_cast<int>(kMaxPlaylist);
+    for (int i = 0; i < n && i < cap; i++) {
+        const MediaItem it = mc.item_at(i);
+        cJSON* o = cJSON_CreateObject();
+        if (o == nullptr) break;
+        cJSON_AddStringToObject(o, "title", it.title.c_str());
+        cJSON_AddStringToObject(o, "subtitle", it.subtitle.c_str());
+        cJSON_AddItemToArray(tracks, o);
+    }
+    ESP_LOGI(TAG, "tracks fallback filled: %d rows from MediaController", std::min(n, cap));
+}
+
 }  // namespace pi_card_media

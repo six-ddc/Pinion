@@ -1094,6 +1094,9 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
             if (!ok) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
         }
         const char* empty_txt = GetStr(node, "empty");
+        // 0 行且没有 empty 兜底文案：整个 list 容器隐藏，不留占位白（容器 pad/显式 h 会占出
+        // 一块空区）。后续 ui_update 数据到达时 RefreshDataConsumers 侧恢复显示。
+        if (rows == 0 && empty_txt == nullptr) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
         if (rows == 0 && empty_txt) {
             lv_obj_t* lbl = lv_label_create(obj);
             lv_label_set_text(lbl, empty_txt);

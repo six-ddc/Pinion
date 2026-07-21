@@ -166,6 +166,12 @@ void DispatchCb(lv_event_t* e) {
         switch (a.kind) {
             case ActionKind::Close:
                 if (binding->card && binding->card->root) {
+                    // 与播放器 X 同范式：inject 告知 LLM 用户关掉了这张卡（空闲起一轮、对话中
+                    // 插下一轮），避免它拿着已不存在的 card id 继续 update，或误以为控件还摆在
+                    // 用户面前。静默 note 用户侧看不到任何反应，已按用户要求改成 inject。
+                    std::string note = "「卡片」用户点击关闭按钮，卡片 " + binding->card->id + " 已关闭";
+                    // new_session 后关旧会话残留的卡不该凭空起一轮，守卫一下。
+                    if (pi_agent_task_has_messages()) pi_agent_task_inject(note.c_str());
                     lv_obj_delete_async(binding->card->root);  // 删祖先须 async
                 }
                 break;
