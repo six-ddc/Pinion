@@ -32,6 +32,12 @@ eth-modem). Network type is persisted in NVS `"network"/"type"` (0=WiFi, 1=4G; d
   `power.h` `sysmon.h`) plus pass-through `include/IOExpander.hpp`, `include/settings.h`,
   `include/audio_codec.h`. Private implementation in `src/`. The lib must stay free of any
   screen/UI/business references — notify upward only via registered callbacks.
+- `components/media_player/` — SD MP3 + 网络电台（全 HLS/m3u8，`radio_stations.h` 32 台 AAC
+  高码率）。管线：字节源（文件 / MP3 无限流 / `media_hls` HLS 源→TS 解封装吐 ADTS）→ 字节环
+  → `MediaDecoder`（**分端**：真机 `media_decoder_esp.cc` 走乐鑫官方 `esp_audio_codec`
+  闭源库 MP3+AAC；sim 用 minimp3 + macOS AudioToolbox——helix-aac 在 64 位宿主有 UB 已弃）
+  → 自研重采样归一 16k mono。宿主测试：`sim/build/ts_demux_test`（TS/HLS 解析）、
+  `media_stress`（ASan 泵切换）。
 
 ## Secrets — never commit
 

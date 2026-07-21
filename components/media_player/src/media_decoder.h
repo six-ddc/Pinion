@@ -36,6 +36,11 @@ class MediaDecoder {
 };
 
 // 按 codec 创建解码器；不支持的 codec 返回 nullptr（调用方停泵报错，勿裸解引用）。
+// 真机由 media_decoder_esp.cc 提供；sim 由 sim/shim/src/media_decoder_sim.cc 分派到下面两个 impl。
 std::unique_ptr<MediaDecoder> CreateMediaDecoder(MediaCodec codec);
+
+// —— sim 端 impl 工厂（仅 media_decoder_sim.cc 引用；真机不编译这些 TU） ——
+std::unique_ptr<MediaDecoder> CreateMinimp3Decoder();  // MP3（media_decoder_minimp3.cc）
+std::unique_ptr<MediaDecoder> CreateSimAacDecoder();   // AAC/ADTS（sim/shim/src/media_decoder_atb_aac.cc，AudioToolbox）
 
 }  // namespace media

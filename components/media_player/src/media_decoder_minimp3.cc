@@ -82,8 +82,7 @@ class Minimp3Decoder : public MediaDecoder {
 
 }  // namespace
 
-std::unique_ptr<MediaDecoder> CreateMediaDecoder(MediaCodec codec) {
-    if (codec != MediaCodec::Mp3) return nullptr;  // AAC：真机走 esp 实现；sim 待 helix impl 接入
+std::unique_ptr<MediaDecoder> CreateMinimp3Decoder() {
     auto dec = std::unique_ptr<Minimp3Decoder>(new Minimp3Decoder());
     if (!dec->ok()) return nullptr;
     return dec;

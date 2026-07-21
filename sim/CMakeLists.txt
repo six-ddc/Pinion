@@ -99,6 +99,8 @@ add_executable(pi_sim
     ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
     shim/src/media_http_curl.cc
     shim/src/media_http_fetch_curl.cc
+    shim/src/media_decoder_sim.cc
+    shim/src/media_decoder_atb_aac.cc
     shim/src/media_textconv_sim.cc
     # lv_markdown component (markdown rendering for assistant replies)
     ${CLAW_ROOT}/components/lv_markdown/src/md_parser.cc
@@ -131,7 +133,7 @@ target_include_directories(pi_sim PRIVATE
     ${CLAW_ROOT}/components/media_player/src     # minimp3.h / media_resampler.h / media_internal.h（私有）
 )
 
-target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2 iconv)
+target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2 iconv "-framework AudioToolbox" "-framework CoreFoundation")
 
 # Offline deterministic replay of the two-turn mock script (pi_scr_mock.h)
 # instead of the real API -- markdown-rendering fixture included. Usage:
@@ -191,6 +193,8 @@ add_executable(media_stress
     ${CLAW_ROOT}/components/media_player/src/media_hls.cc
     ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
     shim/src/media_http_fetch_curl.cc
+    shim/src/media_decoder_sim.cc
+    shim/src/media_decoder_atb_aac.cc
 )
 target_include_directories(media_stress PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include
@@ -201,4 +205,4 @@ target_include_directories(media_stress PRIVATE
 )
 target_compile_options(media_stress PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(media_stress PRIVATE -fsanitize=address,undefined)
-target_link_libraries(media_stress PRIVATE curl)
+target_link_libraries(media_stress PRIVATE curl "-framework AudioToolbox" "-framework CoreFoundation")
