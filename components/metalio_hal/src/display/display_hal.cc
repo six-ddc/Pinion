@@ -278,7 +278,10 @@ void StartLvglAdapter() {
             .ver_res = static_cast<uint16_t>(DISPLAY_HEIGHT),
             .buffer_height = 200,
             .use_psram = true,
-            .enable_ppa_accel = true,
+            // PPA 加速暂关（A/B 验证蓝闪）：真机日志抓到 stock 图卡重绘触发
+            // PPA blend 前 esp_cache_msync 越界窗口报错，且 PPA 2D-DMA 与 DSI
+            // 扫描抢 PSRAM 带宽疑似 underrun 闪蓝——关掉观察蓝闪是否消失。
+            .enable_ppa_accel = false,
             .require_double_buffer = true,
         },
         .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL,
