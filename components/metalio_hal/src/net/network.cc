@@ -89,8 +89,30 @@ bool StartWifiStationAndWait() {
         }
         Emit(Event::WifiConnected, ssid);
     });
-    wifi_station.Start();
-    s_wifi_started = true;
+
+    if (s_wifi_started) {
+        // 已经起过一次（例如开机时）：net.reconnect 等场景会再次打到这里——
+        // WifiStation::Start() 假设"从未初始化过"的干净态，无条件
+        // esp_netif_create_default_wifi_sta() 建 station netif，若 netif 已存在（if_key
+        // "WIFI_STA_DEF" 撞车）esp_netif_new() 返回 NULL，内部 assert(netif) 直接重启
+        // 设备——真机实测复现过（serial.log 第 796-844 行；backtrace 经 addr2line 精确定位到
+        // wifi_default.c:423 esp_netif_create_default_wifi_sta ← wifi_station.cc:103
+        // WifiStation::Start() ← 本函数 ← StartWifi() ← Start() ← net.reconnect 触发的
+        // StartAsync()）。net.reconnect 真正要的语义是"断开重连"（esp_wifi_disconnect +
+        // esp_wifi_connect 级别），不是把 netif/驱动全部拆了重建：这里只调
+        // esp_wifi_disconnect()——WifiStation 自己的 WIFI_EVENT_STA_DISCONNECTED 处理器
+        // （wifi_station.cc:246-253）本来就会在 reconnect_count_ 预算内自动重新
+        // esp_wifi_connect()（复用同一份已 esp_wifi_set_config 过的 STA 配置），不需要越权
+        // 替它连、也不需要重建 netif 这种重手术。若这次调用时其实已经空闲断线（没有可断的
+        // 连接），esp_wifi_disconnect() 只是无副作用地返回 ESP_ERR_WIFI_NOT_CONNECT。
+        esp_err_t err = esp_wifi_disconnect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+            ESP_LOGW(TAG, "esp_wifi_disconnect failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        wifi_station.Start();
+        s_wifi_started = true;
+    }
 
     if (!wifi_station.WaitForConnected(60 * 1000)) {
         wifi_station.Stop();
