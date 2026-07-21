@@ -145,12 +145,20 @@ pin 尺寸）→ 打上 run 代次入队 → 秒回 `{card,state,hints}` → LVG
 
 ### 3.2 ui_update —— 改一个节点或改卡片数据
 
-描述见 `pi_card_tools.h:135-143`。两种互斥形态（`host.cc:1114-1122`）：
+描述见 `pi_card_tools.h:129-155`（`PI_CARD_UPDATE_DESC` + `PI_CARD_UPDATE_SCHEMA`）。三种
+形态可以任意组合在一次调用里，worker 侧形状校验在 `pi_card_tool_update`
+（`host.cc:1275-1327`）：
 
 - **节点 patch**：`{card?, id, props:{text?,value?,checked?,hidden?,tone?,color?}}` ——
   改渲染时声明了 `id` 的节点的六种属性。
+- **批量节点 patch**：`{card?, patches:[{id,props},…]}`（≤16 条，schema `maxItems` 校验）。
+  每个 id 独立生效——某个 id 不存在不影响其余 patch，缺失的 id **聚合成一条**异步错误报回
+  LLM（不是逐条报），入场收口（`ReflowOverlay`/`end_row`）也只跑一次而非每条 patch 各跑一次。
+  worker 侧 `patches` 存在但形状不对（非数组/超 16 项/某项缺 `id` 或 `props`）直接同步拒绝，
+  不静默忽略。
 - **数据操作**：`{card?, data:{set?:{k:v}, append?:{key,item}, remove?:{key,index|id},
-  replace?:{key,index,item}}}` —— 改卡级 data，绑定该 key 的 list / bind_data label 自动重渲。
+  replace?:{key,index,item}}}` —— 改卡级 data，绑定该 key 的 list / bind_data label 自动重渲
+  （list 的行级增量刷新细节见 §7）。
 
 `card` 省略即"最近一张卡"。语义要点：能用 ui_update 就不要重新 ui_render——system prompt
 明确"只有结构不同的卡才重渲"。如果目标卡/节点已消失（被关、TTL 到期、新会话清空），失败
@@ -367,6 +375,41 @@ LLM 的 `tone`/`fill` 就取这些 token 名（`error`→err、`text`→tx 有�
 例外（一次性取色不自动重刷）：qrcode（刻意固定）、chart 网格与折线色、图标的弧段——
 stock_chart 用主题 listener 主动全量重绘补齐。
 
+### 5.6 微动效：入场动画与数值滚动过渡
+
+**卡片入场**（`PlayCardEntrance(tree, adopted)`，`render.cc:610-632`，导出于 `render.h`）：
+opa `LV_OPA_TRANSP`→`LV_OPA_COVER` + `translate_y` 12→0px（`LV_STYLE_TRANSLATE_Y` 风格
+属性，不直接改 `y`——卡片在 flex 布局里，直改 `y` 会被布局吃掉），220ms `ease_out`。挂在
+"最终布局定型之后"：chat 分支在 `s_feed.end_row()` 之后（`host.cc:430-431`），overlay 分支在
+`ReflowOverlay` + `AddOverlayCloseButton` 之后（`host.cc:420-422`）——这两步已经把卡片钉到
+最终尺寸/位置，动画只管起止视觉，不影响布局收口的判定；**绝不能**挂在 data 增量刷新路径
+（`RefreshDataConsumers`/`OnUpdateEvent`）上，否则每次数值更新都会重播入场。`adopted=true`
+时只做 120ms 纯淡入、不带位移（`kAdoptedFadeDurationMs=120` vs `kEntranceDurationMs=220`，
+`render.cc:605-607`）——给"从流式预览接管过来的卡片"用（§10.5），内容早就在那儿"长"出来了，
+不该再像全新卡片一样往上滑一截。standby pin 不播（`OnRenderEvent` 的 pin 分支在触达这两处
+调用点之前就已 `return`，重启重放场景播动画会很怪）。息屏时（`IsScreenOff()`，
+`host.cc:252`）直接跳过，不起任何动画。
+
+**数值 label 滚动过渡**（`ApplyBind` 的 label 分支，`render.cc:520-551`；观察者
+`NumScrollObserverCb`/`NumScrollExecCb`，`render.cc:369-399`）：bind 到 String 类型路径的
+label 维持原生 `lv_label_bind_text`（一次性跳变，字符串没有插值意义）；bind 到 Int/Bool
+类型路径的 label 改用手动 observer + 250ms 插值——subject 变化时不再硬切，而是从当前显示值
+滚动过渡到新值（`lv_anim_path_ease_out`）。两个例外直接跳变、不插值：**`|target-shown|<=1`**
+（差值 1 以内插值观感是"卡在原值一下再跳"而非真正的"滚动"，不如直接跳变干脆）；**息屏态**
+（同上，直接跳变省一轮 `lv_anim` tick）。动画的 `var` 直接是 label 对象本身（不是插值状态
+结构体）——LVGL9 删对象时会自动清掉挂在它上面的动画（`lv_obj_destructor` 里的
+`lv_anim_delete(obj, NULL)`），不需要额外挂 `LV_EVENT_DELETE` 回调去手动打断在途动画。插值
+状态（fmt 指针 + 当前显示值）挂在 `UiCard::num_anims`（`std::list<LabelNumAnim>`，
+`host.h:48-53`，地址稳定不因扩容搬迁），随卡片存活；`lv_obj_set_user_data(label, &ctx)` 挂
+到 label 上供 exec_cb 反查。
+
+**chart 新点平滑刻意不做**：新数据点到达时直接 `lv_chart_set_next_value` + `lv_chart_refresh`
+（§6.4），没有淡入/滑动过渡。原因两条：`LV_CHART_UPDATE_MODE_SHIFT` 内部把环形缓冲区指针
+整体前移一格，插值需要在"旧值"和"新值"之间画出中间帧，但环形缓冲一 shift 就没有"旧值"可
+插了（除非额外维护一份影子缓冲区）；chart 是历史趋势图的 1Hz 采样，纯软件插值渲染的成本
+叠加在这个节奏上不划算，且逐点跳变本身就是正确语义——不是"从 A 平滑变到 B"，是"多了一个
+新样本点"。
+
 ---
 
 ## 6. 数据面：DataHub 与绑定/刷新
@@ -482,20 +525,47 @@ on_first_acquire, on_last_release}`，解决"符号是开放集不能预注册"�
 - **List 消费者**：list 节点把 item 模板克隆进 card->json_pool 常驻，登记
   {key, item_tpl, empty_text, eff_max, depth, limits}。
 
-**list 渲染**（`render.cc:773-831`）：行数 = min(数组长, eff_max)，eff_max = 声明的 max，
-否则数组实长，否则 8，硬顶 [1,20]。每行 `cJSON_Duplicate(item)` → `SubstRecord` 占位符替换 →
+**list 渲染**（`render.cc:897-957`）：行数 = min(数组长, eff_max)，`eff_max`
+（`EffMax`，`render.cc:675`）= 声明的 max，否则数组实长，否则 8，硬顶 [1,20]。每行
+`cJSON_Duplicate(item)` → `SubstRecord`（`render.cc:684`）占位符替换 →
 `RenderNode(in_list_row=true)`。占位符只替换字符串**值**（不碰 key）：`{i}`=0 基下标、
 `{n}`=1 基、`{item.FIELD}`=本行记录字段（number→%g、bool→"1"/"0"、缺失→空串）。空数组且给了
 `empty` → 渲染一行 Faint 色占位文案。**行内限制**：不许嵌套 list；行内节点不注册 id；行内
 action 只允许 report/set/close（行身份靠 {i}/{n}/{item.*} 编进 report 文本）。节点预算按
 `eff_max × 模板节点数` 预留记账，防止 20 行 × 5 节点炸穿 64 上限。
 
-**ui_update 的 data 四操作**（`ApplyDataOps`，`host.cc:425-500`）：`set`（逐键 upsert）、
+**ui_update 的 data 四操作**（`ApplyDataOps`，`host.cc:468-543`）：`set`（逐键 upsert）、
 `append`（数组不存在则建，**20 行硬顶**）、`remove`（按 index 或按行内 `id` 字段查找）、
-`replace`（按 index 换整行）。所有越界/类型错**只异步报错绝不崩**。改完后
-`RefreshDataConsumers`（`host.cc:504-548`）只刷 changed key 的消费者：Label 改 text；List
-**保存 scroll_y → lv_obj_clean → 全量重渲子树 → 恢复 scroll_y**（用户翻到一半列表不跳回顶）。
-末尾 overlay 重跑高度稳定器 / chat 卡重新滚到底。
+`replace`（按 index 换整行）。所有越界/类型错**只异步报错绝不崩**。`ApplyDataOps` 不只落地
+`card->data`，还产出一份结构化的 `DataOp` 列表（`kind∈{Append,RemoveIdx,Replace,SetWhole},
+key, index`，`host.cc:460-465`；`remove` 的 `id` 已在这里解析成 index）供
+`RefreshDataConsumers`（`host.cc:657-686`）判断走行级 fast path 还是全量重建。
+
+**list 行级 fast path（轻量版，不做通用 keyed diff）**：Label 消费者始终整体 `set-text`；
+List 消费者默认走 `RefreshListFastPath`（`host.cc:597-655`）——`Append` 在容器末尾尾插一行、
+`Replace(i)` 原地删旧建新再 `lv_obj_move_to_index` 挪回位置 `i`、`RemoveIdx(i)` 原地删第 `i`
+个子对象，都不碰其余没变的行。行定位不额外存指针数组，靠"list 容器子节点顺序 == 数组下标"
+这条不变量直接 `lv_obj_get_child(dc.obj, i)` 按位取行——`DataConsumer` 只多存两个标志位
+（`host.h:83-92`）：`empty_shown`（当前是否正显示 `empty_text` 占位）、`tpl_uses_index`
+（行模板序列化后含 `"{i}"`/`"{n}"` 子串，渲染时 `TemplateUsesIndex`，`render.cc:729-735`，
+粗扫模板文本一次存下来，不必每次 update 重扫）。
+
+**退全量的条件**（`RefreshListFull`，`host.cc:567-586`）：命中 `SetWhole`（整键替换，天生
+是"全新数组"，行级增量无从谈起）；或命中 `RemoveIdx` 且 `tpl_uses_index`（remove 会让后续行
+的下标整体前移，这类模板的显示内容会跟着过时，只有它需要为此退全量——`Append`/`Replace`
+不影响任何其它行的下标，即便模板里有 `{i}`/`{n}` 也照样走 fast path）。全量重建保存/恢复
+`scroll_y` 消除跳动（用户翻到一半列表不跳回顶）。**同一份 payload 多个 op 命中同一个 key**：
+只要其中任一条触发退全量，这个 key 整个只跑一次 `RefreshListFull`，不会再额外为其它 op 单独
+跑 fast path——数据层面所有 op 都已按 set→append→remove→replace 的固定顺序落地到
+`card->data`，全量重建读到的就是这一刻的最终值，不存在"跳过某个 op 的数据"这回事。
+
+**截断区不补行**：`eff_max` 是初次渲染时定下的可见行数上限，`Append` 到已达上限就不再新建
+可见行（数据本身照样落进 `card->data`，只是不进画面）；`RemoveIdx` 掉一行也不会去"拉"被
+截断区里原本看不见的下一条顶上来补位——轻量版明确的取舍，全量重建下次触发时才会用当前
+真实数组重新算出准确的可见集合。**empty_shown 进退**：行数从非 0 变 0（最后一行被删）补回
+`empty_text` 占位 label；从 0 变非 0（第一次 append）先摘掉占位 label 再插入真行。
+
+末尾 overlay 重跑高度稳定器 / chat 卡重新滚到底（`RefreshDataConsumers` 收尾）。
 
 ---
 
@@ -609,6 +679,75 @@ system prompt 第 11 段给出四种 slot 签名，鼓励常见形状走 preset�
 Release 全部 DataHub 引用、销毁卡级 data 与 json_pool、维护 overlay 计数与 pin 状态、
 出注册表。不存在第二条清理路径，也就不存在漏清理。
 
+### 10.5 流式生长卡片（仅 chat 模式）
+
+ui_render 的参数在 LLM 流式吐字期间就已经逐字符可读：pi-c 每收到一片 delta 就把当前累积
+文本重新 parse 成一棵"尽力而为"的 partial cJSON 树，经既有的 `UI_TOOL_ARGS` 事件
+（`pi_ui_bridge.h`，`s1`=整段重新 parse 出的 partial JSON 字符串快照）传到 drain 侧——这条
+事件桥接早就存在（`pi_agent_task.c` 的 `PI_AI_EV_TOOLCALL_DELTA` 分支），原本只喂一条调试
+文本行，这里复用它接上真正的树渲染，没有新增事件 kind。效果：聊天流里先看到卡片骨架随
+JSON 流入逐步"长出来"，参数吐完、正式渲染校验通过后，在**同一个位置**无缝换装成带真实数据
+绑定的正式卡，不跳行、不重复。
+
+**状态机**：`pi_card::Preview*`（新文件 `pi_card/pi_card_preview.{h,cc}`），module-static
+单例，同一时刻只挂一个"匿名"预览会话（不进 `s_cards` 注册表，不按 id 匹配——同一时刻只有
+一个工具调用在流式吐字，不需要 id 关联）：
+
+| 接口 | 触发点（`pi_screen.cc` `DrainQueueTick`） | 作用 |
+|---|---|---|
+| `PreviewOnToolStart(name)` | `UI_TOOL_START`（`:2148`） | 记住这次流式的是不是 `ui_render`；若上一轮预览还没清干净先兜底撤除 |
+| `PreviewOnArgs(json, gen)` | `UI_TOOL_ARGS`（`:2166`），同 tick 只留最后一条（见下） | 首次出现 `root` 建预览行+树；后续帧增量对齐（reconcile，见下） |
+| `PreviewAdopt()` | `UI_CARD_RENDER` 处理前（`:2352`） | 真卡片渲染前取走预览的 row（若存在且合格），交给 `CardBeginRow` 一帧换装 |
+| `PreviewOnToolEnd()` | `UI_TOOL_END`（`:2179`） | execute 跑完仍未被 adopt（校验失败等）→ 撤除，不留孤儿行 |
+| `PreviewTeardown()` | `UI_AGENT_START`/`UI_ERROR`/`UI_DONE` | 回合级兜底：预览不该活过整个回合 |
+| `PreviewCheckGen(cur_gen)` | 每个 tick 顶部（`:2078`，早于事件循环） | 诞生代次与本 tick 代次不符（barge-in/新会话）→ 撤除 |
+
+**reconcile：位置游标按位增量对齐，不做通用 keyed diff**。`ai->partial_args` 每次都是
+"整段重新 parse"，不是差量，但同一路径下已写完的 key/value 不会再变——利用这条 append-only
+性质，`RenderPreviewNode` / `SyncPreviewNode` / `PreviewSyncContainer`
+（`render.cc:1096` / `1246` / `1281`）维护一个"每个预览容器的 committed 游标"（存在容器的
+`lv_obj` user_data 里）：JSON 容器有 N 个孩子时，`[0, N-2]` 是"后面已经出现更晚的兄弟、证明
+不会再变"的定稿区，逐个渲成最终形（若该位是上一轮生长边留下的半成品先删再重渲）；第 `N-1`
+个是生长边，find-or-create：column/row 递归深入继续生长，label 原地 `lv_label_set_text`
+（不重建，长文本不闪烁），其它叶子类型删旧重渲。**跳过的节点也要占位**：list/chart/
+stock_chart（数据驱动/自管生命周期，预览没有 `card->data`/DataHub 订阅上下文）、未识别
+type、超预算/超深度——若直接跳过不建东西，会打破"lv 子节点下标 == json 子节点下标"这条
+对齐关系，后续按位定位全错位（曾复现：`[chart,A,B,C]` 会渲成 `[A,A,B,C]`）。改成建一个
+`MakePreviewPlaceholder`（`render.cc:1071`，0×0、hidden、打 `LV_OBJ_FLAG_USER_3` 标记）
+补位，下一帧类型可识别了自然被换成真身，不需要额外分支。
+
+**预览零绑定零注册**：`RenderPreviewNode`（`render.cc:1096`）是 `RenderNode` 的简化版——
+只画外观，不 `ApplyBind`（这时既没有 `UiCard` 也没有校验过的合法 bind 路径）、不挂
+`on_click`/`on_change` 事件、不注册 id 进 `card->nodes`、不建 `DataConsumer`。绑定类 label
+还没吐出 `text` 时显示占位 `"--"`。`node_count` 预算：帧内 `++node_count` 实时计数防单帧
+超预算，每帧收尾用 `CountPreviewNodes`（`render.cc:1088`，跳过占位对象不计）对整棵预览树
+重新计数一遍作为下一帧起点——不精确维护增减量，重算最简单不易错。
+
+**三条撤除触发**：①`adopt` 成功（正常收尾，交棒给真卡片）；②`TOOL_END` 时仍未被 adopt
+（校验失败/未生成合法 root）；③session gen 变化（`PreviewCheckGen`）或
+`UI_AGENT_START`/`UI_ERROR`/`UI_DONE`（回合级兜底）。预览 row 挂 `LV_EVENT_DELETE` 回调
+（`PreviewRowDeletedCb`）防外部删除（ClearFeed/屏卸载）后 `Teardown` 二次删。
+
+**adopt 一帧换装**：`UI_CARD_RENDER` 处理前 `s_adopt_row = pi_card::PreviewAdopt()`
+（`pi_screen.cc:2352`）；`CardBeginRow`（`:1986`）若看到 `s_adopt_row` 非空就直接复用它——
+`lv_obj_clean` 清掉预览子节点（零绑定零注册，随便清）、跳过 `s_act_line` 重新定位（这行早就
+在正确位置）、置 `s_card_adopted` 标志。`OnRenderEvent` 的 chat 分支收尾读这个标志决定
+`PlayCardEntrance` 的 `adopted` 参数（§5.6）——命中就只淡入不带位移，没命中（没有预览在跑，
+或走了 pin/overlay 分支）走老路径新建行 + 正常入场动画。安全网：真卡片万一没有走 chat 分支
+消费掉 `s_adopt_row`（理论小概率——预览判定期间 display 一直缺省=chat，但最终完整参数才吐出
+非-chat 的 display），`UI_CARD_RENDER` 处理完后发现它还没被取走就自己删掉，不留永久孤儿行。
+
+**仅 chat 模式；preset 不预览**：`PreviewOnArgs` 里，partial 树顶层一旦出现完整字符串的
+`display` 且不等于 `"chat"`，或出现 `preset` 键（不论值是否吐完——preset 展开只在 execute
+阶段发生，partial 树里凑巧有的 root 跟最终渲染的东西毫无关系），本次工具调用永久放弃预览；
+没出现 `display` 键就按默认口径（chat）继续生长——这两种情形都不算撤除的"第四种触发"，走的
+是"未被 adopt、TOOL_END 兜底撤除"这条已有路径。
+
+**同 tick 合并留最后一条**：`DrainQueueTick` 一个 tick 内若挤了多条 `UI_TOOL_ARGS`（delta
+密集到超过一个 tick 处理不完），只处理最新一条——用 `pending_preview_args` 局部变量做所有权
+转移（`evt.s1` 置空防循环尾部重复 free），循环结束后统一处理这一条、再 free。partial 树是
+"整段重新 parse 出的累积快照"，更早的几条已经是它的严格子集，处理它们纯属浪费。
+
 ---
 
 ## 11. 校验、Lint 与错误回传
@@ -679,7 +818,7 @@ hints)`；ui_update/ui_close 同款。drain 侧：`rendered card <id> (<n> nodes
 | 线程 | 职责 | 碰什么 |
 |---|---|---|
 | agent worker（core0, prio4, 8KB 栈） | pi-c SSE 循环、工具 execute、Validate/Lint、BindStateJson、stock 工具同步抓取 | DataHub 元数据（无锁只读）、pi_ui_queue 入队；**绝不碰 LVGL** |
-| LVGL 线程 | DrainQueueTick(80ms, budget 64 事件/tick)、建/改/删控件、DataHub Acquire/Release/Write/poll、事件回调、RehydratePin | s_cards 注册表等全部 UI 态（单线程持有，无需锁） |
+| LVGL 线程 | DrainQueueTick(80ms, budget 64 事件/tick)、建/改/删控件、DataHub Acquire/Release/Write/poll、事件回调、RehydratePin、`pi_card::Preview*` 流式预览状态机（§10.5，不是独立线程，就是 drain tick 里多几个 case 分支） | s_cards 注册表等全部 UI 态（单线程持有，无需锁） |
 | tts_pump / stock worker | 阻塞 TTS / 腾讯 HTTP | 各自队列 |
 
 跨线程只有两样东西：**FreeRTOS 队列 pi_ui_queue（深 32，非阻塞入队，满即失败告知 LLM
@@ -766,8 +905,9 @@ LVGL9 canvas layer 绘制。分时/五日：昨收虚线（dash 6/5）+ **双色
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| 节点数 / 深度 | 64 / 8 | `host.h:35-38` |
+| 节点数 / 深度 | 64 / 8（流式预览独立计数，同一套上限，超限静默停止生长不报错） | `host.h:35-38`, `render.cc:1061-1062` |
 | list 行数 | max 钳 [1,20]，append 后同样 20 硬顶 | `render.cc:580-585`, `host.cc:446` |
+| ui_update 批量 patches | ≤16 条 | `pi_card_tools.h:145` |
 | overlay 同屏 / TTL | 3 / 保底 5min | `host.cc:43-44` |
 | pin 信封 | 3KB（worker 前置拒绝） | `host.cc:48` |
 | qrcode text | ≤256B | `render.cc:1088-1098` |
@@ -796,11 +936,33 @@ LVGL9 canvas layer 绘制。分时/五日：昨收虚线（dash 6/5）+ **双色
 - **队列满即拒**：非阻塞入队，把背压变成 LLM 可见的"retry shortly"。
 - **GBK/精度/字体等真实世界坑**：报价锚点切分、Round2、SafeFont CJK 回退、美股后缀剥离、
   int16 坐标环绕——都有专门处理并留了注释。
+- **批量 patch 部分失败不中止**：`ui_update` 的 `patches` 数组里某个 id 不存在，只聚合进
+  一条异步错误，其余 id 照常生效——不因一个坏 id 拖累整批（§3.2）。
+- **流式预览零污染真实状态**：预览阶段不 `ApplyBind`、不注册 `card->nodes`、不进
+  `s_cards` 注册表，即便预览过程中出任何岔子（渲染出怪内容、被打断），也不会残留悬垂的
+  DataHub 引用或 id 冲突——真正校验过的正式渲染才碰这些（§10.5）。
+- **list fast path 精确到"哪种 op 才需要退全量"**：只有 `RemoveIdx` 命中含 `{i}`/`{n}` 的
+  行模板才退全量重建，`Append`/`Replace` 即便模板有序号占位符也走行级增量——避免"模板一有
+  {i}/{n} 整个 key 永远全量重建"这种过度保守的粒度（§7）。
 
 ### 14.3 如何验证
 
 - host 模拟器：`cmake -S sim -B sim/build && cmake --build sim/build -j && ./sim/build/pi_sim`
   ——pi_screen/pi_card 代码不改直接跑 macOS SDL2 窗口，真 DeepSeek。F9 / `PI_SIM_CARD_MS`
   可注入测试卡片，`PI_SIM_CMDFILE` 喂触摸手势，F12 截图（只抓 screen 不抓 layer_top）。
+- `PI_SIM_CMDFILE` 驱动的 TEMP SCAFFOLD 命令（`sim/main.cc` 的 `ExecCmd`）覆盖本文档
+  §3.2/§5.6/§7/§10.5 提到的机制，均可脱离真实 LLM 调用直接触发：
+  - `patchtest`：一次 `ui_update` 打一批 `patches`（含存在与不存在的 id），验证聚合异步
+    错误 + 部分成功。
+  - `numanimcard` / `numset <path> <value>` / `strset <path> <text>` / `closecard <id>`：渲
+    一张绑硬件路径的卡，直写 subject 触发数值滚动过渡，`|Δ|<=1` 应跳变、`|Δ|>=2` 应插值；
+    `closecard` 验证动画在途时删卡不崩。
+  - `previewfeed <file>` / `previewdump` / `previewend` / `bargein`：把一个文件里按行存的
+    多帧 partial JSON 快照喂给 `PreviewOnArgs`，`previewdump` 递归打印当前预览树结构（人工
+    核对指针稳定性/占位对齐/无重复），`previewend`/`bargein` 分别模拟"校验失败没有真卡片
+    跟上"与"barge-in 打断"两种撤除路径。
+  - `datacard2` / `listfastop <append|remove|replace|set> [index]` /
+    `listfastmulti_ar` / `listfastmulti_as`：走真实 `ui_update` 的 data 通道触发 list fast
+    path 的四种 op 与多 op 合并场景（含一份 payload 里 append+replace、append+set 的组合）。
 - 真机：`idf.py build && idf.py -p /dev/cu.usbmodem11101 flash`，随后 `uv run
   tools/serial_cap.py` 连续抓日志，`ui_render OK/REJECT` 一眼定位。

@@ -77,6 +77,7 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_actions.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_cmd.cc
     # 股票行情（腾讯财经数据层 + stock tool + stock_chart 控件；HTTP 用 libcurl shim）
     ${CLAW_ROOT}/main/stock/stock_api.cc

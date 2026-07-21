@@ -136,25 +136,30 @@ const char *pi_card_system_prompt(void);
 #define PI_CARD_UPDATE_DESC                                                                          \
     "Patch a node inside a rendered card, or mutate card data. Args {card?:'' (latest), id?:"        \
     "'node-id', props?:{text?,value?,checked?,hidden?,tone?,color?}} — give both id+props to patch " \
-    "that node (must have been given an \"id\" at render time). Or mutate card data: {card?, data:"  \
+    "that node (must have been given an \"id\" at render time). Or patch several nodes in one call: " \
+    "patches?:[{id,props},…] (up to 16; each id independent — a missing id is reported async but "    \
+    "doesn't abort the rest). Or mutate card data: {card?, data:"                                    \
     "{set?:{k:v,…}, append?:{key,item}, remove?:{key,index|id}, replace?:{key,index,item}}} — any "  \
-    "list bound via bind_data (or a bind_data label) re-renders from the new data. Give either "     \
-    "(id+props) or data. If the card/node is gone (closed, TTL-expired, or a new conversation "       \
-    "cleared all cards) the failure is reported back to you asynchronously, not via this call's "     \
-    "return."
+    "list bound via bind_data (or a bind_data label) re-renders from the new data. Give one of "     \
+    "(id+props), patches, or data. If the card/node is gone (closed, TTL-expired, or a new "          \
+    "conversation cleared all cards) the failure is reported back to you asynchronously, not via "    \
+    "this call's return."
 
 #define PI_CARD_UPDATE_SCHEMA \
-    "{\"type\":\"object\",\"properties\":{\"card\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}" \
-    ",\"props\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"value\":{\"type" \
-    "\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"hidden\":{\"type\":\"boolean\"},\"tone\":{\"" \
-    "type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"" \
-    "card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\":\"string\"}}},\"data\":{\"type" \
-    "\":\"object\",\"properties\":{\"set\":{\"type\":\"object\"},\"append\":{\"type\":\"object\",\"p" \
-    "roperties\":{\"key\":{\"type\":\"string\"},\"item\":{}},\"required\":[\"key\",\"item\"]},\"remo" \
-    "ve\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"index\":{\"type\":\"n" \
-    "umber\"},\"id\":{\"type\":\"string\"}},\"required\":[\"key\"]},\"replace\":{\"type\":\"object\"" \
-    ",\"properties\":{\"key\":{\"type\":\"string\"},\"index\":{\"type\":\"number\"},\"item\":{}},\"r" \
-    "equired\":[\"key\",\"index\",\"item\"]}}}}}"
+    "{\"type\":\"object\",\"$defs\":{\"props\":{\"type\":\"object\",\"properties\":{\"text\":{\"type" \
+    "\":\"string\"},\"value\":{\"type\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"hidden\":{\"" \
+    "type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"e" \
+    "rr\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\"" \
+    ":\"string\"}}}},\"properties\":{\"card\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"pr" \
+    "ops\":{\"$ref\":\"#/$defs/props\"},\"patches\":{\"type\":\"array\",\"maxItems\":16,\"items\":{\"" \
+    "type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"props\":{\"$ref\":\"#/$defs/pr" \
+    "ops\"}},\"required\":[\"id\",\"props\"]}},\"data\":{\"type\":\"object\",\"properties\":{\"set\"" \
+    ":{\"type\":\"object\"},\"append\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"stri" \
+    "ng\"},\"item\":{}},\"required\":[\"key\",\"item\"]},\"remove\":{\"type\":\"object\",\"propertie" \
+    "s\":{\"key\":{\"type\":\"string\"},\"index\":{\"type\":\"number\"},\"id\":{\"type\":\"string\"}" \
+    "},\"required\":[\"key\"]},\"replace\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"" \
+    "string\"},\"index\":{\"type\":\"number\"},\"item\":{}},\"required\":[\"key\",\"index\",\"item\"" \
+    "]}}}}}"
 
 #define PI_CARD_CLOSE_DESC "Close a rendered card. Args {card?:'' (latest)}."
 

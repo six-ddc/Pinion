@@ -37,6 +37,7 @@ std::string s_last_id;
 std::atomic<int> s_next_id{1};
 int s_overlay_count = 0;
 FeedHooks s_feed{};
+bool s_screen_off = false;  // SetScreenOff 镜像；供 PlayCardEntrance/NumScrollObserverCb 息屏跳动画的门控查询
 
 // overlay 护栏：浮层会阻止息屏（见 pi_screen 的 sleep 门控），无 ttl 的浮层若被 LLM
 // 忘关会让屏幕永不熄灭、持续耗电，故每个 overlay 都有一个保底最大存活期；同时封顶
@@ -232,12 +233,23 @@ void Init() {
 
 void SetFeedHooks(const FeedHooks& hooks) { s_feed = hooks; }
 
+// 转发 s_feed 的两个钩子给 pi_card_preview.cc（另一个 TU）建预览行用——预览不走
+// OnRenderEvent 的完整流程（没有 UiCard、不入 s_cards 注册表），只需要一个空行 + 首次建行时
+// 滚到可见，不必让它重复存一份 FeedHooks。
+lv_obj_t* FeedBeginRow() { return s_feed.begin_row ? s_feed.begin_row() : nullptr; }
+void FeedEndRowOnce() {
+    if (s_feed.end_row) s_feed.end_row();
+}
+
 bool HasOpenOverlay() { return s_overlay_count > 0; }
 
 void SetScreenOff(bool off) {
+    s_screen_off = off;
     DataHub::Instance().SetLivePaused(off);
     pi_card_stock::SetScreenOff(off);
 }
+
+bool IsScreenOff() { return s_screen_off; }
 
 bool AnyVisibleCardBindsPrefix(const std::string& prefix) {
     for (const auto& [id, card] : s_cards) {
@@ -415,6 +427,7 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         card->overlay_tree = tree;
         ReflowOverlay(card.get());
         AddOverlayCloseButton(wrapper, card.get());
+        PlayCardEntrance(tree, /*adopted=*/false);
         // 保底 TTL：无 ttl（0）或 LLM 给的超长 ttl 一律封顶到 kOverlayMaxTtlMs，避免浮层
         // 永久阻止息屏。显式 ttl 在封顶内则照用。
         int ttl = (ttl_ms > 0 && ttl_ms < kOverlayMaxTtlMs) ? ttl_ms : kOverlayMaxTtlMs;
@@ -423,6 +436,11 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         s_overlay_count++;
     } else {
         if (s_feed.end_row) s_feed.end_row();
+        // 改造1：这一行如果是从流式预览接管过来的（CardBeginRow 命中 s_adopt_row），入场动效
+        // 走 adopted 分支——只淡入（120ms）不带位移，因为内容早就在那儿"长"出来了，不该再
+        // 像全新卡片一样往上滑一截，那样反而显得预览白长了。
+        bool adopted = s_feed.last_row_adopted && s_feed.last_row_adopted();
+        PlayCardEntrance(tree, adopted);
     }
 
     s_last_id = id;
@@ -433,10 +451,21 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
 
 namespace {
 
-// data.set/append/remove/replace 落地到 card->data，收集被改的 key（供 RefreshDataConsumers
-// 只刷真正变化的消费者）。越界/类型不符只 ReportAsyncError（异步告知 LLM），绝不崩、绝不
-// 让一次坏的 data op 拖垮整卡。
-void ApplyDataOps(UiCard* card, const cJSON* ops, std::set<std::string>& changed) {
+// 改造4：结构化 DataOp——ApplyDataOps 不再只留下"哪个 key 变了"这种粗粒度信号，而是把每个
+// 操作的种类 + 落地后的下标一并记下来，供 RefreshDataConsumers 判断能不能走行级 fast path
+// （只重渲/新建/删掉"确实变了的那一行"）而不是每次都整卡 list 全量重建。index 语义：
+// Append=新元素落地后的数组下标（即插入后的 length-1）；RemoveIdx/Replace=解析好的目标下标
+// （remove 的 id 已经在这里转换成 index）；SetWhole 不涉及下标，恒为 -1（set 是整键替换，
+// 天生就是"全新数组"，行级增量无从谈起，见 RefreshDataConsumers）。
+struct DataOp {
+    enum Kind { Append, RemoveIdx, Replace, SetWhole } kind;
+    std::string key;
+    int index = -1;
+};
+
+// data.set/append/remove/replace 落地到 card->data，追加对应的结构化 DataOp。越界/类型不符
+// 只 ReportAsyncError（异步告知 LLM），绝不崩、绝不让一次坏的 data op 拖垮整卡。
+void ApplyDataOps(UiCard* card, const cJSON* ops, std::vector<DataOp>& ops_out) {
     if (!card || !card->data || !cJSON_IsObject(ops)) return;
 
     if (const cJSON* set = cJSON_GetObjectItem(ops, "set"); cJSON_IsObject(set)) {
@@ -448,7 +477,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::set<std::string>& changed
             } else {
                 cJSON_AddItemToObject(card->data, kv->string, cJSON_Duplicate(kv, 1));
             }
-            changed.insert(kv->string);
+            ops_out.push_back({DataOp::SetWhole, kv->string, -1});
         }
     }
     if (const cJSON* append = cJSON_GetObjectItem(ops, "append"); cJSON_IsObject(append)) {
@@ -459,7 +488,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::set<std::string>& changed
             if (!arr) arr = cJSON_AddArrayToObject(card->data, keyj->valuestring);
             if (cJSON_IsArray(arr) && cJSON_GetArraySize(arr) < 20) {
                 cJSON_AddItemToArray(arr, cJSON_Duplicate(item, 1));
-                changed.insert(keyj->valuestring);
+                ops_out.push_back({DataOp::Append, keyj->valuestring, cJSON_GetArraySize(arr) - 1});
             } else {
                 ReportAsyncError(std::string("data.append 失败：'") + keyj->valuestring +
                                  "' 不是数组，或已达 20 行硬顶");
@@ -489,7 +518,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::set<std::string>& changed
             }
             if (idx >= 0 && idx < cJSON_GetArraySize(arr)) {
                 cJSON_DeleteItemFromArray(arr, idx);
-                changed.insert(keyj->valuestring);
+                ops_out.push_back({DataOp::RemoveIdx, keyj->valuestring, idx});
             } else {
                 ReportAsyncError("data.remove 失败：index 越界，或没有匹配的 id");
             }
@@ -506,50 +535,147 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::set<std::string>& changed
         int idx = cJSON_IsNumber(idxj) ? idxj->valueint : -1;
         if (cJSON_IsArray(arr) && item && idx >= 0 && idx < cJSON_GetArraySize(arr)) {
             cJSON_ReplaceItemInArray(arr, idx, cJSON_Duplicate(item, 1));
-            changed.insert(keyj->valuestring);
+            ops_out.push_back({DataOp::Replace, keyj->valuestring, idx});
         } else {
             ReportAsyncError("data.replace 失败：数组不存在，或 index 越界");
         }
     }
 }
 
-// 只刷 key∈changed 的消费者：Label 直接 set-text；List 全量重渲子树（保存/恢复 scroll_y）。
-// 末尾按显示模式收尾：Overlay 重跑高度稳定器，Chat 走 end_row（贴底跟随/滚动到底）。
-void RefreshDataConsumers(UiCard* card, const std::set<std::string>& changed) {
-    if (!card || changed.empty()) return;
+// list 空数组兜底文案的挂/摘——行级 fast path 在"行数 0↔非0"这两个转折点各调一次；全量重建
+// （RefreshListFull）也复用它，逻辑只写一份。挂/摘之后调用方要自己同步 dc.empty_shown。
+void AddListEmptyLabel(UiCard::DataConsumer& dc) {
+    if (dc.empty_text.empty()) return;
+    lv_obj_t* lbl = lv_label_create(dc.obj);
+    lv_label_set_text(lbl, dc.empty_text.c_str());
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    const lv_font_t* f = &font_pi_mono_14;
+    SafeFont(f, dc.empty_text.c_str());  // 中文兜底文案回退 puhui，不出豆腐块
+    lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+    pi_theme::ApplyText(lbl, pi_theme::Tok::Faint);
+}
+void RemoveListEmptyLabel(UiCard::DataConsumer& dc) {
+    // 只在 dc.empty_shown 为真时调用：dc.obj 此刻唯一的子节点就是 empty_text label（若
+    // dc.empty_text 本来是空串，压根没建过 label，child_count==0，天然是空操作）。
+    if (lv_obj_get_child_count(dc.obj) > 0) lv_obj_delete(lv_obj_get_child(dc.obj, 0));
+}
+
+// List 消费者的全量重建：lv_obj_clean 整个子树，按 card->data[key] 重新逐行渲染，保存/恢复
+// scroll_y 消除跳动。退回路径——SetWhole，或 tpl_uses_index 模板上的 RemoveIdx，都靠它兜底
+// （见 RefreshDataConsumers）。行定位不存指针，靠"子节点顺序==数组下标"这条不变量，全量重建
+// 后这条不变量自动成立，不需要额外维护什么映射；只需要重算 dc.empty_shown。
+void RefreshListFull(UiCard* card, UiCard::DataConsumer& dc) {
+    int32_t sy = lv_obj_get_scroll_y(dc.obj);
+    lv_obj_clean(dc.obj);
+    const cJSON* arr = cJSON_GetObjectItem(card->data, dc.key.c_str());
+    int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    int rows = std::min(len, dc.eff_max);
+    int node_count = 0;
+    std::string rerr;
+    for (int i = 0; i < rows; i++) {
+        cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
+        SubstRecord(clone, cJSON_GetArrayItem(arr, i), i);
+        RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count, rerr,
+                  /*parent_flow=*/0, /*in_list_row=*/true);
+        cJSON_Delete(clone);
+    }
+    dc.empty_shown = (rows == 0);
+    if (dc.empty_shown) AddListEmptyLabel(dc);
+    lv_obj_scroll_to_y(dc.obj, sy, LV_ANIM_OFF);
+}
+
+// List 消费者的行级 fast path：按 ops 里命中 dc.key 的每一条，逐条原地 append 尾插 / replace
+// 换行 / remove 删行，不碰其余没变的行——这是改造4的核心，避免"改一行、全表重渲"的浪费。行
+// 定位直接 lv_obj_get_child(dc.obj, i) 按位取，不额外存指针数组：list 容器子节点顺序本就等于
+// 数组下标，这条不变量在 append/replace/remove 三个分支里各自维持住就够了。调用前提
+// （RefreshDataConsumers 已判过）：本轮没有 SetWhole 命中这个 key；RemoveIdx 命中
+// tpl_uses_index 模板的情形也已经被摘出去整个 key 走全量，不会调到本函数处理那条 op。
+// "截断区不补行"：eff_max 是初次渲染时定下的可见行数上限，append 到已达上限就不再新建可见
+// 行（数据本身照样落进 card->data，只是不进画面）；remove 掉一行也不会去"拉"被截断区里原本
+// 看不见的下一条顶上来补位——这是轻量版明确的取舍（团队确认过），全量重建路径下次触发时
+// 才会用当前真实数组重新算出准确的可见集合。
+void RefreshListFastPath(UiCard* card, UiCard::DataConsumer& dc, const std::vector<DataOp>& ops) {
+    for (const DataOp& op : ops) {
+        if (op.key != dc.key) continue;
+        const cJSON* arr = cJSON_GetObjectItem(card->data, dc.key.c_str());
+        switch (op.kind) {
+            case DataOp::Append: {
+                if (dc.empty_shown) {
+                    RemoveListEmptyLabel(dc);  // 空转非空：先摘掉占位文案，腾出位置 0 给真行
+                    dc.empty_shown = false;
+                }
+                if (op.index >= dc.eff_max) break;  // 截断区不补行
+                const cJSON* item = cJSON_IsArray(arr) ? cJSON_GetArrayItem(arr, op.index) : nullptr;
+                if (!item) break;
+                cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
+                SubstRecord(clone, item, op.index);
+                int node_count = 0;
+                std::string rerr;
+                RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count, rerr,
+                          /*parent_flow=*/0, /*in_list_row=*/true);  // flex 容器尾插即末位，天然对齐
+                cJSON_Delete(clone);
+                break;
+            }
+            case DataOp::Replace: {
+                int visible = static_cast<int>(lv_obj_get_child_count(dc.obj));
+                if (op.index < 0 || op.index >= visible) break;  // 截断区/越界：不动
+                const cJSON* item = cJSON_IsArray(arr) ? cJSON_GetArrayItem(arr, op.index) : nullptr;
+                if (!item) break;
+                lv_obj_delete(lv_obj_get_child(dc.obj, op.index));
+                cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
+                SubstRecord(clone, item, op.index);
+                int node_count = 0;
+                std::string rerr;
+                lv_obj_t* row = RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count,
+                                           rerr, /*parent_flow=*/0, /*in_list_row=*/true);
+                cJSON_Delete(clone);
+                if (row) lv_obj_move_to_index(row, op.index);  // 新行建出来会追加到末尾，挪回原位置
+                break;
+            }
+            case DataOp::RemoveIdx: {
+                int visible = static_cast<int>(lv_obj_get_child_count(dc.obj));
+                if (op.index < 0 || op.index >= visible) break;  // 截断区/越界：不动
+                lv_obj_delete(lv_obj_get_child(dc.obj, op.index));
+                if (visible - 1 == 0) {
+                    AddListEmptyLabel(dc);  // 非空转空：补回占位文案
+                    dc.empty_shown = true;
+                }
+                break;
+            }
+            case DataOp::SetWhole:
+                break;  // SetWhole 已在 RefreshDataConsumers 里触发全量重建分支，这里不会走到
+        }
+    }
+}
+
+// 只刷 ops 里出现过的 key 对应的消费者：Label 直接 set-text；List 优先走行级 fast path。退回
+// 全量重建（RefreshListFull）的条件：本轮该 key 命中过 SetWhole（整键替换，天生是"全新数组"，
+// 行级增量无从谈起）；或命中过 RemoveIdx 且模板 tpl_uses_index（remove 会让后续行的下标整体
+// 前移，这类模板的显示内容会跟着过时，只有它需要为此退全量——append/replace 不影响任何其它
+// 行的下标，即便模板里有 {i}/{n} 也不受这条限制，照样走 fast path）。末尾按显示模式收尾：
+// Overlay 重跑高度稳定器，Chat 走 end_row（贴底跟随/滚动到底）。
+void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
+    if (!card || ops.empty()) return;
     bool touched = false;
     for (auto& dc : card->consumers) {
-        if (changed.find(dc.key) == changed.end() || !dc.obj) continue;
+        bool hit = false;
+        bool need_full = false;
+        for (const DataOp& op : ops) {
+            if (op.key != dc.key) continue;
+            hit = true;
+            if (op.kind == DataOp::SetWhole) need_full = true;
+            if (op.kind == DataOp::RemoveIdx && dc.tpl_uses_index) need_full = true;
+        }
+        if (!hit || !dc.obj) continue;
         touched = true;
         if (dc.kind == UiCard::DataConsumer::Label) {
             const cJSON* v = cJSON_GetObjectItem(card->data, dc.key.c_str());
             std::string txt = dc.text_tpl.empty() ? Stringify(v) : SubstDataValue(dc.text_tpl, v);
             lv_label_set_text(dc.obj, txt.c_str());
-        } else {  // List：全量重渲子树，保存/恢复 scroll_y 消除跳动
-            int32_t sy = lv_obj_get_scroll_y(dc.obj);
-            lv_obj_clean(dc.obj);
-            const cJSON* arr = cJSON_GetObjectItem(card->data, dc.key.c_str());
-            int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-            int rows = std::min(len, dc.eff_max);
-            int node_count = 0;
-            std::string rerr;
-            for (int i = 0; i < rows; i++) {
-                cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
-                SubstRecord(clone, cJSON_GetArrayItem(arr, i), i);
-                RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count, rerr,
-                          /*parent_flow=*/0, /*in_list_row=*/true);
-                cJSON_Delete(clone);
-            }
-            if (rows == 0 && !dc.empty_text.empty()) {
-                lv_obj_t* lbl = lv_label_create(dc.obj);
-                lv_label_set_text(lbl, dc.empty_text.c_str());
-                lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-                const lv_font_t* f = &font_pi_mono_14;
-                SafeFont(f, dc.empty_text.c_str());  // 中文兜底文案回退 puhui，不出豆腐块
-                lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
-                pi_theme::ApplyText(lbl, pi_theme::Tok::Faint);
-            }
-            lv_obj_scroll_to_y(dc.obj, sy, LV_ANIM_OFF);
+        } else if (need_full) {
+            RefreshListFull(card, dc);
+        } else {
+            RefreshListFastPath(card, dc, ops);
         }
     }
     if (touched) {
@@ -591,18 +717,48 @@ void OnUpdateEvent(const char* card_id, const char* payload_json) {
             did_node_patch = true;
         }
     }
+    const cJSON* patchesj = cJSON_GetObjectItem(payload, "patches");
+    if (cJSON_IsArray(patchesj)) {
+        std::vector<std::string> missing;
+        const cJSON* p = nullptr;
+        cJSON_ArrayForEach(p, patchesj) {
+            const cJSON* pid = cJSON_GetObjectItem(p, "id");
+            const cJSON* pprops = cJSON_GetObjectItem(p, "props");
+            if (!cJSON_IsString(pid) || !cJSON_IsObject(pprops)) continue;  // worker 已校验形状，这里兜底跳过
+            auto it = card->nodes.find(pid->valuestring);
+            if (it == card->nodes.end()) {
+                missing.push_back(pid->valuestring);
+            } else {
+                std::string err;
+                ApplyProps(it->second, pprops, err);
+                did_node_patch = true;
+            }
+        }
+        if (!missing.empty()) {
+            std::string joined;
+            for (size_t i = 0; i < missing.size(); i++) {
+                if (i) joined += "、";
+                joined += "'" + missing[i] + "'";
+            }
+            ESP_LOGW(TAG, "update: %zu/%d batch patch node(s) not found", missing.size(),
+                     cJSON_GetArraySize(patchesj));
+            ReportAsyncError(std::string("ui_update 批量 patch 部分失败：节点 ") + joined +
+                             " 不存在（渲染时须给该节点一个 id 才能后续 update；其余已生效的节点不受影响）");
+        }
+    }
     const cJSON* dataj = cJSON_GetObjectItem(payload, "data");
     bool did_data_op = false;
     if (cJSON_IsObject(dataj)) {
-        std::set<std::string> changed;
-        ApplyDataOps(card, dataj, changed);
-        RefreshDataConsumers(card, changed);  // 内部按需 ReflowOverlay/end_row
-        did_data_op = !changed.empty();
+        std::vector<DataOp> ops;
+        ApplyDataOps(card, dataj, ops);
+        RefreshDataConsumers(card, ops);  // 内部按需 ReflowOverlay/end_row
+        did_data_op = !ops.empty();
     }
     cJSON_Delete(payload);
-    // node patch 改的文本/显隐可能变了内容高度：重跑收口（data op 分支已在
-    // RefreshDataConsumers 里做过，这里只补 node-patch 单独生效、data op 没碰的场景，
-    // 避免同一轮 update 两条分支都命中时重复 reflow）。
+    // node patch（单点或 patches 批量，did_node_patch 是它们共用的一个标志位）改的文本/显隐
+    // 可能变了内容高度：重跑收口（data op 分支已在 RefreshDataConsumers 里做过，这里只补
+    // node-patch 单独生效、data op 没碰的场景，避免同一轮 update 两条分支都命中时重复 reflow；
+    // 批量 patches 命中多个节点也只在这里跑一次，不逐条 reflow）。
     if (did_node_patch && !did_data_op) {
         if (card->display == Display::Overlay) {
             ReflowOverlay(card);
@@ -1129,15 +1285,37 @@ extern "C" char* pi_card_tool_update(const cJSON* args, bool* is_error) {
     const cJSON* idj = cJSON_GetObjectItem(args, "id");
     const cJSON* propsj = cJSON_GetObjectItem(args, "props");
     const cJSON* dataj = cJSON_GetObjectItem(args, "data");
+    const cJSON* patchesj = cJSON_GetObjectItem(args, "patches");
     bool node_patch = cJSON_IsString(idj) && cJSON_IsObject(propsj);
     bool data_ops = cJSON_IsObject(dataj);
-    if (!node_patch && !data_ops) {
-        return reject("shape", "update needs either (id + props) to patch a node, or data:{set/append/"
-                               "remove/replace} to mutate card data");
+    bool patches_ok = false;
+    if (patchesj) {
+        int n = cJSON_IsArray(patchesj) ? cJSON_GetArraySize(patchesj) : -1;
+        if (n <= 0) {
+            return reject("shape", "patches must be a non-empty array of {id, props}");
+        }
+        if (n > 16) {
+            return reject("shape", "patches has " + std::to_string(n) + " items (max 16)");
+        }
+        for (int i = 0; i < n; i++) {
+            const cJSON* p = cJSON_GetArrayItem(patchesj, i);
+            const cJSON* pid = cJSON_IsObject(p) ? cJSON_GetObjectItem(p, "id") : nullptr;
+            const cJSON* pprops = cJSON_IsObject(p) ? cJSON_GetObjectItem(p, "props") : nullptr;
+            if (!cJSON_IsString(pid) || !cJSON_IsObject(pprops)) {
+                return reject("shape", "patches[" + std::to_string(i) +
+                                       "] must be {id:string, props:object}");
+            }
+        }
+        patches_ok = true;
+    }
+    if (!node_patch && !data_ops && !patches_ok) {
+        return reject("shape", "update needs (id + props) to patch a node, patches:[{id,props},…] "
+                               "(max 16) for a batch, or data:{set/append/remove/replace} to mutate "
+                               "card data");
     }
     const cJSON* cardj = cJSON_GetObjectItem(args, "card");
     std::string card = cJSON_IsString(cardj) ? cardj->valuestring : "";
-    // 整份 args 序列化进 s3：OnUpdateEvent(card_id, payload_json) 里再分流节点 patch / data ops。
+    // 整份 args 序列化进 s3：OnUpdateEvent(card_id, payload_json) 里再分流节点 patch / batch patches / data ops。
     char* payload = cJSON_PrintUnformatted(args);
     if (!payload) {
         return reject("oom", "out of memory");
@@ -1145,8 +1323,8 @@ extern "C" char* pi_card_tool_update(const cJSON* args, bool* is_error) {
     if (!Enqueue(UI_CARD_UPDATE, Dup(card), nullptr, payload, 0, 0)) {
         return reject("queue-full", "UI busy (event queue full), retry shortly");
     }
-    ESP_LOGI(TAG, "ui_update OK: card=%s%s%s", card.empty() ? "(active)" : card.c_str(),
-             node_patch ? " +node" : "", data_ops ? " +data" : "");
+    ESP_LOGI(TAG, "ui_update OK: card=%s%s%s%s", card.empty() ? "(active)" : card.c_str(),
+             node_patch ? " +node" : "", patches_ok ? " +patches" : "", data_ops ? " +data" : "");
     return Dup("ok");
 }
 

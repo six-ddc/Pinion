@@ -41,9 +41,12 @@
 #include "settings.h"  // P1 grid rehydrate 测试：直写 standby pin 封套
 #include "pi_theme.h"  // T1 主题往返测试：pi_theme::Set
 #include "media_player/media_player.h"
+#include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
+#include "pi_card/pi_card_preview.h"
 #include "pi_card/pi_card_tools.h"
+#include "pi_ui_bridge.h"
 #include "stock/stock_tool.h"
 #include "media_admin_httpd.h"
 #include "pi_screen.h"
@@ -609,6 +612,211 @@ void ShowRows(int n) {
     }
 }
 
+// TEMP SCAFFOLD (改造10 acceptance): render a card with a label bound to the writable Int path
+// audio.volume — used with `numset` below to observe the manual-observer + 250ms interpolation
+// added in pi_card_render.cc's ApplyBind (replacing the native lv_label_bind_text one-shot jump
+// for non-String binds) — plus a second label bound to the String path net.ssid, to confirm the
+// String branch still uses the untouched native lv_label_bind_text (no animation, no crash/tofu).
+// Also exercises the entrance fade+slide (PlayCardEntrance, pi_card_render.cc) since it's an
+// overlay render, with id "vol" left on the card root so `ui_close` can target it for the
+// mid-animation-delete regression check.
+void RenderNumAnimCard() {
+    static const char* kSpec =
+        "{\"display\":\"overlay\",\"card\":\"vol\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
+        "{\"type\":\"label\",\"role\":\"title\",\"text\":\"数值滚动测试\"},"
+        "{\"type\":\"label\",\"id\":\"vol\",\"role\":\"value\",\"bind\":\"audio.volume\","
+        "\"fmt\":\"%d%%\",\"mono\":true},"
+        "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"net.ssid\",\"fmt\":\"%s\"}]}}";
+    cJSON* args = cJSON_Parse(kSpec);
+    if (!args) {
+        std::fprintf(stderr, "[sim] numanimcard JSON parse failed\n");
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    std::fprintf(stderr, "[sim] numanimcard render: %s (%s)\n", res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD (改造10 acceptance): numset <path> <value> — writes the DataHub subject
+// directly (bypassing touch/slider drag) so the manual observer's 250ms interpolation fires
+// deterministically at a known moment for screenshot timing.
+void ExecNumSet(const std::string& path, int value) {
+    lv_subject_t* subj = pi_card::DataHub::Instance().Acquire(path);
+    if (!subj) {
+        std::fprintf(stderr, "[sim] numset: unknown path '%s'\n", path.c_str());
+        return;
+    }
+    lv_subject_set_int(subj, value);
+    std::fprintf(stderr, "[sim] numset %s -> %d\n", path.c_str(), value);
+}
+
+// TEMP SCAFFOLD (改造10 acceptance c): strset <path> <text> — direct subject write for String
+// paths (net.ssid has no setter, so ExecNumSet's DataHub::Write path doesn't apply here);
+// confirms the untouched native lv_label_bind_text branch still renders String binds correctly
+// (including CJK, exercising the SafeFont mono->puhui fallback) with no animation.
+void ExecStrSet(const std::string& path, const std::string& text) {
+    lv_subject_t* subj = pi_card::DataHub::Instance().Acquire(path);
+    if (!subj) {
+        std::fprintf(stderr, "[sim] strset: unknown path '%s'\n", path.c_str());
+        return;
+    }
+    lv_subject_copy_string(subj, text.c_str());
+    std::fprintf(stderr, "[sim] strset %s -> '%s'\n", path.c_str(), text.c_str());
+}
+
+// TEMP SCAFFOLD (改造1 acceptance #2): previewfeed <file> — feeds a sequence of partial-JSON
+// snapshots (one per line, each the FULL accumulated args-so-far, matching how
+// pi_agent_task.c's UI_TOOL_ARGS actually behaves) straight into
+// pi_card::PreviewOnArgs, bypassing the queue/drain-tick entirely — deterministic, no real LLM
+// needed. Calls PreviewOnToolStart("ui_render") once up front (NOT per line — doing it per line
+// would tear down the very session we're trying to grow). After each line, logs the tree root
+// and its child-0 pointer so a human/script can diff across frames and confirm committed
+// subtrees keep the same lv_obj_t* (the acceptance criterion).
+void DumpPreviewNode(lv_obj_t* obj, int depth);  // 前向声明：定义见下方（迟到属性取证要逐帧转储）
+
+void ExecPreviewFeed(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.good()) {
+        std::fprintf(stderr, "[sim] previewfeed: can't open '%s'\n", path.c_str());
+        return;
+    }
+    pi_card::PreviewOnToolStart("ui_render");
+    uint32_t gen = pi_agent_task_session_gen();  // 传真实当前代次，避免下个 drain tick 被判过期撤除
+    std::string line;
+    int frame = 0;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        frame++;
+        pi_card::PreviewOnArgs(line.c_str(), gen);
+        lv_obj_t* tree = pi_card::PreviewDebugTree();
+        lv_obj_t* child0 = (tree && lv_obj_get_child_count(tree) > 0) ? lv_obj_get_child(tree, 0) : nullptr;
+        std::fprintf(stderr, "[sim][previewfeed] frame %d: tree=%p child0=%p children=%u\n", frame,
+                     static_cast<void*>(tree), static_cast<void*>(child0),
+                     tree ? lv_obj_get_child_count(tree) : 0);
+        // 迟到属性修复取证（任务分配 #2）：每帧转储一次，逐帧 diff 才能看出 role/grow/justify
+        // 这些容器/叶子属性是不是"到帧就生效"而不是憋到 adopt 才跳变。
+        std::fprintf(stderr, "[sim][previewfeed] frame %d dump:\n", frame);
+        DumpPreviewNode(tree, 0);
+    }
+}
+
+// TEMP SCAFFOLD (verify-m1 counterexample; extended for the 迟到属性 fix acceptance): recursively
+// dump the live preview tree so a human can eyeball structure (order/duplicates/rebuilds) AND the
+// layout-affecting properties that are supposed to now update mid-growth instead of only at
+// adopt: label font pointer (role → font swap), computed pixel width + flex_grow (grow:1), and
+// the container's flex main/cross place enum (justify/align).
+void DumpPreviewNode(lv_obj_t* obj, int depth) {
+    if (!obj) return;
+    const char* kind = "obj";
+    char extra[192] = "";
+    int off = 0;
+    if (lv_obj_check_type(obj, &lv_label_class)) {
+        kind = "label";
+        off += std::snprintf(extra + off, sizeof(extra) - off, " text=\"%s\" font=%p",
+                              lv_label_get_text(obj),
+                              static_cast<const void*>(lv_obj_get_style_text_font(obj, LV_PART_MAIN)));
+    } else if (lv_obj_check_type(obj, &lv_button_class)) {
+        kind = "button";
+    } else if (lv_obj_check_type(obj, &lv_slider_class)) {
+        kind = "slider";
+    }
+    off += std::snprintf(extra + off, sizeof(extra) - off,
+                          " w=%d grow=%u main=%d cross=%d radius=%d hidden=%d",
+                          static_cast<int>(lv_obj_get_width(obj)),
+                          static_cast<unsigned>(lv_obj_get_style_flex_grow(obj, LV_PART_MAIN)),
+                          static_cast<int>(lv_obj_get_style_flex_main_place(obj, LV_PART_MAIN)),
+                          static_cast<int>(lv_obj_get_style_flex_cross_place(obj, LV_PART_MAIN)),
+                          static_cast<int>(lv_obj_get_style_radius(obj, LV_PART_MAIN)),
+                          lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0);
+    std::fprintf(stderr, "[sim][previewdump] %*s%s %p%s\n", depth * 2, "", kind,
+                 static_cast<void*>(obj), extra);
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) DumpPreviewNode(lv_obj_get_child(obj, i), depth + 1);
+}
+void ExecPreviewDump() {
+    lv_obj_t* tree = pi_card::PreviewDebugTree();
+    std::fprintf(stderr, "[sim][previewdump] === tree root=%p ===\n", static_cast<void*>(tree));
+    DumpPreviewNode(tree, 0);
+}
+
+// TEMP SCAFFOLD (改造1 acceptance #4/#5): previewend / bargein — drive the two non-adopt
+// teardown paths without needing a real LLM round-trip. previewend calls PreviewOnToolEnd
+// directly (simulates "tool execute finished, no UI_CARD_RENDER followed" — e.g. validation
+// failed); bargein calls pi_agent_task_new_session() directly (simulates a barge-in/new session
+// bumping the session gen mid-stream) — the actual teardown then happens on the next
+// DrainQueueTick via PreviewCheckGen, same as the real path.
+void ExecPreviewEnd() {
+    pi_card::PreviewOnToolEnd();
+    std::fprintf(stderr, "[sim] previewend: tree=%p\n", static_cast<void*>(pi_card::PreviewDebugTree()));
+}
+void ExecBargeIn() {
+    pi_agent_task_new_session();
+    std::fprintf(stderr, "[sim] bargein: session gen bumped\n");
+}
+
+// TEMP SCAFFOLD (merge regression: preview vs. formal render visual A/B): rendercard <file> —
+// read one raw ui_render JSON spec (a "card" id + "root", same shape RenderBadCard uses) from a
+// file and push it through the real (non-preview) pi_card_tool_render path, so a previewfeed
+// frame's final JSON can be screenshotted twice — once via the preview tree, once via the formal
+// tree — for a pixel comparison.
+void ExecRenderJson(const std::string& path) {
+    std::ifstream f(path);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    cJSON* args = cJSON_Parse(text.c_str());
+    if (!args) {
+        std::fprintf(stderr, "[sim] rendercard: JSON parse failed for '%s'\n", path.c_str());
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    std::fprintf(stderr, "[sim][rendercard] -> %s (%s)\n", res ? res : "(null)", is_err ? "ERR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD (改造10 acceptance): closecard <id> — real ui_close, used to check that
+// deleting a card while its entrance/num-scroll lv_anim_t is still in flight doesn't crash
+// (regression for PlayCardEntrance/NumScrollObserverCb using the label/tree object itself as
+// the anim var, relying on LVGL's auto-cleanup-on-delete instead of a manual DELETE callback).
+void ExecCloseCard(const std::string& id) {
+    cJSON* args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "card", id.c_str());
+    bool is_err = false;
+    char* res = pi_card_tool_close(args, &is_err);
+    std::fprintf(stderr, "[sim] closecard %s: %s (%s)\n", id.c_str(), res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD (ui_update batch `patches` acceptance): one real ui_update call against
+// BuildGrowCard()'s row0..row19 with a `patches` array — 2 existing ids (row0/row1, both
+// currently visible) + 1 missing id, to see 2 nodes flip hidden in a single call plus one
+// aggregated async error, via the same real tool path ShowRows() exercises per-id.
+void ExecPatchTest() {
+    cJSON* args = cJSON_CreateObject();
+    cJSON* patches = cJSON_AddArrayToObject(args, "patches");
+    auto add_patch = [&](const char* id, bool hidden) {
+        cJSON* p = cJSON_CreateObject();
+        cJSON_AddStringToObject(p, "id", id);
+        cJSON* props = cJSON_AddObjectToObject(p, "props");
+        cJSON_AddBoolToObject(props, "hidden", hidden);
+        cJSON_AddItemToArray(patches, p);
+    };
+    add_patch("row0", true);
+    add_patch("row1", true);
+    add_patch("rowMissing", true);  // does not exist -> aggregated async error
+    bool is_err = false;
+    char* res = pi_card_tool_update(args, &is_err);
+    std::fprintf(stderr, "[sim] patchtest ui_update: %s (%s)\n", res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
 // TEMP SCAFFOLD (P1 report 状态快照 + P2 本地 toggle 披露)：一张表单卡——
 //   * qty(slider) / urgent(switch)：无 bind 只有 id 的**纯本地表单控件**。既验证它们没被
 //     「死控件兜底」DIM 掉（pi_card_render.cc 的 live 判据第 4 条），也验证 report 会自动
@@ -680,6 +888,18 @@ constexpr const char* kCardList =
     // 见 spec D3），但那样就演示不出"截图行数 +1"，故这里显式留出余量。
     "{\"type\":\"list\",\"bind_data\":\"items\",\"max\":8,\"empty\":\"清单为空\",\"item\":{\"type\":\"row\","
     "\"children\":[{\"type\":\"label\",\"text\":\"{n}. {item.name}\",\"grow\":1},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}]}}]}}";
+
+// 改造4：行模板不含 {i}/{n}（只用 {item.*}）——tpl_uses_index 应算 false，走行级 fast path。
+// max:4、初始 2 条：append 到 3/4 条正常新增行，第 3 次 append（会让底层数组到 5 条）应该
+// "截断区不补行"（可见行数钉在 4，不再新增）。固定 card id "datacard2"，供 listfastop 命令用。
+constexpr const char* kCardListFast =
+    "{\"card\":\"datacard2\",\"display\":\"overlay\",\"data\":{\"items\":["
+    "{\"name\":\"苹果\",\"price\":\"12\"},{\"name\":\"香蕉\",\"price\":\"6\"}]},"
+    "\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
+    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"快路径清单\"},"
+    "{\"type\":\"list\",\"bind_data\":\"items\",\"max\":4,\"empty\":\"清单为空\",\"item\":{\"type\":\"row\","
+    "\"children\":[{\"type\":\"label\",\"text\":\"{item.name}\",\"grow\":1},"
     "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}]}}]}}";
 
 // T2：list max:20 × 5 节点/行的行模板 = 100 > 64，validate 应同步拒绝（"list reserves"）。
@@ -942,6 +1162,121 @@ void RenderDataCard() {
     bool is_err = false;
     char* res = pi_card_tool_render(args, &is_err);
     std::fprintf(stderr, "[sim] datacard render: %s (%s)\n", res ? res : "(null)", is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD（改造4 acceptance）：渲染 kCardListFast（固定 card id "datacard2"，行模板不含
+// {i}/{n}，走行级 fast path）。
+void RenderDataCardFast() {
+    cJSON* args = cJSON_Parse(kCardListFast);
+    if (!args) {
+        std::fprintf(stderr, "[sim] datacard2 JSON parse failed\n");
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_render(args, &is_err);
+    std::fprintf(stderr, "[sim] datacard2 render: %s (%s)\n", res ? res : "(null)", is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD（改造4 acceptance）：listfastop <append|remove|replace|set> [index] — 走真实
+// ui_update 的 data 通道，对准 "datacard2" 卡的 items 数组。append 尾插一条；remove/replace
+// 需要 index（remove 缺省 0，replace 缺省 0）；set 整键换成全新数组（validate"退全量"用）。
+void ExecListFastOp(const std::string& op, int index) {
+    cJSON* args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "card", "datacard2");
+    cJSON* data = cJSON_AddObjectToObject(args, "data");
+    if (op == "append") {
+        cJSON* append = cJSON_AddObjectToObject(data, "append");
+        cJSON_AddStringToObject(append, "key", "items");
+        cJSON* item = cJSON_AddObjectToObject(append, "item");
+        cJSON_AddStringToObject(item, "name", "新品");
+        cJSON_AddStringToObject(item, "price", "1");
+    } else if (op == "remove") {
+        cJSON* remove = cJSON_AddObjectToObject(data, "remove");
+        cJSON_AddStringToObject(remove, "key", "items");
+        cJSON_AddNumberToObject(remove, "index", index);
+    } else if (op == "replace") {
+        cJSON* replace = cJSON_AddObjectToObject(data, "replace");
+        cJSON_AddStringToObject(replace, "key", "items");
+        cJSON_AddNumberToObject(replace, "index", index);
+        cJSON* item = cJSON_AddObjectToObject(replace, "item");
+        cJSON_AddStringToObject(item, "name", "换了");
+        cJSON_AddStringToObject(item, "price", "99");
+    } else if (op == "set") {
+        cJSON* set = cJSON_AddObjectToObject(data, "set");
+        cJSON* arr = cJSON_AddArrayToObject(set, "items");
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", "全新数组");
+        cJSON_AddStringToObject(item, "price", "0");
+        cJSON_AddItemToArray(arr, item);
+    } else {
+        std::fprintf(stderr, "[sim] listfastop 未知操作 '%s'（用 append|remove|replace|set）\n",
+                     op.c_str());
+        cJSON_Delete(args);
+        return;
+    }
+    bool is_err = false;
+    char* res = pi_card_tool_update(args, &is_err);
+    std::fprintf(stderr, "[sim] listfastop %s idx=%d -> %s (%s)\n", op.c_str(), index,
+                 res ? res : "(null)", is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD（改造4 acceptance #6）：一次 ui_update 里同时塞 append+replace（同 key），验证
+// "多 op 合并"——两条 op 都该在这一次调用里正确生效（append 尾插一条，replace 换掉指定行）。
+void ExecListFastMultiAppendReplace() {
+    cJSON* args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "card", "datacard2");
+    cJSON* data = cJSON_AddObjectToObject(args, "data");
+    cJSON* append = cJSON_AddObjectToObject(data, "append");
+    cJSON_AddStringToObject(append, "key", "items");
+    cJSON* aitem = cJSON_AddObjectToObject(append, "item");
+    cJSON_AddStringToObject(aitem, "name", "多op追加");
+    cJSON_AddStringToObject(aitem, "price", "2");
+    cJSON* replace = cJSON_AddObjectToObject(data, "replace");
+    cJSON_AddStringToObject(replace, "key", "items");
+    cJSON_AddNumberToObject(replace, "index", 0);
+    cJSON* ritem = cJSON_AddObjectToObject(replace, "item");
+    cJSON_AddStringToObject(ritem, "name", "多op换首行");
+    cJSON_AddStringToObject(ritem, "price", "3");
+    bool is_err = false;
+    char* res = pi_card_tool_update(args, &is_err);
+    std::fprintf(stderr, "[sim] listfastmulti append+replace -> %s (%s)\n", res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
+    free(res);
+    cJSON_Delete(args);
+}
+
+// TEMP SCAFFOLD（改造4 acceptance #6）：一次 ui_update 里同时塞 append+set（同 key）——
+// ApplyDataOps 按 set→append 的固定顺序落地两条操作（各自独立生效在 card->data 上：
+// set 先把数组整个换成新内容，append 再往这个新数组末尾追一条，两条的数据效果都真实生效，
+// 都能在最终数组里看到），但 RefreshDataConsumers 只因为出现了 SetWhole 就整个 key 走一次
+// RefreshListFull，不会再额外为 append 单独跑一次 fast path——重建时直接读的是这一刻
+// card->data 的最终值，天然已经含着 append 的效果，没有"跳过 append 的数据"这回事，只是
+// "不会为它多做一次行级增量"。
+void ExecListFastMultiAppendSet() {
+    cJSON* args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "card", "datacard2");
+    cJSON* data = cJSON_AddObjectToObject(args, "data");
+    cJSON* append = cJSON_AddObjectToObject(data, "append");
+    cJSON_AddStringToObject(append, "key", "items");
+    cJSON* aitem = cJSON_AddObjectToObject(append, "item");
+    cJSON_AddStringToObject(aitem, "name", "会被set吞掉");
+    cJSON_AddStringToObject(aitem, "price", "4");
+    cJSON* set = cJSON_AddObjectToObject(data, "set");
+    cJSON* arr = cJSON_AddArrayToObject(set, "items");
+    cJSON* sitem = cJSON_CreateObject();
+    cJSON_AddStringToObject(sitem, "name", "set最终态");
+    cJSON_AddStringToObject(sitem, "price", "5");
+    cJSON_AddItemToArray(arr, sitem);
+    bool is_err = false;
+    char* res = pi_card_tool_update(args, &is_err);
+    std::fprintf(stderr, "[sim] listfastmulti append+set -> %s (%s)\n", res ? res : "(null)",
+                 is_err ? "ERROR" : "ok");
     free(res);
     cJSON_Delete(args);
 }
@@ -1302,6 +1637,8 @@ void DumpFeedGeom(const char* tag) {
 }
 
 // TEMP SCAFFOLD: 按按钮上的文本找到该 button（递归找 label，再往上找最近的 button 祖先）。
+// 祖先判定放宽成"任意 CLICKABLE 对象"而非严格 lv_button_class——sbar 的 mode_btn（ZEN/FLOW
+// 切换）是 lv_obj_create + 手动挂 CLICKABLE，不是真正的 lv_button，原判定找不到它。
 lv_obj_t* FindBtnByLabel(lv_obj_t* parent, const char* text) {
     uint32_t n = lv_obj_get_child_count(parent);
     for (uint32_t i = 0; i < n; i++) {
@@ -1310,7 +1647,8 @@ lv_obj_t* FindBtnByLabel(lv_obj_t* parent, const char* text) {
             const char* t = lv_label_get_text(c);
             if (t != nullptr && std::strcmp(t, text) == 0) {
                 for (lv_obj_t* p = lv_obj_get_parent(c); p != nullptr; p = lv_obj_get_parent(p)) {
-                    if (lv_obj_check_type(p, &lv_button_class)) return p;
+                    if (lv_obj_check_type(p, &lv_button_class) || lv_obj_has_flag(p, LV_OBJ_FLAG_CLICKABLE))
+                        return p;
                 }
             }
         }
@@ -1434,6 +1772,41 @@ void ExecCmd(const std::string& line) {
         int n = 0;
         ss >> n;
         ShowRows(n);
+    } else if (cmd == "patchtest") {  // TEMP SCAFFOLD: real ui_update batch `patches` path
+        ExecPatchTest();
+    } else if (cmd == "numanimcard") {  // TEMP SCAFFOLD: render the num-anim acceptance card
+        RenderNumAnimCard();
+    } else if (cmd == "numset") {  // TEMP SCAFFOLD: numset <path> <value> — direct subject write
+        std::string path;
+        int v = 0;
+        ss >> path >> v;
+        ExecNumSet(path, v);
+    } else if (cmd == "closecard") {  // TEMP SCAFFOLD: closecard <id> — real ui_close
+        std::string id;
+        ss >> id;
+        ExecCloseCard(id);
+    } else if (cmd == "previewfeed") {  // TEMP SCAFFOLD: previewfeed <file> — feed partial-JSON frames
+        std::string path;
+        std::getline(ss, path);
+        if (!path.empty() && path[0] == ' ') path.erase(0, 1);
+        ExecPreviewFeed(path);
+    } else if (cmd == "previewdump") {  // TEMP SCAFFOLD (verify): recursively dump preview tree
+        ExecPreviewDump();
+    } else if (cmd == "previewend") {  // TEMP SCAFFOLD: simulate UI_TOOL_END without a card render
+        ExecPreviewEnd();
+    } else if (cmd == "bargein") {  // TEMP SCAFFOLD: simulate a barge-in/new-session gen bump
+        ExecBargeIn();
+    } else if (cmd == "rendercard") {  // TEMP SCAFFOLD: rendercard <file> — real ui_render from raw JSON file
+        std::string path;
+        std::getline(ss, path);
+        if (!path.empty() && path[0] == ' ') path.erase(0, 1);
+        ExecRenderJson(path);
+    } else if (cmd == "strset") {  // TEMP SCAFFOLD: strset <path> <text> — direct String subject write
+        std::string path, text;
+        ss >> path;
+        std::getline(ss, text);
+        if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+        ExecStrSet(path, text);
     } else if (cmd == "chatcard") {  // TEMP SCAFFOLD: chatcard <n> — append card #n to the chat feed
         int n = 1;
         ss >> n;
@@ -1526,6 +1899,17 @@ void ExecCmd(const std::string& line) {
         std::string op;
         ss >> op;
         ExecDataOp(op);
+    } else if (cmd == "datacard2") {  // 改造4: render kCardListFast (fixed card id "datacard2")
+        RenderDataCardFast();
+    } else if (cmd == "listfastop") {  // 改造4: listfastop <append|remove|replace|set> [index]
+        std::string op;
+        int idx = 0;
+        ss >> op >> idx;
+        ExecListFastOp(op, idx);
+    } else if (cmd == "listfastmulti_ar") {  // 改造4: 一次 ui_update 里 append+replace 合并
+        ExecListFastMultiAppendReplace();
+    } else if (cmd == "listfastmulti_as") {  // 改造4: 一次 ui_update 里 append+set 合并
+        ExecListFastMultiAppendSet();
     } else if (cmd == "datalabel") {  // Phase2 T8: render kCardDataLabel (fixed card id "datalabel")
         RenderDataLabelCard();
     } else if (cmd == "datalabelset") {  // Phase2 T8: datalabelset <text> — real ui_update data.set

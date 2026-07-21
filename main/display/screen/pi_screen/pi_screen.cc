@@ -23,6 +23,7 @@
 #include "pi_card/pi_card_cmd.h"
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
+#include "pi_card/pi_card_preview.h"
 #include "metalio_hal/audio_pipeline.h"
 #include "metalio_hal/bluetooth.h"
 #include "metalio_hal/gps.h"
@@ -216,6 +217,10 @@ lv_obj_t* s_cur_tool_fn_lbl = nullptr;
 lv_obj_t* s_cur_tool_ret_lbl = nullptr;
 lv_obj_t* s_cur_tool_body_args_lbl = nullptr;
 lv_obj_t* s_cur_tool_body_partial_row = nullptr;  // "partial 等待流式返回" row, RUNNING-only
+// 改造1（流式生长卡片）：当前流式吐字的工具是不是 ui_render——是的话 UI_TOOL_ARGS 转给
+// pi_card::PreviewOnArgs 长预览卡，且不再刷旧的 "args#" 调试文本行（两者都读同一份 partial
+// json，展示形式二选一，可视化预览更直观）。
+bool s_cur_tool_is_render = false;
 lvmd::MdView* s_cur_md = nullptr;  // current reply stream; owned by the LVGL tree, not us
 // 会话内全部存活的 MdView（含已 Finish 的历史回复）：颜色烘焙在控件/recolor
 // 标记里，不走 pi_theme 共享样式，主题切换时逐个 Retheme 重涂。root 删除
@@ -1955,13 +1960,37 @@ void ScrollFeedToBottom(bool force) {
     }
 }
 
+// 改造1（流式生长卡片）：UI_CARD_RENDER 处理前，drain tick 把 pi_card::PreviewAdopt() 的结果
+// 存进这里；CardBeginRow 若看到它非空就接管那一行而不新建，一帧换装。s_card_adopted 记这次
+// begin_row() 是不是命中了 adopt——OnRenderEvent 收尾决定 PlayCardEntrance 的 adopted 参数要
+// 读它（见 ConsumeCardAdopted，注册进 FeedHooks.last_row_adopted）。
+lv_obj_t* s_adopt_row = nullptr;
+bool s_card_adopted = false;
+bool ConsumeCardAdopted() {
+    bool v = s_card_adopted;
+    s_card_adopted = false;
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // pi_card 声明式 UI 卡片的消息流接入点（pi_card::SetFeedHooks 注册；LVGL 线程）。
 // 在 feed 末尾建一个全宽透明行给卡片渲染，并把常驻 act_line 钉回最后（同 tool
 // card 的插入惯例）；渲染完滚到底。卡片 root 的 depth0 会自带卡片外观，故这里
 // 的行仅作占位包装、透明。ClearFeed 会连同删除，卡片经 root 的 DELETE 自清理。
+//
+// 改造1：s_adopt_row 非空时（真卡片渲染前，drain tick 已用 PreviewAdopt() 从流式预览会话
+// 接管了这一行）直接复用它——lv_obj_clean 清掉预览子节点（零绑定零注册，随便清）、跳过
+// s_act_line 重新定位（这行早就在正确位置，s_act_line 也没挪过）、置 s_card_adopted 供
+// OnRenderEvent 收尾判断入场动效走 adopted 分支。
 // ---------------------------------------------------------------------------
 lv_obj_t* CardBeginRow() {
+    if (s_adopt_row != nullptr) {
+        lv_obj_t* row = s_adopt_row;
+        s_adopt_row = nullptr;
+        lv_obj_clean(row);
+        s_card_adopted = true;
+        return row;
+    }
     if (s_feed == nullptr) return nullptr;
     lv_obj_t* row = lv_obj_create(s_feed);
     screen_strip_obj_chrome(row);
@@ -2043,6 +2072,15 @@ void DrainQueueTick(lv_timer_t*) {
     // 会话代次过滤：new_session 后旧 run 仍在 unwind，其残余 TEXT_DELTA/TOOL_*
     // 携带旧代次——直接丢弃，不污染新会话（也避免触碰已被 ClearFeed 清空的游标）。
     uint32_t cur_gen = pi_agent_task_session_gen();
+    // 改造1：预览若跨会话/被打断（诞生代次与本 tick 的 cur_gen 不符）存活到了这里，撤除——
+    // 不能指望预览自己的事件流被 gen 过滤器丢弃就自动清干净，它是纯 drain 侧本地状态，不在
+    // pi_ui_queue 事件通路上。
+    pi_card::PreviewCheckGen(cur_gen);
+    // 同一 tick 内若挤了多条 UI_TOOL_ARGS（如 delta 密集到超过一个 tick 处理不完），只留
+    // 最新一条——partial 树是"整段重新 parse 出的累积快照"，更早的几条已经是它的严格子集，
+    // 处理它们纯属浪费。转移所有权到 pending_preview_args（把 evt.s1 置空，防循环末尾的统一
+    // free 重复释放），循环结束后统一处理这一条、再 free。
+    char* pending_preview_args = nullptr;
     while (budget-- > 0 && xQueueReceive(q, &evt, 0) == pdTRUE) {
         if (evt.gen != cur_gen) {
             if (evt.s1 != nullptr)
@@ -2056,6 +2094,7 @@ void DrainQueueTick(lv_timer_t*) {
         touched = true;
         switch (evt.kind) {
             case UI_AGENT_START:
+                pi_card::PreviewTeardown();  // 新一轮开始：上一轮若有残留预览（不该有，兜底）先清
                 s_agent_busy = true;
                 ShowStopBtn();
                 pi_agent_task_tts_clear_cut();  // 新 run 自带 run_start，无需也不该再切
@@ -2105,6 +2144,8 @@ void DrainQueueTick(lv_timer_t*) {
                 FinalizeMdView();
                 s_turn_tool_count++;
                 const char* name = evt.s1 != nullptr ? evt.s1 : "tool";
+                s_cur_tool_is_render = std::strcmp(name, "ui_render") == 0;
+                pi_card::PreviewOnToolStart(name);
                 if (!s_zen) {
                     // Same fix as the thinking row above: pin s_act_line to
                     // the end instead of moving the card to s_act_line's
@@ -2123,7 +2164,11 @@ void DrainQueueTick(lv_timer_t*) {
                 break;
             }
             case UI_TOOL_ARGS:
-                if (!s_zen && s_cur_tool_body_args_lbl != nullptr && evt.s1 != nullptr) {
+                if (s_cur_tool_is_render) {
+                    if (pending_preview_args != nullptr) free(pending_preview_args);  // 丢更早的一条
+                    pending_preview_args = evt.s1;
+                    evt.s1 = nullptr;  // 所有权转移，循环末尾的统一 free 不再碰它
+                } else if (!s_zen && s_cur_tool_body_args_lbl != nullptr && evt.s1 != nullptr) {
                     char buf[320];
                     std::snprintf(buf, sizeof(buf), "#%06X args#    %s",
                                   static_cast<unsigned>(pi_theme::Hex(Tok::Faint)), evt.s1);
@@ -2131,6 +2176,8 @@ void DrainQueueTick(lv_timer_t*) {
                 }
                 break;
             case UI_TOOL_END: {
+                pi_card::PreviewOnToolEnd();  // 若预览还活着（没被真卡片 adopt）说明校验失败等，撤除
+                s_cur_tool_is_render = false;
                 if (s_tool_running_timer != nullptr) {
                     lv_timer_delete(s_tool_running_timer);
                     s_tool_running_timer = nullptr;
@@ -2204,6 +2251,7 @@ void DrainQueueTick(lv_timer_t*) {
                 stat_dirty = true;
                 break;
             case UI_DONE: {
+                pi_card::PreviewTeardown();  // 回合结束：预览不该活过整个回合，兜底撤除
                 // Symmetric with UI_ERROR: defensively stop the think/tool
                 // timers here too. Normally THINKING_END / TOOL_END already
                 // deleted them, but a turn can finish while one is still open
@@ -2263,6 +2311,7 @@ void DrainQueueTick(lv_timer_t*) {
                 break;
             }
             case UI_ERROR: {
+                pi_card::PreviewTeardown();  // 出错收尾：预览不该活过整个回合，兜底撤除
                 // Not a modal -- reading can continue around it. Real
                 // transports hit this path on genuine network/API failures,
                 // so the banner's retry has to actually work (it resends the
@@ -2297,7 +2346,19 @@ void DrainQueueTick(lv_timer_t*) {
                     batched_text.clear();
                 }
                 FinalizeMdView();
+                // 改造1：真卡片就要渲染了——若有一个存活的流式预览合格接管，取走它的 row 供
+                // CardBeginRow 复用（一帧换装）；PreviewAdopt 内部已判过 gen/disqualified，这里
+                // 不用再管，可能为 nullptr（没有预览在跑，走老路径新建行）。
+                s_adopt_row = pi_card::PreviewAdopt();
                 pi_card::OnRenderEvent(evt.s1, evt.s2, evt.i1, evt.i2, evt.s3);
+                // 安全网：s_adopt_row 只有 chat 分支的 CardBeginRow 会消费。真卡片万一走了
+                // pin/overlay 分支（预览阶段判定 display 缺省=chat，但最终完整参数在预览判定
+                // 之后才吐出非 chat 的 display——理论小概率，仍要防），这里发现它还没被取走
+                // 就得自己删掉，否则是一行永远清不掉的孤儿行（CardBeginRow 不会再被调用）。
+                if (s_adopt_row != nullptr) {
+                    lv_obj_delete(s_adopt_row);
+                    s_adopt_row = nullptr;
+                }
                 break;
             }
             case UI_CARD_UPDATE:
@@ -2310,6 +2371,10 @@ void DrainQueueTick(lv_timer_t*) {
         if (evt.s1 != nullptr) free(evt.s1);
         if (evt.s2 != nullptr) free(evt.s2);
         if (evt.s3 != nullptr) free(evt.s3);
+    }
+    if (pending_preview_args != nullptr) {
+        pi_card::PreviewOnArgs(pending_preview_args, cur_gen);
+        free(pending_preview_args);
     }
     if (!batched_text.empty()) AppendAssistantText(batched_text.c_str());
     if (stat_dirty) UpdateDockStat();
@@ -3725,6 +3790,7 @@ lv_obj_t* PiScreen::Create() {
     card_hooks.end_row = CardEndRow;
     card_hooks.pin_host = []() -> lv_obj_t* { return s_pin_host; };
     card_hooks.on_pin_changed = [](bool has_pin) { ApplyPinLayout(has_pin); };
+    card_hooks.last_row_adopted = ConsumeCardAdopted;
     pi_card::SetFeedHooks(card_hooks);
 
     // Phase3：invoke 命令注册表——net.reconnect/bt.reconnect/net.switch_type 在

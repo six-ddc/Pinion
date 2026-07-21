@@ -54,6 +54,52 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
 // update：把 props（cJSON 对象）套到已有控件上。未知字段忽略。
 bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err);
 
+// 卡片入场动效：opa 0→255（220ms ease_out）+（非 adopted 时）translate_y 12→0（同 220ms，
+// LV_STYLE_TRANSLATE_Y 风格属性，不直接改 y——卡片在 flex 布局里，直改 y 会被布局吃掉）。调用
+// 方须在卡片最终布局定型之后调用（chat: s_feed.end_row() 之后；overlay: ReflowOverlay +
+// AddOverlayCloseButton 之后），绝不能挂在 data 增量刷新路径（RefreshDataConsumers/
+// OnUpdateEvent）上，否则每次数值更新都会重播入场。adopted=true（预留给未来"接手复用旧节点"
+// 路径，如改造4 list 行级复用；pi_card 目前永远整卡重渲，调用点一律传 false）时只做 120ms
+// opa 淡入、不带位移，避免复用内容还跟着跳一截。tree 是 RenderNode 建出来的 root 子树，不是
+// wrapper/行容器本身。息屏时（IsScreenOff，pi_card_host.h）直接跳过，不起任何动画。
+void PlayCardEntrance(lv_obj_t* tree, bool adopted);
+
+// ---------------------------------------------------------------------------
+// 流式生长卡片（改造1）专用的"预览渲染"——只画外观，零 bind/零事件/零 id 注册进
+// card->nodes/零 DataConsumer 登记，因为流式阶段既没有 UiCard 也没有校验过的合法 bind 路径。
+// 与 RenderNode 共用同一套 type 分派/样式助手，但 list/chart/stock_chart 三种数据驱动或自管
+// 生命周期的类型直接跳过不建。限额沿用 64 节点/8 层，用独立计数（不占用正式渲染的
+// RenderLimits/node_count），超限只是静默停止生长，不报错——预览允许"半棵树"。
+
+// 一次性整棵渲染 node（及其全部子树，若是 column/row）：用于 (a) 流式会话第一次出现可渲染
+// 内容时的初始建树，(b) 位置游标推进时把"已确定不再变"的兄弟节点渲染成最终形。会给自己建出
+// 的每个 column/row 打 LV_OBJ_FLAG_USER_2（内部惯用记号，标记"这是一个预览容器，可以被
+// PreviewSyncContainer 继续增量同步"）+ user_data 记一个 committed 游标（= 已建子节点数-1，
+// 即认定最后一个子节点仍是"生长边"，留给下一次调用去继续对齐）。
+lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count);
+
+// 位置游标增量对齐：lv_container 是先前调用建出的、打了 USER_2 标记的容器；json_container 是
+// 它这次收到的最新 partial 节点（读它的 "children" 数组，N 个孩子）。[0, N-2]（如果还没被上
+// 一轮标成 committed）逐个渲成最终形；第 N-1 个（生长边）走 SyncPreviewNode 原地更新/递归/
+// 删旧重建。已定稿区间的 lv_obj 指针跨调用不变——只有生长边那一个位置会被反复替换或原地更新。
+void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
+                          int& node_count);
+
+// 单个位置的"生长边"同步：existing 是当前挂在这个位置的 lv 对象（可为 nullptr，表示这个位置
+// 之前还没能渲出东西）；node_spec 是这个位置最新的 partial 节点。返回这个位置最终对应的 lv
+// 对象（可能与 existing 相同——原地更新；也可能是新建的——删旧重建）。column/row 类型且
+// existing 已带 USER_2 标记时递归调 PreviewSyncContainer 继续往深处生长（保住已定稿的孙子）；
+// 类型不符/首次出现则整棵重建。label 类型原地 lv_label_set_text（不重建，长文本不闪烁）；
+// 其它叶子类型无状态可原地更新，统一删旧重渲（成本低，也是团队定稿点名的做法）。这是
+// PreviewSyncContainer 的生长边分支与流式会话顶层 tree 同步共用的唯一入口。
+lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
+                          int& node_count);
+
+// 预算重算：删除节点时不精确回补 node_count（子树带走几个节点不值得追踪），调用方
+// （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后应该用这个函数对整棵预览树重新计数，
+// 作为下一帧的准确起点。不计入占位对象（RenderPreviewNode 内部的 USER_3 标记）。
+int CountPreviewNodes(lv_obj_t* tree);
+
 // ---- data 值格式化 / list 行模板替换（RenderNode 的 list/data-label 分支与
 // pi_card_host.cc 的 RefreshDataConsumers 共用，故跨 TU 可见而非 render.cc 内部静态）----
 

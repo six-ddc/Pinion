@@ -37,6 +37,19 @@ struct RenderLimits {
     int max_depth = 8;
 };
 
+// 数值 label 插值动画的 ctx（bind 到非 String 类型 hub 路径的 label 用，见 pi_card_render.cc
+// 的 ApplyBind/NumScrollObserverCb/NumScrollExecCb）：subject 变化时不再走原生
+// lv_label_bind_text 的一次性跳变，改手动 observer 读到新值后从当前显示值滚动过渡到新值
+// （250ms）。anim 的 var 直接是 label 对象本身（不是这个 ctx）——LVGL9 删对象时会自动清掉挂在
+// 它上面的动画（lv_obj_destructor 里的 lv_anim_delete(obj, NULL)，已读 lv_obj.c 核实），故不
+// 需要像 ChoiceCtx/HwWriteback 那样再挂一个 LV_EVENT_DELETE 回调去手动打断在途动画。ctx 本身
+// 借 lv_obj_set_user_data(label, ctx) 挂在 label 上供 exec_cb 反查 fmt；放进 UiCard::num_anims
+// （list，地址稳定，不随扩容搬迁）随卡片存活，无需单独 new/free。
+struct LabelNumAnim {
+    const char* fmt = nullptr;  // 借自 card->str_pool 的稳定地址；nullptr 时退化用 "%d"
+    int32_t shown = 0;          // 当前显示值，同时是下一轮插值的起点
+};
+
 struct UiCard {
     std::string id;
     lv_obj_t* root = nullptr;                 // 挂 DELETE 清理的对象（chat=行 / overlay=scrim）
@@ -49,6 +62,7 @@ struct UiCard {
     // 释放。把 fmt 存进这个地址稳定（list 不搬迁元素）、随卡片存活的池里再传给绑定，
     // 覆盖 observer 的整个存活期，杜绝读悬垂 fmt 把后续刷新格式化成乱码。
     std::list<std::string> str_pool;
+    std::list<LabelNumAnim> num_anims;        // 数值 label 插值动画状态，见上方结构体注释
     lv_timer_t* ttl_timer = nullptr;          // overlay 自动关闭（一次性）
 
     // ---- 卡级 data 模型（spec/data 分离，见 Phase2）----
@@ -66,6 +80,18 @@ struct UiCard {
         int eff_max = 0;                       // List：预留/重渲行上限
         int depth = 0;                         // List：容器所在深度（重渲行传 depth+1）
         RenderLimits limits;                    // List：重渲计数用
+        // ---- 改造4：行级 fast path（轻量版）----
+        // 行定位不额外存指针数组——靠"list 容器子节点顺序 == 数组下标"这条不变量，直接
+        // lv_obj_get_child(dc.obj, i) 按位取行，少一份要跟数据同步的状态。empty_shown 为真时
+        // 容器唯一的子节点是 empty_text 占位 label（不是行），fast path 处理任何操作前都要看
+        // 一眼这个标志，别把占位 label 当成第 0 行。
+        bool empty_shown = false;              // List：当前是否正显示 empty_text 占位（0 行）
+        bool tpl_uses_index = false;           // List：行模板序列化后出现过 "{i}"/"{n}" 子串——
+                                                // remove 会让后续行的下标整体前移，这类模板的
+                                                // 显示内容会跟着过时，remove 操作必须退回全量
+                                                // 重建（append/replace 不影响其它行下标，不受
+                                                // 此限制）。RenderNode 渲染时用 TemplateUsesIndex
+                                                // 扫一次算出存下来，不必每次 update 都重扫模板。
     };
     std::vector<DataConsumer> consumers;
 };
@@ -76,11 +102,18 @@ struct FeedHooks {
     void (*end_row)();         // 渲染完做滚动到底等收尾
     lv_obj_t* (*pin_host)();          // 常驻卡的父容器（待机屏，仅 Idle 可见）；未就绪返回 nullptr
     void (*on_pin_changed)(bool has_pin);  // pin 有/无变化时通知（ApplyPinLayout 收缩/复原时钟区）
+    // 改造1：上一次 begin_row() 是不是命中了流式预览的 adopt（一帧换装）而非新建行——读一次
+    // 就清零。OnRenderEvent 收尾据此决定 PlayCardEntrance 的 adopted 参数。
+    bool (*last_row_adopted)();
 };
 
 // ---- 启动期一次性（PiScreen::Create，LVGL 线程）----
 void Init();  // 注册 DataHub 内置路径（幂等）
 void SetFeedHooks(const FeedHooks& hooks);
+// 转发 FeedHooks 的 begin_row/end_row 给 pi_card_preview.cc（流式生长卡片预览会话），见
+// pi_card_host.cc 头注。
+lv_obj_t* FeedBeginRow();
+void FeedEndRowOnce();
 
 // ---- drain-tick 入口（LVGL 线程，无需显示锁）----
 // data_json：卡级 data（object 字面量的 JSON 串，走 pi_ui_evt_t.s3），无则传 nullptr/空。
@@ -104,6 +137,10 @@ bool HasOpenOverlay();
 // 刷新与 stock 行情拉取——屏全黑还在刷 subject/拉网络纯属浪费电；keep_history 采样与
 // 在途结果落地不受影响。off=false 立即补种/补拉，亮屏第一帧即新值。幂等。
 void SetScreenOff(bool off);
+// 当前是否处于 SetScreenOff(true) 状态——卡片入场动画（PlayCardEntrance，pi_card_render.cc）
+// 与数值 label 插值动画（同文件 NumScrollObserverCb）息屏时都跳过：黑屏没人看得见，白白占
+// 一轮 lv_anim tick。
+bool IsScreenOff();
 
 // 可见性反查（LVGL 线程）：是否存在「当前可见」（lv_obj_is_visible——含滚出视口、藏在
 // 非活跃视图的判定）的卡绑定了以 prefix 开头的 DataHub 路径。stock 的 bind 订阅（背后是

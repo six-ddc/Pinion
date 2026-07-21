@@ -24,6 +24,12 @@
 
 #define LV_USE_SNAPSHOT 1
 
+/* 迟到属性修复取证（任务 #7 点 1）：真机 sdkconfig 开着 CONFIG_LV_USE_ASSERT_STYLE=y，sim
+ * 之前没开，测不出"预览路径漏调 EnsureCardStyles() 导致对未初始化静态 lv_style_t 调
+ * lv_obj_add_style"这类真机挂起风险——补开，sim 从此比真机断言配置更贴近，防以后再漏。
+ * 全套回归干净通过后决定保留（见任务报告）。 */
+#define LV_USE_ASSERT_STYLE 1
+
 /* pi_card v1 能力 3：qrcode 控件（依赖 canvas，两端均默认已开）。 */
 #define LV_USE_QRCODE 1
 

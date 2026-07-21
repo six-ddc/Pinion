@@ -444,6 +444,56 @@ void BarObserverCb(lv_observer_t* observer, lv_subject_t* subject) {
     if (bar) lv_bar_set_value(bar, lv_subject_get_int(subject), LV_ANIM_ON);
 }
 
+// ---- 数值 label 插值动画（非 String 类型 bind 路径专用，见下方 ApplyBind）----
+// 原生 lv_label_bind_text 收到 notify 就直接 lv_label_set_text_fmt，是一次性跳变；这里改手动
+// observer + 250ms 插值，让数字"滚"过去而不是硬切。anim 的 var 直接是 label 对象本身（不是
+// ctx）——LVGL9 删对象时自动清掉挂在它上面的动画（lv_obj_destructor 里的
+// lv_anim_delete(obj, NULL)，已读 managed_components/lvgl__lvgl/src/core/lv_obj.c:525 核实），
+// 不需要再挂一个 LV_EVENT_DELETE 回调去手动打断在途动画。ctx（fmt+当前显示值，来自
+// UiCard::num_anims，地址稳定不因扩容搬迁）借 lv_obj_set_user_data(label, ctx) 挂在 label
+// 上，供 exec_cb 反查。
+void NumScrollExecCb(void* var, int32_t v) {
+    lv_obj_t* label = static_cast<lv_obj_t*>(var);
+    auto* ctx = static_cast<LabelNumAnim*>(lv_obj_get_user_data(label));
+    if (!ctx) return;
+    ctx->shown = v;
+    // fmt 的 "%d" 要配 int 实参——int32_t 在本工具链是 long，直传给 -Wformat 报类型不符。
+    lv_label_set_text_fmt(label, ctx->fmt ? ctx->fmt : "%d", static_cast<int>(v));
+}
+
+void NumScrollObserverCb(lv_observer_t* observer, lv_subject_t* subject) {
+    lv_obj_t* label = lv_observer_get_target_obj(observer);
+    auto* ctx = static_cast<LabelNumAnim*>(lv_observer_get_user_data(observer));
+    if (!label || !ctx) return;
+    int32_t target = lv_subject_get_int(subject);
+    if (target == ctx->shown) return;  // 值没变（含注册时的首次立即回调），不必起一轮动画
+    // 息屏，或差值 <=1（典型 Bool 0/1、以及大多数整数路径的最小步进）：插值动画在这种小
+    // 差值上观感是"卡在 0 一下再跳"而非真正的"滚动"，不如直接跳变干脆（verify-m1 发现的
+    // 问题）。250ms 插值只留给差值 >=2 时真正能看出"滚"的场景。
+    if (IsScreenOff() || std::abs(target - ctx->shown) <= 1) {
+        ctx->shown = target;
+        lv_label_set_text_fmt(label, ctx->fmt ? ctx->fmt : "%d", static_cast<int>(target));
+        return;
+    }
+    lv_anim_delete(label, NumScrollExecCb);  // 打断上一轮还没播完的插值，避免两个 anim 抢同一个 var
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, label);
+    lv_anim_set_exec_cb(&a, NumScrollExecCb);
+    lv_anim_set_values(&a, ctx->shown, target);
+    lv_anim_set_duration(&a, 250);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+// ---- 卡片入场动效 exec_cb（公开入口 PlayCardEntrance 在本文件后段，见 pi_card_render.h）----
+void EntranceOpaExecCb(void* var, int32_t v) {
+    lv_obj_set_style_opa(static_cast<lv_obj_t*>(var), static_cast<lv_opa_t>(v), LV_PART_MAIN);
+}
+void EntranceYExecCb(void* var, int32_t v) {
+    lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(var), v, LV_PART_MAIN);
+}
+
 // ------------------------------ choice 复合控件 -----------------------------
 // 一行分段选择器：flex-row 容器 + N 个内部按钮。容器打 LV_OBJ_FLAG_USER_1 标记 +
 // lv_obj_set_user_data 挂堆上的 ChoiceCtx（当前选中下标/段数/按钮句柄），DELETE 时释放。
@@ -576,7 +626,18 @@ void ApplyBind(lv_obj_t* obj, const char* type, const char* path, const cJSON* n
         // cJSON_Delete 释放的节点树。intern 进 card 的字符串池（地址稳定、随卡片存活）
         // 再绑定，否则后续每次刷新都在读已释放内存 → label 格式化成乱码。
         if (fmt) fmt = card->str_pool.emplace_back(fmt).c_str();
-        lv_label_bind_text(obj, subj, fmt);
+        if (t == HubType::String) {
+            // 字符串没有"数值插值"的意义，维持原生 bind：一次性跳变直显新文本。
+            lv_label_bind_text(obj, subj, fmt);
+        } else {
+            // 数值路径（Int/Bool）：手动 observer + 250ms 插值滚动，见上方 NumScrollObserverCb。
+            LabelNumAnim& ctx = card->num_anims.emplace_back();
+            ctx.fmt = fmt;
+            ctx.shown = lv_subject_get_int(subj);
+            lv_label_set_text_fmt(obj, fmt ? fmt : "%d", static_cast<int>(ctx.shown));  // 种子初值，不过渡
+            lv_obj_set_user_data(obj, &ctx);  // exec_cb 用（NumScrollExecCb 反查 fmt/shown）
+            lv_subject_add_observer_obj(subj, NumScrollObserverCb, obj, &ctx);
+        }
     } else if (std::strcmp(type, "slider") == 0) {
         if (has_range) lv_slider_set_range(obj, lo, hi);
         lv_slider_bind_value(obj, subj);
@@ -625,6 +686,38 @@ bool SafeFont(const lv_font_t*& font, const char* text) {
         return true;
     }
     return false;
+}
+
+namespace {
+constexpr int32_t kEntranceSlideY = 12;
+constexpr uint32_t kEntranceDurationMs = 220;
+constexpr uint32_t kAdoptedFadeDurationMs = 120;
+}  // namespace
+
+void PlayCardEntrance(lv_obj_t* tree, bool adopted) {
+    if (!tree || IsScreenOff()) return;  // 息屏时不起动画：黑屏没人看得见，白白占一轮 anim tick
+
+    lv_obj_set_style_opa(tree, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, tree);
+    lv_anim_set_exec_cb(&a, EntranceOpaExecCb);
+    lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&a, adopted ? kAdoptedFadeDurationMs : kEntranceDurationMs);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+
+    if (!adopted) {
+        lv_obj_set_style_translate_y(tree, kEntranceSlideY, LV_PART_MAIN);
+        lv_anim_t ay;
+        lv_anim_init(&ay);
+        lv_anim_set_var(&ay, tree);
+        lv_anim_set_exec_cb(&ay, EntranceYExecCb);
+        lv_anim_set_values(&ay, kEntranceSlideY, 0);
+        lv_anim_set_duration(&ay, kEntranceDurationMs);
+        lv_anim_set_path_cb(&ay, lv_anim_path_ease_out);
+        lv_anim_start(&ay);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +815,21 @@ struct GridDsc {
     std::vector<int32_t> rows;  // 末尾 LV_GRID_TEMPLATE_LAST
 };
 void GridDscFreeCb(lv_event_t* e) { delete static_cast<GridDsc*>(lv_event_get_user_data(e)); }
+
+// 改造4：行模板里有没有出现过 {i}/{n}——这类模板拿"下标"当内容的一部分，remove 会让它后面
+// 的每一行下标整体前移（比如删掉第2行，原第3行变成第2行），但行级增量只重渲"确实被删的那
+// 一行"，不会连带刷新它后面的邻居们——remove 命中这种模板必须退回全量重建（append/replace
+// 不影响任何其它行的下标，不受此限，见 RefreshDataConsumers）。粗扫：整个模板序列化成一段
+// JSON 文本后找 "{i}"/"{n}" 子串，宁可误判 true（代价只是多退一次全量，安全）也不做逐字段精扫。
+// RenderNode 渲染 list 节点时调一次，结果存进 DataConsumer::tpl_uses_index，不必每次 update
+// 都重扫模板。
+bool TemplateUsesIndex(const cJSON* item_tpl) {
+    char* s = cJSON_PrintUnformatted(item_tpl);
+    if (!s) return false;
+    bool found = std::strstr(s, "{i}") != nullptr || std::strstr(s, "{n}") != nullptr;
+    cJSON_free(s);
+    return found;
+}
 
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
                      int depth, int& node_count, std::string& err, int parent_flow,
@@ -1011,6 +1119,8 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
             dc.eff_max = eff;
             dc.depth = depth;
             dc.limits = limits;
+            dc.empty_shown = (rows == 0 && empty_txt != nullptr);
+            dc.tpl_uses_index = TemplateUsesIndex(item);
             card->consumers.push_back(std::move(dc));
         }
     } else if (std::strcmp(type, "divider") == 0) {
@@ -1107,6 +1217,264 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         }
     }
     return obj;
+}
+
+// ---------------------------------------------------------------------------
+// 流式生长卡片（改造1）：预览渲染。见 pi_card_render.h 的详细头注。
+// LV_OBJ_FLAG_USER_2：内部惯用记号，标记"这是一个预览容器（column/row），已建成，其
+// user_data 存着一个 committed 游标"——USER_1 已被 choice 占用（pi_card_render.cc:501），
+// 这里换一位不冲突。user_data 的取值语义：这个容器已建出的子节点里，前 committed 个已经
+// 认定不会再变（"定稿"），第 committed 个（若存在）仍是"生长边"，随时可能被继续同步。
+// LV_OBJ_FLAG_USER_3：占位标记（见 MakePreviewPlaceholder）。
+constexpr int kPreviewMaxNodes = 64;
+constexpr int kPreviewMaxDepth = 8;
+
+// 位置占位：list/chart/stock_chart（数据驱动/自管生命周期，预览跳过不建实体）、未知 type、
+// 还没吐出 type 字段、超预算/超深度——这些位置本该"什么都不建"，但那样会打破
+// "LVGL 子节点下标 == JSON 子节点下标"的对齐关系（一旦某个 JSON 孩子没有对应的 lv 孩子，
+// PreviewSyncContainer/SyncPreviewNode 后续按下标定位全错位，可能把别的节点当成这个位置
+// 重渲/误判为已存在）——verify-m2 抓到的真实 bug。改成建一个 0×0、隐藏、不占预算的占位对象
+// 补上这个位置，下一帧只要类型可识别了，SyncPreviewNode 的"existing 类型不符 → 删旧重建"
+// 分支会自然把占位换成真身，无需额外分支。
+lv_obj_t* MakePreviewPlaceholder(lv_obj_t* parent) {
+    lv_obj_t* obj = lv_obj_create(parent);
+    screen_strip_obj_chrome(obj);
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_size(obj, 0, 0);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_USER_3);
+    return obj;
+}
+
+// 预算重算：node_count 在单次 PreviewOnArgs 调用内靠 ++node_count 实时计数（防止一帧里连续
+// 新建/晋升多个节点时超预算），但删除节点时不精确回补（子树到底带走了几个节点不值得追踪，
+// 容易算错——verify-m2 抓到的第二个真实 bug：只减 1，删掉的若是带孙子的子树就会少减）。
+// 每次 PreviewOnArgs 处理完一帧后改用这个函数全树重算一次，作为下一帧的准确起点——树本就不
+// 大（≤64），重算成本可忽略。占位对象（USER_3）不计数、不递归其子节点（它本来就没有子节点）。
+int CountPreviewNodes(lv_obj_t* obj) {
+    if (!obj) return 0;
+    int count = lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_3) ? 0 : 1;
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) count += CountPreviewNodes(lv_obj_get_child(obj, i));
+    return count;
+}
+
+lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count) {
+    if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
+    if (depth > kPreviewMaxDepth) return MakePreviewPlaceholder(parent);
+    const char* type = GetStr(node, "type");
+    if (!type) return MakePreviewPlaceholder(parent);  // 半吐的 type 字段（如 "labe）永远不会
+                                // 进树——partial parser 保证半个 key/value 不会出现，未识别
+                                // 只可能是"还没吐这个键"，占位等下一帧。
+    if (std::strcmp(type, "list") == 0 || std::strcmp(type, "chart") == 0 ||
+        std::strcmp(type, "stock_chart") == 0) {
+        return MakePreviewPlaceholder(parent);  // 数据驱动/自管生命周期类型：预览没有
+                         // card->data、没有 DataHub 订阅上下文，占位、不建实体、不占预算。
+    }
+    if (node_count >= kPreviewMaxNodes) return MakePreviewPlaceholder(parent);  // 预算耗尽：占位停止生长，不报错
+
+    lv_obj_t* obj = nullptr;
+    const bool is_container = std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0;
+
+    if (is_container) {
+        const bool is_row = std::strcmp(type, "row") == 0;
+        obj = lv_obj_create(parent);
+        screen_strip_obj_chrome(obj);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
+        int gap = GetInt(node, "gap", 12);
+        lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
+        lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
+        if (is_row) {
+            lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+        }
+    } else if (std::strcmp(type, "label") == 0) {
+        obj = lv_label_create(parent);
+        if (const char* txt = GetStr(node, "text")) {
+            lv_label_set_text(obj, txt);
+        } else if (GetStr(node, "bind") || GetStr(node, "bind_data")) {
+            lv_label_set_text(obj, "--");  // 绑定类 label 还没吐 text：占位，预览不读硬件值
+        }
+        lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        ApplyLabelStyle(obj, node);
+    } else if (std::strcmp(type, "icon") == 0) {
+        Tok tok = Tok::Dim;
+        ToneTok(GetStr(node, "tone", "dim"), tok);
+        obj = MakeIcon(parent, GetStr(node, "icon", GetStr(node, "name", "dot")),
+                       GetInt(node, "size", 22), tok);
+    } else if (std::strcmp(type, "button") == 0) {
+        obj = lv_button_create(parent);
+        lv_obj_t* lbl = lv_label_create(obj);
+        const char* text = GetStr(node, "text", "");
+        lv_label_set_text(lbl, text);
+        Tok fg = ApplyButtonStyle(obj, lbl, node);
+        if (const char* icon_name = GetStr(node, "icon")) {
+            lv_obj_t* ic = MakeIcon(obj, icon_name, GetInt(node, "size", 20), fg);
+            lv_obj_move_to_index(ic, 0);
+            lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(obj, 8, LV_PART_MAIN);
+            if (text[0] == '\0') lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_center(lbl);
+        }
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);  // 预览不可交互，不挂 on_click
+    } else if (std::strcmp(type, "slider") == 0) {
+        obj = lv_slider_create(parent);
+        int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
+        if (mx <= mn) mx = mn + 1;
+        lv_slider_set_range(obj, mn, mx);
+        if (HasKey(node, "value")) lv_slider_set_value(obj, GetInt(node, "value", 0), LV_ANIM_OFF);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else if (std::strcmp(type, "arc") == 0) {
+        obj = lv_arc_create(parent);
+        int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
+        if (mx <= mn) mx = mn + 1;
+        lv_arc_set_range(obj, mn, mx);
+        if (HasKey(node, "value")) lv_arc_set_value(obj, GetInt(node, "value", 0));
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else if (std::strcmp(type, "bar") == 0) {
+        obj = lv_bar_create(parent);
+        int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
+        if (mx <= mn) mx = mn + 1;
+        lv_bar_set_range(obj, mn, mx);
+        if (HasKey(node, "value")) lv_bar_set_value(obj, GetInt(node, "value", 0), LV_ANIM_OFF);
+    } else if (std::strcmp(type, "switch") == 0) {
+        obj = lv_switch_create(parent);
+        if (GetBool(node, "checked")) lv_obj_add_state(obj, LV_STATE_CHECKED);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else if (std::strcmp(type, "qrcode") == 0) {
+        obj = lv_qrcode_create(parent);
+        int sz = GetInt(node, "size", 160);
+        if (sz < 96) sz = 96;
+        else if (sz > 320) sz = 320;
+        lv_qrcode_set_size(obj, sz);
+        lv_qrcode_set_dark_color(obj, pi_theme::PaletteOf(true).tx);
+        lv_qrcode_set_light_color(obj, pi_theme::PaletteOf(true).bg);
+        const char* txt = GetStr(node, "text", "");
+        lv_qrcode_update(obj, txt, static_cast<uint32_t>(std::strlen(txt)));
+    } else if (std::strcmp(type, "choice") == 0) {
+        obj = MakeChoice(parent, node);
+    } else if (std::strcmp(type, "divider") == 0) {
+        obj = lv_obj_create(parent);
+        screen_strip_obj_chrome(obj);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_height(obj, 1);
+        pi_theme::ApplyBg(obj, Tok::Line);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+    } else if (std::strcmp(type, "spacer") == 0) {
+        obj = lv_obj_create(parent);
+        screen_strip_obj_chrome(obj);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_size(obj, 0, 0);
+    } else {
+        return MakePreviewPlaceholder(parent);  // 未知 type：预览静默跳过，不当错误（不是校验器）
+    }
+    if (!obj) return MakePreviewPlaceholder(parent);  // OOM 兜底
+
+    ++node_count;
+    ApplyDefaultStyle(obj, type, depth);  // depth==0 时含卡片外观（底色+圆角+边框+内边距）
+    // 预览版通用属性：只要外观相关的 pad/fill/hidden，不登记 id（预览没有 card->nodes）。
+    if (HasKey(node, "pad")) lv_obj_set_style_pad_all(obj, GetInt(node, "pad", 0), LV_PART_MAIN);
+    ApplyFill(obj, node);
+    if (GetBool(node, "hidden")) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    // ApplySizing 需要 parent_flow 判默认 grow/宽度，预览不追踪真实父容器主轴（这条信息只有
+    // 显式声明 w/h 时才不需要它），统一按 FLOW_COL 取默认值——近似，预览允许，真实渲染
+    // （RenderNode）才是权威。
+    ApplySizing(obj, type, node, FLOW_COL);
+
+    if (is_container) {
+        const cJSON* children = GetItem(node, "children");
+        if (children && cJSON_IsArray(children)) {
+            const cJSON* child = nullptr;
+            cJSON_ArrayForEach(child, children) {
+                RenderPreviewNode(obj, child, depth + 1, node_count);  // 静默跳过失败子节点
+            }
+        }
+        // 打预览容器记号 + 记 committed 游标：认定最后一个已建子节点仍是"生长边"，留给下次
+        // SyncPreviewNode/PreviewSyncContainer 继续对齐——无论这个容器是本次整棵新建、还是
+        // 上一轮生长边刚定形被 RenderPreviewNode 整棵重渲，规则统一，不需要区分调用来源。
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_USER_2);
+        int built = lv_obj_get_child_count(obj);
+        lv_obj_set_user_data(obj, reinterpret_cast<void*>(static_cast<intptr_t>(built > 0 ? built - 1 : 0)));
+    }
+    return obj;
+}
+
+lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
+                          int& node_count) {
+    const char* type = GetStr(node_spec, "type");
+    if (!type) {
+        // 类型还没吐出来：维持原状——但这个位置必须有个占位对齐下标（首次到达这个位置，
+        // existing 为 null 时补一个；已经有占位/半成品的话别重建，留着它，等类型可识别再换）。
+        return existing ? existing : MakePreviewPlaceholder(parent);
+    }
+    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
+        if (existing && lv_obj_has_flag(existing, LV_OBJ_FLAG_USER_2)) {
+            PreviewSyncContainer(existing, node_spec, depth, node_count);
+            return existing;  // 指针不变——递归深入继续生长，不推倒重来
+        }
+        if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算，不在此回补
+        return RenderPreviewNode(parent, node_spec, depth, node_count);
+    }
+    if (std::strcmp(type, "label") == 0) {
+        if (existing && lv_obj_check_type(existing, &lv_label_class)) {
+            if (const char* txt = GetStr(node_spec, "text")) {
+                lv_label_set_text(existing, txt);
+            } else if (GetStr(node_spec, "bind") || GetStr(node_spec, "bind_data")) {
+                lv_label_set_text(existing, "--");
+            }
+            return existing;  // 原地更新文本，不重建——长文本不闪烁
+        }
+        if (existing) lv_obj_delete(existing);
+        return RenderPreviewNode(parent, node_spec, depth, node_count);
+    }
+    // 其它叶子类型（button/icon/slider/arc/bar/switch/qrcode/choice/divider/spacer）：无状态
+    // 可原地更新，统一删旧重渲——这些类型的属性很少在生长过程中被反复触及，删旧重渲成本低、
+    // 实现也最不容易出错。
+    if (existing) lv_obj_delete(existing);
+    return RenderPreviewNode(parent, node_spec, depth, node_count);
+}
+
+void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
+                          int& node_count) {
+    if (depth > kPreviewMaxDepth) return;
+    const cJSON* children = GetItem(json_container, "children");
+    int n = (children && cJSON_IsArray(children)) ? cJSON_GetArraySize(children) : 0;
+    if (n == 0) return;  // 还没孩子，等下一帧
+    intptr_t committed = reinterpret_cast<intptr_t>(lv_obj_get_user_data(lv_container));
+    int lv_n = lv_obj_get_child_count(lv_container);
+
+    // 1) 定稿区 [committed, n-2]：这些位置后面已经出现了更晚的兄弟，证明不会再变了——逐个
+    //    渲染成最终形（若该位是上一轮生长边留下的半成品，先删再重渲）。
+    while (committed < n - 1) {
+        if (committed < lv_n) {
+            lv_obj_t* existing = lv_obj_get_child(lv_container, static_cast<uint32_t>(committed));
+            if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算
+            lv_n = lv_obj_get_child_count(lv_container);
+        }
+        RenderPreviewNode(lv_container, cJSON_GetArrayItem(children, static_cast<int>(committed)),
+                          depth + 1, node_count);
+        lv_n = lv_obj_get_child_count(lv_container);
+        committed++;
+    }
+
+    // 2) 生长边（第 n-1 个）：find-or-create，递归/原地更新/删旧重建三选一（见 SyncPreviewNode）。
+    lv_obj_t* existing_edge =
+        (lv_n > committed) ? lv_obj_get_child(lv_container, static_cast<uint32_t>(committed)) : nullptr;
+    SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1), depth + 1,
+                    node_count);
+    lv_obj_set_user_data(lv_container, reinterpret_cast<void*>(static_cast<intptr_t>(committed)));
 }
 
 bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err) {
