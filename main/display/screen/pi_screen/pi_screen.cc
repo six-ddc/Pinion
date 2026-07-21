@@ -3629,6 +3629,21 @@ lv_obj_t* PiScreen::Create() {
                          return static_cast<int>(e.temp_c10);  // 0.1 ℃
                      },
                      nullptr, pi_card::WorkerRead::Safe);
+        // temp_c10 的浮点显示配套：LLM 直觉给 "%.1f" 会被 fmt 校验拒（数值通道纯 int，
+        // vsnprintf 把 int 按 double 读是 UB；而且 %.1f 也换算不了 0.1℃ 单位——630 只会
+        // 打成 630.0）。String 路径 getter 里格式化好 "63.0"，模型 bind 它即得一位小数，
+        // 无需 fmt。负温 -0.1~-0.9℃ 区间整除会丢符号，手动补（t<0 前缀 '-'，各段取绝对值）。
+        hub.Register("battery.temp_c", pi_card::HubType::String,
+                     []() -> pi_card::HubValue {
+                         mhal::power::BatteryExt e;
+                         mhal::power::GetBatteryExt(e);
+                         const int t = static_cast<int>(e.temp_c10);
+                         const int a = t < 0 ? -t : t;
+                         char buf[16];
+                         std::snprintf(buf, sizeof(buf), "%s%d.%d", t < 0 ? "-" : "", a / 10, a % 10);
+                         return std::string(buf);
+                     },
+                     nullptr, pi_card::WorkerRead::Safe);
         hub.Register("battery.tte_min", pi_card::HubType::Int,
                      []() -> pi_card::HubValue {
                          mhal::power::BatteryExt e;
