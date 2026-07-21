@@ -1,0 +1,4 @@
+## media_player 组件依赖：乐鑫官方音频解码库（esp_audio_simple_dec 独立 API，不引 GMF；
+## MP3/AAC 闭源 .a 按芯片发布，esp32p4 齐全）。sim 不走这里（可移植解码器见 sim/shim）。
+dependencies:
+  espressif/esp_audio_codec: "~2.6.0"
