@@ -1264,6 +1264,7 @@ int CountPreviewNodes(lv_obj_t* obj) {
     return count;
 }
 
+
 // 预览容器（column/row）几何：初建（RenderPreviewNode）和生长期每帧幂等重打（见
 // PreviewSyncContainer）共用同一份代码，避免两处各写一份产生行为漂移。宽高/flex flow/gap/
 // justify(主轴)/align(交叉轴) 全是幂等 style setter，不新建/不删除对象、不碰子节点指针——
@@ -1387,6 +1388,86 @@ bool PreviewSeedBindLabel(lv_obj_t* lbl, const cJSON* node, const char* path) {
     return true;
 }
 
+// ---- 预览期 bind_data 数据标签（值在 args 自己的 "data" 对象里，text 是 {value} 模板）----
+// 难点在流序：顶层 schema 属性序是 root → … → data，data 在整棵 root 之后才吐——root 流完
+// 时数据标签早已渲成 "--" 定稿，data 姗姗来迟没人刷新它们，只能干等 adopt。解法：建标签时
+// 打 LV_OBJ_FLAG_USER_4 + user_data 挂 ctx（key+模板；USER_1 choice/USER_2 预览容器/USER_3
+// 占位均已占用，USER_4 此前空闲；预览 label 的 user_data 空闲——正式渲染的 num-anim ctx 是
+// adopt 后另一棵树的事），每帧 PreviewOnArgs 处理完树同步后全树回刷一遍（≤64 节点走一趟
+// 指针树，代价可忽略；文本没变时跳过 set_text 不白白 invalidate）。
+// s_preview_data 指向 PreviewOnArgs 当帧快照树里的 "data" 对象，帧尾必须清回 nullptr——快照
+// 随后就被 cJSON_Delete，绝不允许跨帧存活（见 PreviewSetData 头注）。
+const cJSON* s_preview_data = nullptr;
+
+struct PreviewDataLabelCtx {
+    std::string key;
+    std::string tpl;
+};
+
+void PreviewDataLabelFreeCb(lv_event_t* e) {
+    lv_obj_t* lbl = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    delete static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(lbl));
+}
+
+void PreviewRenderDataLabel(lv_obj_t* lbl, const PreviewDataLabelCtx& ctx) {
+    std::string txt = "--";  // data 还没流到这个键：占位，绝不裸渲 "{value}%" 模板
+    if (const cJSON* v = s_preview_data ? GetItem(s_preview_data, ctx.key.c_str()) : nullptr) {
+        txt = ctx.tpl.empty() ? Stringify(v) : SubstDataValue(ctx.tpl, v);
+    }
+    if (std::strcmp(lv_label_get_text(lbl), txt.c_str()) != 0) SetPreviewLabelText(lbl, txt.c_str());
+}
+
+// 建 ctx（无则挂新、有则更新 key/模板——生长边 label 的 text 模板可能还在逐字吐）并渲一次。
+void PreviewBindDataLabel(lv_obj_t* lbl, const char* key, const char* tpl) {
+    PreviewDataLabelCtx* ctx = lv_obj_has_flag(lbl, LV_OBJ_FLAG_USER_4)
+                                   ? static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(lbl))
+                                   : nullptr;
+    if (ctx == nullptr) {
+        ctx = new PreviewDataLabelCtx();
+        lv_obj_set_user_data(lbl, ctx);
+        lv_obj_add_flag(lbl, LV_OBJ_FLAG_USER_4);
+        lv_obj_add_event_cb(lbl, PreviewDataLabelFreeCb, LV_EVENT_DELETE, nullptr);
+    }
+    ctx->key = key;
+    ctx->tpl = tpl != nullptr ? tpl : "";
+    PreviewRenderDataLabel(lbl, *ctx);
+}
+
+// 预览 label 文本统一决策，镜像正式渲染优先级：bind（DataHub 快照）> bind_data（partial data
+// 直读）> 静态 text。bind/bind_data 取不到值时 "--" 占位；静态 text 含 {value}/{v} 视为
+// bind_data 键还没流完的半成品模板，同样占位不裸渲（键到齐后签名变化会重渲走正路）。
+// 建标签（RenderPreviewNode）与原地更新（SyncPreviewNode）共用，保证两条路径口径一致。
+void PreviewLabelText(lv_obj_t* lbl, const cJSON* node) {
+    if (const char* bind = GetStr(node, "bind")) {
+        if (!PreviewSeedBindLabel(lbl, node, bind)) lv_label_set_text(lbl, "--");
+        return;
+    }
+    if (const char* dk = GetStr(node, "bind_data")) {
+        PreviewBindDataLabel(lbl, dk, GetStr(node, "text"));
+        return;
+    }
+    if (const char* txt = GetStr(node, "text")) {
+        if (std::strstr(txt, "{value}") != nullptr || std::strstr(txt, "{v}") != nullptr) {
+            lv_label_set_text(lbl, "--");
+            return;
+        }
+        SetPreviewLabelText(lbl, txt);
+    }
+}
+
+void PreviewSetData(const cJSON* data) { s_preview_data = cJSON_IsObject(data) ? data : nullptr; }
+
+void RefreshPreviewDataLabels(lv_obj_t* obj) {
+    if (obj == nullptr) return;
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_4)) {
+        if (auto* ctx = static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(obj))) {
+            PreviewRenderDataLabel(obj, *ctx);
+        }
+    }
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) RefreshPreviewDataLabels(lv_obj_get_child(obj, i));
+}
+
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count) {
     EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
     if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
@@ -1487,14 +1568,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         obj = lv_label_create(parent);
         lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
         ApplyLabelStyle(obj, node);  // 先落字体/角色，PreviewSeedBindLabel 的 SafeFont 才有正确基准
-        if (const char* txt = GetStr(node, "text")) {
-            SetPreviewLabelText(obj, txt);
-        } else if (const char* bind = GetStr(node, "bind");
-                   bind == nullptr || !PreviewSeedBindLabel(obj, node, bind)) {
-            if (bind != nullptr || GetStr(node, "bind_data")) {
-                lv_label_set_text(obj, "--");  // 取不到快照（Unsafe/动态路径）或 bind_data：占位
-            }
-        }
+        PreviewLabelText(obj, node);
     } else if (std::strcmp(type, "icon") == 0) {
         Tok tok = Tok::Dim;
         ToneTok(GetStr(node, "tone", "dim"), tok);
@@ -1657,14 +1731,7 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
 
     if (is_label) {
         if (same_sig && lv_obj_check_type(existing, &lv_label_class)) {
-            if (const char* txt = GetStr(node_spec, "text")) {
-                SetPreviewLabelText(existing, txt);
-            } else if (const char* bind = GetStr(node_spec, "bind");
-                       bind == nullptr || !PreviewSeedBindLabel(existing, node_spec, bind)) {
-                if (bind != nullptr || GetStr(node_spec, "bind_data")) {
-                    lv_label_set_text(existing, "--");
-                }
-            }
+            PreviewLabelText(existing, node_spec);  // 含 bind 快照重读/bind_data ctx 更新/模板护栏
             return existing;  // 原地更新文本，不重建——长文本不闪烁
         }
         if (existing) lv_obj_delete(existing);

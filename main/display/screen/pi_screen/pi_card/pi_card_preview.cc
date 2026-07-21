@@ -109,7 +109,13 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
         FeedEndRowOnce();  // 首次建行滚到可见；后续每次生长不再重复滚，不跟用户抢滚动位置
     }
 
+    // bind_data 上下文：data 在 schema 顶层排在 root 之后，多数帧里还是 nullptr——照传，
+    // 渲染器自己按"没值→占位"处理；到达后本帧内借给同步 + 回刷两步用，帧尾必须清空
+    // （snap 马上就被删，指针不许跨帧活）。
+    PreviewSetData(cJSON_GetObjectItem(snap, "data"));
     s_preview.tree = SyncPreviewNode(s_preview.row, s_preview.tree, root_spec, 0, s_preview.node_count);
+    RefreshPreviewDataLabels(s_preview.tree);  // data 迟到补渲已定稿的数据标签（见 render.h 头注）
+    PreviewSetData(nullptr);
     // 帧内 ++node_count 只保证本帧不超预算；删除节点时不精确回补（子树带走几个节点不值得
     // 追踪），故每帧收尾用 CountPreviewNodes 对整树重新计数一遍，做下一帧的准确起点——树很小
     // （≤64），重算成本可忽略，比精确维护增减量更不容易出错。

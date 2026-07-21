@@ -103,6 +103,18 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
 // 作为下一帧的准确起点。不计入占位对象（RenderPreviewNode 内部的 USER_3 标记）。
 int CountPreviewNodes(lv_obj_t* tree);
 
+// 流式预览的 partial data 上下文：PreviewOnArgs 每帧在 SyncPreviewNode 前把快照顶层的
+// "data" 对象借给渲染器（非 object/缺失传 nullptr 等效清空），bind_data 标签据此直显模板
+// 替换值；帧处理完必须再调一次传 nullptr 清空——指针指向即将被 cJSON_Delete 的快照树，
+// 绝不允许跨帧存活。
+void PreviewSetData(const cJSON* data);
+
+// bind_data 数据标签全树回刷：data 在顶层 schema 里排在 root 之后，root 流完时数据标签
+// 已定稿渲成 "--"，data 到达后靠这趟回刷补真值（USER_4 标记 + user_data ctx 定位，文本
+// 没变的跳过 set_text）。PreviewOnArgs 每帧在 SyncPreviewNode 之后、PreviewSetData(nullptr)
+// 之前调用。
+void RefreshPreviewDataLabels(lv_obj_t* tree);
+
 // ---- data 值格式化 / list 行模板替换（RenderNode 的 list/data-label 分支与
 // pi_card_host.cc 的 RefreshDataConsumers 共用，故跨 TU 可见而非 render.cc 内部静态）----
 
