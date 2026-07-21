@@ -596,20 +596,23 @@ static uint64_t now_ms(void) {
 /* per-run cursors (single in-flight prompt at a time, reset at AGENT_START) */
 static bool s_thinking_open = false;
 static uint64_t s_tool_start_ms = 0;
-/* latest assistant message's real usage (pi_usage_t), refreshed at every
- * MESSAGE_END so by AGENT_END it holds this run's final-turn numbers — the
- * AGENT_END event itself carries no message pointer (emit_simple zeroes it),
- * so this is the only way to get real input/output token counts onto DONE. */
-static uint32_t s_last_usage_input = 0;
-static uint32_t s_last_usage_output = 0;
+/* 会话累计用量：每条 assistant 消息的 MESSAGE_END 都累加（含多工具回合的中间消息，
+ * 旧实现只留最后一条、且被每轮覆盖——用户看到的 IN/OUT"每次发送就重置"即此）。
+ * IN 累加的是**完整 prompt 量**（input+cache_read+cache_write）：pi-c 的 usage.input
+ * 刨掉了 DeepSeek 上下文缓存命中部分（对算钱正确，对"消耗了多少 token"误导）。
+ * 跨 run 存活，rebuild_agent（new_session）清零；写在 worker/事件线程，读在 LVGL
+ * 线程（32 位对齐读写在目标架构原子，同 g_session_gen 的约定）。
+ * s_last_ctx_tokens = 最后一条 assistant 消息的完整 prompt 量 = 当前上下文占用。 */
+static uint32_t s_sess_in_tokens = 0;
+static uint32_t s_sess_out_tokens = 0;
+static uint32_t s_last_ctx_tokens = 0;
 
 static void on_event(const pi_agent_event_t *ev, void *user) {
     (void)user;
     switch (ev->kind) {
     case PI_AG_EV_AGENT_START:
         s_thinking_open = false;
-        s_last_usage_input = 0;
-        s_last_usage_output = 0;
+        /* 用量累计是会话级的，这里不清（只在 rebuild_agent 清零）。 */
         /* TTS run 生命周期由 UI 侧驱动（pi_screen 收到 UI_AGENT_START 时调
          * pi_agent_task_tts_run_start），这里只入 UI 队列。 */
         text_overflow_clear(); /* 新一轮：清掉上一轮/被打断轮残留的溢出正文 */
@@ -697,19 +700,21 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
             enqueue(UI_ERROR, strdup(msg), NULL, 0, 0);
             /* 出错停播由 UI 侧在 UI_ERROR 里调 pi_agent_task_tts_cancel。 */
         }
-        /* capture real usage off every assistant message; the last one seen
-         * before AGENT_END is this run's final turn (usage.input/.output are
-         * the provider-reported token counts, not an estimate). */
+        /* 每条 assistant 消息都累计真实 usage（provider 上报，非估算）：IN 取完整
+         * prompt 量（含缓存命中，见 s_sess_* 注释），OUT 取 output；同时记下本条的
+         * 完整 prompt 量作为当前上下文占用（CTX 显示用）。 */
         if (ev->message && ev->message->role == PI_ROLE_ASSISTANT) {
-            s_last_usage_input = ev->message->usage.input;
-            s_last_usage_output = ev->message->usage.output;
+            const pi_usage_t *u = &ev->message->usage;
+            s_last_ctx_tokens = u->input + u->cache_read + u->cache_write;
+            s_sess_in_tokens += s_last_ctx_tokens;
+            s_sess_out_tokens += u->output;
         }
         break;
 
     case PI_AG_EV_AGENT_END:
         /* TTS 收尾由 UI 侧在 UI_DONE 里调 pi_agent_task_tts_run_end。 */
         enqueue_text_delta(NULL); /* 冲掉结尾残留溢出正文，避免收尾缺字 */
-        enqueue(UI_DONE, NULL, NULL, (int)s_last_usage_input, (int)s_last_usage_output);
+        enqueue(UI_DONE, NULL, NULL, (int)s_sess_in_tokens, (int)s_sess_out_tokens);
         break;
 
     default:
@@ -779,6 +784,11 @@ static void rebuild_agent(void) {
     xSemaphoreGive(g_agent_mutex);
     if (!g_agent)
         ESP_LOGE(TAG, "rebuild_agent: pi_agent_create failed");
+    /* 会话级用量累计随新会话清零。此刻旧 run 一定已返回（destroy 契约），不会再有
+     * MESSAGE_END 竞争写入。 */
+    s_sess_in_tokens = 0;
+    s_sess_out_tokens = 0;
+    s_last_ctx_tokens = 0;
 }
 
 /* 原子取出待处理 prompt 并置空；返回值所有权移交调用方（用完 free），无则 NULL。 */
@@ -906,6 +916,19 @@ void pi_agent_task_abort(void) {
     xSemaphoreGive(g_agent_mutex);
 }
 
+void pi_agent_task_note(const char *text) {
+    if (!text || !text[0]) return;
+    xSemaphoreTake(g_agent_mutex, portMAX_DELAY); /* 防撞 worker 的 rebuild（destroy/create）窗口 */
+    if (g_agent) {
+        size_t n = 0;
+        pi_agent_transcript(g_agent, &n);
+        /* 会话里还没有任何消息（开机后从未对话/刚 new_session）：没有"对话中"可言，
+         * 丢弃——避免用户首个问题被塞进一条无关旧备注。 */
+        if (n > 0) pi_agent_steer(g_agent, text);
+    }
+    xSemaphoreGive(g_agent_mutex);
+}
+
 void pi_agent_task_inject(const char *text) {
     if (!g_agent || !text || !text[0]) return;
     if (g_running) {
@@ -969,6 +992,8 @@ uint32_t pi_agent_context_window(void) {
     return g_model ? (uint32_t)g_model->context_window : 0;
 #endif
 }
+
+uint32_t pi_agent_ctx_tokens(void) { return s_last_ctx_tokens; }
 
 bool pi_agent_tts_enabled(void) { return g_tts_enabled; }
 

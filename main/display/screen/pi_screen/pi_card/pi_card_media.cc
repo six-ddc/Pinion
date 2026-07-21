@@ -115,7 +115,7 @@ void ApplyId3Meta(std::string& title, std::string& subtitle, const std::string& 
     media_id3::Tags t = media_id3::ReadTags(path);
     if (!t.title.empty()) title = t.title;
     if (!t.album.empty() && !t.artist.empty()) {
-        subtitle = t.album + " \xc2\xb7 " + t.artist;  // "专辑 · 艺人"
+        subtitle = t.album + " · " + t.artist;  // "专辑 · 艺人"
     } else if (!t.album.empty()) {
         subtitle = t.album;
     } else if (!t.artist.empty()) {
@@ -195,7 +195,9 @@ char* RunRadio(const cJSON* args, bool* is_error) {
         cJSON_AddItemToArray(stations, o);
     }
     cJSON_AddStringToObject(out, "hint",
-                            "to play, call media mode:'play' with station_indices:[the index above]");
+                            "to play, call media mode:'play' with station_indices:[...] — include "
+                            "multiple stations (requested one first) so the user can switch channels "
+                            "with next/prev");
     char* printed = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     if (printed == nullptr) return Fail(is_error, "OOM");
@@ -242,13 +244,7 @@ char* RunPlay(const cJSON* args, bool* is_error) {
     const cJSON* jpaths = cJSON_GetObjectItemCaseSensitive(args, "paths");
 
     if (cJSON_IsArray(jstations) && cJSON_GetArraySize(jstations) > 0) {
-        std::vector<MediaItem> items;
-        const cJSON* el = nullptr;
-        cJSON_ArrayForEach(el, jstations) {
-            if (items.size() >= kMaxPlaylist) break;
-            if (!cJSON_IsNumber(el)) continue;
-            int i = static_cast<int>(el->valuedouble);
-            if (i < 0 || i >= static_cast<int>(media::kRadioStationCount)) continue;
+        auto station_item = [](int i) {
             const media::RadioStation& s = media::kRadioStations[i];
             MediaItem m;
             m.title = s.name;
@@ -256,9 +252,28 @@ char* RunPlay(const cJSON* args, bool* is_error) {
             m.path_or_url = s.url;
             m.is_stream = true;
             m.duration_s = 0;
-            items.push_back(std::move(m));
+            return m;
+        };
+        std::vector<int> idxs;
+        const cJSON* el = nullptr;
+        cJSON_ArrayForEach(el, jstations) {
+            if (idxs.size() >= kMaxPlaylist) break;
+            if (!cJSON_IsNumber(el)) continue;
+            int i = static_cast<int>(el->valuedouble);
+            if (i < 0 || i >= static_cast<int>(media::kRadioStationCount)) continue;
+            idxs.push_back(i);
         }
-        if (items.empty()) return Fail(is_error, "no valid station_indices (0-based into the radio list)");
+        if (idxs.empty()) return Fail(is_error, "no valid station_indices (0-based into the radio list)");
+        std::vector<MediaItem> items;
+        // 单台兜底：只点一个台时把播放列表扩成全部电台（自然序）、从所点台起播——
+        // 保证 Next/Prev 永远有台可切（收音机换台语义），不受模型是否传多台影响。
+        if (idxs.size() == 1) {
+            for (size_t i = 0; i < media::kRadioStationCount && items.size() < kMaxPlaylist; i++) {
+                items.push_back(station_item(static_cast<int>(i)));
+            }
+            return BuildPlayResult(is_error, items, idxs[0], "radio");
+        }
+        for (int i : idxs) items.push_back(station_item(i));
         return BuildPlayResult(is_error, items, 0, "radio");
     }
 

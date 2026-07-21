@@ -231,12 +231,13 @@ uint32_t s_think_start_ms = 0;
 uint32_t s_tool_start_ms = 0;
 int s_turn_tool_count = 0;
 std::string s_turn_last_tool_output;
-int s_out_tokens = 0;
+int s_out_tokens = 0;      // 会话累计输出（DONE.i2，跨轮累加）
 bool s_out_tokens_known = false;  // false until a real DONE.i2 exists (stream carries no count)
 int32_t s_ttfb_ms = -1;  // time to first text_delta this turn; -1 = not yet seen
 int s_ctx_pct = 0;
-bool s_ctx_known = false;  // false until a real DONE.i1 / context_window reading exists
-int s_in_tokens = 0;       // real usage.input from the last DONE, for the dock's "^" stat
+bool s_ctx_known = false;  // false until a completed turn provides pi_agent_ctx_tokens()
+uint32_t s_ctx_tokens = 0;  // 当前上下文占用（完整 prompt 量，含缓存命中）
+int s_in_tokens = 0;       // 会话累计输入（DONE.i1，完整 prompt 累加，见 pi_ui_bridge.h）
 bool s_in_tokens_known = false;
 std::string s_last_user_prompt;  // for the error banner's retry action
 
@@ -476,22 +477,24 @@ void RenderCtxGauge() {
 void ApplyCtxUnknown() {
     s_ctx_known = false;
     s_ctx_pct = 0;
+    s_ctx_tokens = 0;
     RenderCtxGauge();
 }
 
-// input_tokens is DONE.i1 (real pi_usage_t.input, per pi_ui_bridge.h); the
-// context window is model.context_window via pi_agent_context_window().
-void ApplyCtxUsage(uint32_t input_tokens) {
-    uint32_t window = pi_agent_context_window();
-    if (window == 0) {
-        ApplyCtxUnknown();
-        return;
-    }
-    int pct = static_cast<int>((static_cast<uint64_t>(input_tokens) * 100) / window);
-    if (pct > 100) pct = 100;
-    if (pct < 0) pct = 0;
-    s_ctx_pct = pct;
+// ctx_tokens 来自 pi_agent_ctx_tokens()：最后一次请求的完整 prompt 量（含 DeepSeek
+// 缓存命中，见 pi_ui_bridge.h）——这才是当前上下文占用；DONE.i1 现在是会话累计输入，
+// 不能再拿来当上下文。pct 仅供 gauge（1M 窗口下常年 0-1%），文本显示走 token 数。
+void ApplyCtxUsage(uint32_t ctx_tokens) {
+    s_ctx_tokens = ctx_tokens;
     s_ctx_known = true;
+    uint32_t window = pi_agent_context_window();
+    int pct = 0;
+    if (window > 0) {
+        pct = static_cast<int>((static_cast<uint64_t>(ctx_tokens) * 100) / window);
+        if (pct > 100) pct = 100;
+        if (pct < 0) pct = 0;
+    }
+    s_ctx_pct = pct;
     RenderCtxGauge();
 }
 
@@ -753,10 +756,10 @@ void UpdateIdleClock(lv_timer_t*) {
                                        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
         char dbuf[32];
         if (tm_info.tm_year >= 2025 - 1900) {
-            std::snprintf(dbuf, sizeof(dbuf), "%s \xc2\xb7 %s %d", kWd[tm_info.tm_wday],
+            std::snprintf(dbuf, sizeof(dbuf), "%s · %s %d", kWd[tm_info.tm_wday],
                           kMo[tm_info.tm_mon], tm_info.tm_mday);
         } else {
-            std::snprintf(dbuf, sizeof(dbuf), "--- \xc2\xb7 --- --");
+            std::snprintf(dbuf, sizeof(dbuf), "--- · --- --");
         }
         lv_label_set_text(s_date_lbl, dbuf);
     }
@@ -768,7 +771,7 @@ void UpdateIdleClock(lv_timer_t*) {
                                         "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
         char sbuf[48];
         if (tm_info.tm_year >= 2025 - 1900) {
-            std::snprintf(sbuf, sizeof(sbuf), "%02d:%02d \xc2\xb7 %s \xc2\xb7 %s %d",
+            std::snprintf(sbuf, sizeof(sbuf), "%02d:%02d · %s · %s %d",
                           tm_info.tm_hour, tm_info.tm_min, kWd2[tm_info.tm_wday],
                           kMo2[tm_info.tm_mon], tm_info.tm_mday);
         } else {
@@ -854,7 +857,7 @@ void BuildIdleView(lv_obj_t* parent) {
     lv_obj_set_style_pad_column(hint, 16, LV_PART_MAIN);
 
     lv_obj_t* h1 = lv_label_create(hint);
-    lv_label_set_text(h1, "\xe6\x8c\x89\xe4\xbd\x8f\xe8\xaf\xb4\xe8\xaf\x9d");  // "按住说话"
+    lv_label_set_text(h1, "按住说话");
     SetLabelFont(h1, &font_puhui_24_4, Tok::Faint);
     lv_obj_t* h2 = lv_label_create(hint);
     lv_label_set_text(h2, "HOLD KEY / TOUCH TO TALK");
@@ -1013,13 +1016,13 @@ void BuildListenView(lv_obj_t* parent) {
     lv_obj_set_style_pad_hor(s_listen_pill, 30, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(s_listen_pill, 14, LV_PART_MAIN);
     s_listen_pill_lbl = lv_label_create(s_listen_pill);
-    lv_label_set_text(s_listen_pill_lbl, "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81");  // "松开发送"
+    lv_label_set_text(s_listen_pill_lbl, "松开发送");
     SetLabelFont(s_listen_pill_lbl, &font_puhui_24_4, Tok::Accent);
     lv_obj_set_style_text_letter_space(s_listen_pill_lbl, 2, LV_PART_MAIN);
 
     s_listen_cancel_hint = lv_label_create(mid);
     lv_label_set_text(s_listen_cancel_hint,
-                      "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\xaf\xe5\x8f\x96\xe6\xb6\x88");  // "^ 上滑可取消"
+                      "^ 上滑可取消");
     SetLabelFont(s_listen_cancel_hint, &font_puhui_20_4, Tok::Faint);
 }
 
@@ -1030,15 +1033,15 @@ void SetListenCancelState(bool armed) {
     pi_theme::ApplyBorder(s_listen_pill, armed ? Tok::Err : Tok::AccentDim);
     if (s_listen_pill_lbl != nullptr) {
         lv_label_set_text(s_listen_pill_lbl,
-                          armed ? "\xe6\x9d\xbe\xe5\xbc\x80\xe6\x89\x8b\xe6\x8c\x87\xef\xbc\x8c\xe5\x8f\x96\xe6\xb6\x88"   // "松开手指，取消"
-                                : "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x91\xe9\x80\x81");                                     // "松开发送"
+                          armed ? "松开手指，取消"
+                                : "松开发送");
         SetLabelFont(s_listen_pill_lbl, &font_puhui_24_4, armed ? Tok::Err : Tok::Accent);
         lv_obj_set_style_text_letter_space(s_listen_pill_lbl, 2, LV_PART_MAIN);
     }
     if (s_listen_cancel_hint != nullptr) {
         lv_label_set_text(s_listen_cancel_hint,
-                          armed ? "\xe6\x9d\xbe\xe5\xbc\x80\xe5\x8f\x96\xe6\xb6\x88 \xc2\xb7 \xe7\xa7\xbb\xe5\x9b\x9e\xe7\xbb\xa7\xe7\xbb\xad"  // "松开取消 · 移回继续"
-                                : "^ \xe4\xb8\x8a\xe6\xbb\x91\xe5\x8f\xaf\xe5\x8f\x96\xe6\xb6\x88");                                          // "^ 上滑可取消"
+                          armed ? "松开取消 · 移回继续"
+                                : "^ 上滑可取消");
         SetLabelFont(s_listen_cancel_hint, &font_puhui_20_4, armed ? Tok::Err : Tok::Faint);
     }
 }
@@ -1247,7 +1250,7 @@ void ShowErrorBanner(const char* message) {
 
     if (!s_last_user_prompt.empty()) {
         lv_obj_t* retry = lv_label_create(row);
-        lv_label_set_text(retry, "\xe9\x87\x8d\xe8\xaf\x95");  // "重试"
+        lv_label_set_text(retry, "重试");
         SetLabelFont(retry, &font_puhui_20_4, Tok::Accent);
         lv_obj_add_flag(retry, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(
@@ -1373,7 +1376,7 @@ lv_obj_t* CreateToolCard(lv_obj_t* parent, const char* name) {
     lv_obj_t* mark = MakeRect(partial_row, 6, 16, Tok::Faint);
     lv_obj_remove_flag(mark, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t* partial_lbl = lv_label_create(partial_row);
-    lv_label_set_text(partial_lbl, "partial \xe7\xad\x89\xe5\xbe\x85\xe6\xb5\x81\xe5\xbc\x8f\xe8\xbf\x94\xe5\x9b\x9e");
+    lv_label_set_text(partial_lbl, "partial 等待流式返回");
     SetLabelFont(partial_lbl, &font_puhui_20_4, Tok::Faint);
     s_cur_tool_body_partial_row = partial_row;
 
@@ -1431,7 +1434,7 @@ void OnPeekClicked(lv_event_t*) {
     if (!s_zen_turn_done) return;
     s_zen_peeking = !s_zen_peeking;
     if (s_zen_peeking) {
-        lv_label_set_text(s_act_peek, "\xe6\x94\xb6\xe8\xb5\xb7 ^");  // "收起 ^"
+        lv_label_set_text(s_act_peek, "收起 ^");
         s_peek_container = lv_obj_create(s_feed);
         screen_strip_obj_chrome(s_peek_container);
         lv_obj_remove_flag(s_peek_container, LV_OBJ_FLAG_SCROLLABLE);
@@ -1447,7 +1450,7 @@ void OnPeekClicked(lv_event_t*) {
         if (s_turn_had_thinking) {
             lv_obj_t* row = CreateThinkRow(s_peek_container);
             char buf[32];
-            std::snprintf(buf, sizeof(buf), "thinking \xc2\xb7 %s",
+            std::snprintf(buf, sizeof(buf), "thinking · %s",
                           FormatSecs1(s_turn_thinking_secs).c_str());
             lv_label_set_text(s_cur_think_lbl, buf);
             (void)row;
@@ -1458,13 +1461,13 @@ void OnPeekClicked(lv_event_t*) {
             StopBreath(s_cur_tool_dot);
             pi_theme::ApplyBg(s_cur_tool_dot, Tok::Ok);
             char ret[64];
-            std::snprintf(ret, sizeof(ret), "%s \xc2\xb7 %s", tc.output.c_str(),
+            std::snprintf(ret, sizeof(ret), "%s · %s", tc.output.c_str(),
                           FormatSecs1(tc.elapsed_ms / 1000.0f).c_str());
             lv_label_set_text(s_cur_tool_ret_lbl, ret);
             SetLabelFont(s_cur_tool_ret_lbl, &font_pi_mono_17, Tok::Ok);
         }
     } else {
-        lv_label_set_text(s_act_peek, "\xe6\x9f\xa5\xe7\x9c\x8b\xe8\xbf\x87\xe7\xa8\x8b >");  // "查看过程 >"
+        lv_label_set_text(s_act_peek, "查看过程 >");
         if (s_peek_container != nullptr) {
             lv_obj_delete(s_peek_container);
             s_peek_container = nullptr;
@@ -1584,13 +1587,26 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_set_flex_align(dock, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(dock, 24, LV_PART_MAIN);
 
-    s_dock_stat_lbl = lv_label_create(dock);
+    // 左列（占满余宽）：行1 = 紧凑媒体行（隐藏态，播放时浮现），行2 = token 统计。
+    // 媒体行 HIDDEN 时 flex 让 token 行自动回垂直居中。
+    lv_obj_t* left_col = lv_obj_create(dock);
+    screen_strip_obj_chrome(left_col);
+    lv_obj_remove_flag(left_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(left_col, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_height(left_col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(left_col, 1);
+    lv_obj_set_style_bg_opa(left_col, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(left_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(left_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(left_col, 4, LV_PART_MAIN);
+
+    pi_media::CreateInlineBar(left_col, /*gate_by_context=*/false);
+
+    s_dock_stat_lbl = lv_label_create(left_col);
     lv_label_set_text(s_dock_stat_lbl, "");
     SetLabelFont(s_dock_stat_lbl, &font_pi_mono_17, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_dock_stat_lbl, 1, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(s_dock_stat_lbl, 6, LV_PART_MAIN);
-
-    MakeSpacer(dock);
 
     s_dock_action_box = lv_obj_create(dock);
     screen_strip_obj_chrome(s_dock_action_box);
@@ -1618,7 +1634,7 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_t* stop_icon = MakeRect(s_stop_btn, 16, 16, Tok::Err);
     lv_obj_set_style_radius(stop_icon, 3, LV_PART_MAIN);
     lv_obj_t* stop_lbl = lv_label_create(s_stop_btn);
-    lv_label_set_text(stop_lbl, "STOP \xc2\xb7 \xe7\x9f\xad\xe6\x8c\x89 KEY");  // "STOP · 短按 KEY"
+    lv_label_set_text(stop_lbl, "STOP · 短按 KEY");
     // Mixed ASCII+CJK: needs the CJK font (mono has no "短按" glyphs).
     SetLabelFont(stop_lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_set_style_text_letter_space(stop_lbl, 1, LV_PART_MAIN);
@@ -1645,7 +1661,7 @@ void BuildDock(lv_obj_t* parent) {
     lv_obj_set_style_pad_column(s_talk_btn, 14, LV_PART_MAIN);
     MakeRing(s_talk_btn, 14, Tok::Accent, 2);
     lv_obj_t* talk_lbl = lv_label_create(s_talk_btn);
-    lv_label_set_text(talk_lbl, "\xe6\x8c\x89\xe4\xbd\x8f\xe8\xaf\xb4\xe8\xaf\x9d");  // "按住说话"
+    lv_label_set_text(talk_lbl, "按住说话");
     SetLabelFont(talk_lbl, &font_puhui_24_4, Tok::Accent);  // CJK text needs the CJK font
     lv_obj_set_style_text_letter_space(talk_lbl, 2, LV_PART_MAIN);
     void* ret_chat = reinterpret_cast<void*>(static_cast<intptr_t>(ViewState::Chat));
@@ -1795,9 +1811,9 @@ std::string TtsBlockPlain(const lvmd::Block& b) {
 // 句末标点、分号、换行，以及逗号（逗号作软停顿，降低首句发声延迟）。只喂到边界前的
 // 完整片段，绝不喂尾部——避免把还没闭合的行内标记（如半个 **）当字面读出来。
 size_t TtsLastBoundary(const std::string& full, size_t from) {
-    static const char* const kEnders[] = {"\xe3\x80\x82" /*。*/, "\xef\xbc\x81" /*！*/,
-                                          "\xef\xbc\x9f" /*？*/, "\xef\xbc\x9b" /*；*/,
-                                          "\xef\xbc\x8c" /*，*/, "\xe3\x80\x81" /*、*/,
+    static const char* const kEnders[] = {"。" /*。*/, "！" /*！*/,
+                                          "？" /*？*/, "；" /*；*/,
+                                          "，" /*，*/, "、" /*、*/,
                                           "\n", ".", "!", "?", ";", ","};
     size_t best = from;
     for (const char* e : kEnders) {
@@ -2011,7 +2027,7 @@ void ThinkTimerTick(lv_timer_t*) {
     float secs = (lv_tick_get() - s_think_start_ms) / 1000.0f;
     s_turn_thinking_secs = secs;
     char buf[48];
-    std::snprintf(buf, sizeof(buf), "thinking \xc2\xb7 %s", FormatSecs1(secs).c_str());
+    std::snprintf(buf, sizeof(buf), "thinking · %s", FormatSecs1(secs).c_str());
     if (s_cur_think_lbl != nullptr) lv_label_set_text(s_cur_think_lbl, buf);
     if (s_zen) lv_label_set_text(s_act_text, buf);
 }
@@ -2026,16 +2042,28 @@ void ToolRunningTimerTick(lv_timer_t*) {
     // ZEN：活动行只给中性活性（无工具名/无输出——ZEN 契约是过程完全收起，事后 peek）。
     if (s_zen && s_act_text != nullptr) {
         char zb[48];
-        std::snprintf(zb, sizeof(zb), "working \xc2\xb7 %s", FormatSecs1(secs).c_str());
+        std::snprintf(zb, sizeof(zb), "working · %s", FormatSecs1(secs).c_str());
         lv_label_set_text(s_act_text, zb);
     }
 }
 
-// 单行消耗簇：IN 输入 token · OUT 输出 token · CTX 上下文占用率。三者都在 DONE
-// 上报真实 pi_usage_t 前显示 "--"（不编造）：流式不携带真实 token 计数，OUT 尤
-// 其不能拿流式序号充数（bridge 契约里 i2 已保留不发序号），CTX 也在拿到真实占用
-// 率前显示 "--"。ttfb（首字延迟）是开发指标、对使用无意义，已按用户反馈去掉；CTX
-// 也不再画进度条，跟 IN/OUT 一样只写数字/百分比（原 "^"/"v" 亦改为直白的 IN/OUT）。
+// token 数紧凑格式：<1000 原样、<100k 一位小数 k（4380 -> "4.4k"）、其余整 k。
+void FmtTokens(int v, char* out, size_t n) {
+    if (v < 0) v = 0;
+    if (v < 1000) {
+        std::snprintf(out, n, "%d", v);
+    } else if (v < 100000) {
+        std::snprintf(out, n, "%d.%dk", v / 1000, (v % 1000) / 100);
+    } else {
+        std::snprintf(out, n, "%dk", v / 1000);
+    }
+}
+
+// 单行消耗簇：IN/OUT = 会话累计输入/输出 token（跨轮累加，new_session 归零；
+// bridge 侧每条 assistant 消息的真实 pi_usage_t 累加，IN 为完整 prompt 量），
+// CTX = 当前上下文占用 token 数（pi_agent_ctx_tokens；1M 窗口下百分比恒 0 无意义，
+// 直接显示 token 量）。三者都在拿到真实 usage 前显示 "--"（不编造）：流式不携带
+// 真实 token 计数，OUT 尤其不能拿流式序号充数（bridge 契约里 i2 已保留不发序号）。
 void UpdateDockStat() {
     if (s_dock_stat_lbl == nullptr) return;
     char stat[80];
@@ -2043,21 +2071,21 @@ void UpdateDockStat() {
     char out_part[16];
     char ctx_part[16];
     if (s_in_tokens_known) {
-        std::snprintf(in_part, sizeof(in_part), "%d", s_in_tokens);
+        FmtTokens(s_in_tokens, in_part, sizeof(in_part));
     } else {
         std::snprintf(in_part, sizeof(in_part), "--");
     }
     if (s_out_tokens_known) {
-        std::snprintf(out_part, sizeof(out_part), "%d", s_out_tokens);
+        FmtTokens(s_out_tokens, out_part, sizeof(out_part));
     } else {
         std::snprintf(out_part, sizeof(out_part), "--");
     }
-    if (s_ctx_known && pi_agent_context_window() > 0) {
-        std::snprintf(ctx_part, sizeof(ctx_part), "%d%%", s_ctx_pct);
+    if (s_ctx_known) {
+        FmtTokens(static_cast<int>(s_ctx_tokens), ctx_part, sizeof(ctx_part));
     } else {
         std::snprintf(ctx_part, sizeof(ctx_part), "--");
     }
-    std::snprintf(stat, sizeof(stat), "IN %s \xc2\xb7 OUT %s tok \xc2\xb7 CTX %s", in_part,
+    std::snprintf(stat, sizeof(stat), "IN %s · OUT %s tok · CTX %s", in_part,
                   out_part, ctx_part);
     lv_label_set_text(s_dock_stat_lbl, stat);
 }
@@ -2188,7 +2216,7 @@ void DrainQueueTick(lv_timer_t*) {
                     StopBreath(s_cur_tool_dot);
                     pi_theme::ApplyBg(s_cur_tool_dot, Tok::Ok);
                     char ret[128];
-                    std::snprintf(ret, sizeof(ret), "%s \xc2\xb7 %s", output,
+                    std::snprintf(ret, sizeof(ret), "%s · %s", output,
                                   FormatSecs1(evt.i1 / 1000.0f).c_str());
                     lv_label_set_text(s_cur_tool_ret_lbl, ret);
                     SetLabelFont(s_cur_tool_ret_lbl, &font_pi_mono_17, Tok::Ok);
@@ -2204,7 +2232,7 @@ void DrainQueueTick(lv_timer_t*) {
                     // ZEN 泄漏修复：原来这里无条件写 "name -> output"，而 ui_render/stock 的
                     // output 是大段 JSON，在 ZEN 可见的活动行上整坨铺开＝工具结果照样展示。
                     // ZEN 只给中性完成信号；完整过程仍进 s_tool_cache 供回合结束后 peek。
-                    std::snprintf(act, sizeof(act), "done \xc2\xb7 %s",
+                    std::snprintf(act, sizeof(act), "done · %s",
                                   FormatSecs1(evt.i1 / 1000.0f).c_str());
                 } else {
                     std::snprintf(act, sizeof(act), "%s -> %s", name, output);
@@ -2288,26 +2316,25 @@ void DrainQueueTick(lv_timer_t*) {
                 const char* last_out =
                     s_turn_last_tool_output.empty() ? "" : s_turn_last_tool_output.c_str();
                 if (s_turn_tool_count > 0) {
-                    std::snprintf(summary, sizeof(summary), "%d tool \xc2\xb7 %s \xc2\xb7 %s",
+                    std::snprintf(summary, sizeof(summary), "%d tool · %s · %s",
                                   s_turn_tool_count, last_out, FormatSecs1(total_secs).c_str());
                 } else {
-                    std::snprintf(summary, sizeof(summary), "done \xc2\xb7 %s",
+                    std::snprintf(summary, sizeof(summary), "done · %s",
                                   FormatSecs1(total_secs).c_str());
                 }
                 lv_label_set_text(s_act_text, summary);
                 if (s_turn_had_thinking || !s_tool_cache.empty()) {
-                    lv_label_set_text(s_act_peek, "\xe6\x9f\xa5\xe7\x9c\x8b\xe8\xbf\x87\xe7\xa8\x8b >");
+                    lv_label_set_text(s_act_peek, "查看过程 >");
                 }
-                // DONE carries the real pi_usage_t for this run (bridge
-                // contract: i1=usage.input, i2=usage.output) -- correct both
-                // the dock stat and the CTX gauge from it instead of the
-                // streaming approximation / a fabricated ratio.
+                // DONE 携带会话累计用量（bridge 契约：i1=累计输入完整 prompt，
+                // i2=累计输出）；当前上下文占用另取 pi_agent_ctx_tokens()——
+                // 二者语义已分家，不能再拿 i1 当上下文。
                 s_in_tokens = evt.i1;
                 s_in_tokens_known = true;
                 s_out_tokens = evt.i2;
                 s_out_tokens_known = true;
                 UpdateDockStat();
-                ApplyCtxUsage(static_cast<uint32_t>(evt.i1));
+                ApplyCtxUsage(pi_agent_ctx_tokens());
                 break;
             }
             case UI_ERROR: {
@@ -2416,8 +2443,9 @@ void Go(ViewState s) {
             if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
     }
-    // mini 播放条：Idle / Chat 可见，Listen 隐藏（Stage C）。
-    pi_media::SetMiniBarContext(s == ViewState::Idle || s == ViewState::Chat);
+    // 屏幕级紧凑媒体行只在 Idle 显示（Chat 的媒体行内嵌 dock、随 chat_view 显隐，
+    // Listen 两处天然全隐）。
+    pi_media::SetMiniBarContext(s == ViewState::Idle);
 }
 
 // pin 常驻组件的待机布局：出现时大时钟区整体隐藏（时间/日期上移到状态栏中央的迷你
@@ -2945,7 +2973,7 @@ void BuildNewSessionSheet(lv_obj_t* parent) {
     lv_obj_t* title = lv_label_create(sheet);
     // "开始新对话？"
     lv_label_set_text(title,
-                      "\xe5\xbc\x80\xe5\xa7\x8b\xe6\x96\xb0\xe5\xaf\xb9\xe8\xaf\x9d\xef\xbc\x9f");
+                      "开始新对话？");
     SetLabelFont(title, &font_puhui_30_4, Tok::Tx);
 
     s_sheet_meta_lbl = lv_label_create(sheet);
@@ -2954,10 +2982,8 @@ void BuildNewSessionSheet(lv_obj_t* parent) {
     lv_obj_set_style_text_letter_space(s_sheet_meta_lbl, 1, LV_PART_MAIN);
 
     lv_obj_t* note = lv_label_create(sheet);
-    // "当前对话将结束。"（P2 才有归档，本期不提找回）
-    lv_label_set_text(note,
-                      "\xe5\xbd\x93\xe5\x89\x8d\xe5\xaf\xb9\xe8\xaf\x9d\xe5\xb0\x86\xe7\xbb\x93\xe6"
-                      "\x9d\x9f\xe3\x80\x82");
+    // P2 才有归档，本期不提找回
+    lv_label_set_text(note, "当前对话将结束。");
     SetLabelFont(note, &font_puhui_20_4, Tok::Faint);
 
     lv_obj_t* btn_row = lv_obj_create(sheet);
@@ -2972,7 +2998,7 @@ void BuildNewSessionSheet(lv_obj_t* parent) {
 
     lv_obj_t* cancel_lbl = nullptr;
     lv_obj_t* cancel_btn = MakeSheetButton(btn_row, Tok::Line2, &cancel_lbl);
-    lv_label_set_text(cancel_lbl, "\xe5\x8f\x96\xe6\xb6\x88");  // "取消"
+    lv_label_set_text(cancel_lbl, "取消");
     SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Dim);
     lv_obj_add_event_cb(
         cancel_btn, [](lv_event_t*) { CloseNewSessionSheet(); }, LV_EVENT_CLICKED, nullptr);
@@ -2999,24 +3025,26 @@ void OpenNewSessionSheet() {
     if (pi_quick_panel::IsOpen())
         pi_quick_panel::Close();
 
-    // meta 行：轮数 · CTX · 时长（mono；取不到 CTX 显示 --）
-    char ctx[20];
-    if (s_ctx_known && pi_agent_context_window() > 0) {
-        std::snprintf(ctx, sizeof(ctx), "CTX %d%%", s_ctx_pct);
+    // meta 行：轮数 · CTX · 时长（mono；取不到 CTX 显示 --；token 数同 dock 语义）
+    char ctx[24];
+    if (s_ctx_known) {
+        char tokbuf[16];
+        FmtTokens(static_cast<int>(s_ctx_tokens), tokbuf, sizeof(tokbuf));
+        std::snprintf(ctx, sizeof(ctx), "CTX %s tok", tokbuf);
     } else {
         std::snprintf(ctx, sizeof(ctx), "CTX --");
     }
     uint32_t secs = (lv_tick_get() - s_session_start_ms) / 1000;
     char meta[96];
-    std::snprintf(meta, sizeof(meta), "%d turns \xc2\xb7 %s \xc2\xb7 %s", s_session_turns, ctx,
+    std::snprintf(meta, sizeof(meta), "%d turns · %s · %s", s_session_turns, ctx,
                   FormatSessionDuration(secs).c_str());
     lv_label_set_text(s_sheet_meta_lbl, meta);
 
     // 正在生成 -> 主按钮改「停止并新建」；否则「+ 新对话」（✚ 不在字体子集）
     lv_label_set_text(s_sheet_confirm_lbl,
                       IsGenerating()
-                          ? "\xe5\x81\x9c\xe6\xad\xa2\xe5\xb9\xb6\xe6\x96\xb0\xe5\xbb\xba"
-                          : "+ \xe6\x96\xb0\xe5\xaf\xb9\xe8\xaf\x9d");
+                          ? "停止并新建"
+                          : "+ 新对话");
 
     lv_obj_remove_flag(s_sheet_root, LV_OBJ_FLAG_HIDDEN);
     s_sheet_open = true;
@@ -3100,7 +3128,7 @@ void BuildConfirmSheet(lv_obj_t* parent) {
 
     lv_obj_t* cancel_lbl = nullptr;
     lv_obj_t* cancel_btn = MakeSheetButton(btn_row, Tok::Line2, &cancel_lbl);
-    lv_label_set_text(cancel_lbl, "\xe5\x8f\x96\xe6\xb6\x88");  // "取消"
+    lv_label_set_text(cancel_lbl, "取消");
     SetLabelFont(cancel_lbl, &font_puhui_24_4, Tok::Dim);
     lv_obj_add_event_cb(
         cancel_btn, [](lv_event_t*) { CloseConfirmSheet(); }, LV_EVENT_CLICKED, nullptr);
@@ -3125,7 +3153,7 @@ void ShowConfirmSheet(const std::string& title, const std::string& body,
     if (pi_quick_panel::IsOpen()) pi_quick_panel::Close();
     lv_label_set_text(s_confirm_title_lbl, title.c_str());
     lv_label_set_text(s_confirm_body_lbl, body.c_str());
-    lv_label_set_text(s_confirm_confirm_lbl, confirm_label.empty() ? "\xe7\xa1\xae\xe8\xae\xa4"
+    lv_label_set_text(s_confirm_confirm_lbl, confirm_label.empty() ? "确认"
                                                                    : confirm_label.c_str());  // "确认"
     s_confirm_on_confirm = std::move(on_confirm);
     lv_obj_remove_flag(s_confirm_sheet_root, LV_OBJ_FLAG_HIDDEN);
@@ -3447,9 +3475,17 @@ lv_obj_t* PiScreen::Create() {
     lv_obj_set_style_bg_opa(s_pin_host, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
 
-    // Stage C：常驻 mini 播放条。建在 pin host 之后（z 序压过 ptt 层，条上按钮可收到
-    // 触摸）、快捷面板/设置栈/媒体全屏页之前（那些不透明浮层自然遮住它）。
-    pi_media::CreateMiniBar(scr);
+    // Stage C：媒体呈现层初始化（记 screen 供全屏页 Open）+ Idle 屏幕级紧凑媒体行。
+    // 该行必须建在 ptt 层/pin host 之后（z 序压过 ptt 层才能收触摸）、快捷面板/设置栈/
+    // 媒体全屏页之前（那些不透明浮层自然遮住它）；位置视觉上融入底部提示带上沿，
+    //「按住说话」提示行仍居中在其下方。Chat 的媒体行内嵌 dock（BuildDock），不在此。
+    pi_media::Init(scr);
+    {
+        constexpr int32_t kIdleBarW = 460;
+        lv_obj_t* idle_bar = pi_media::CreateInlineBar(scr, /*gate_by_context=*/true);
+        lv_obj_set_size(idle_bar, kIdleBarW, 36);
+        lv_obj_set_pos(idle_bar, (kW - kIdleBarW) / 2, kSbarH + kMidH + 2);
+    }
 
     // P0 浮层：快捷面板在 ptt 层之上，新对话 sheet 再压一层（面板里的
     // 「新对话」要能弹出 sheet）。都常驻构建、HIDDEN 切换。

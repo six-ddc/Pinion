@@ -30,6 +30,7 @@
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
+#include "pi_ui_bridge.h"              // pi_agent_task_note：关闭播放器静默告知模型
 #include "screen_util.h"
 #include "settings.h"                  // NVS 持久化「media/last」
 
@@ -205,26 +206,30 @@ void FmtTime(int secs, char* out, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// mini 播放条（常驻，隐藏态；state != stopped 时浮现）
+// 紧凑媒体行（多实例：Chat dock 左列内嵌 + Idle 屏幕级；state != stopped 时浮现）
 // ---------------------------------------------------------------------------
-lv_obj_t* s_parent = nullptr;    // pi_screen 的 screen 对象
-lv_obj_t* s_mini = nullptr;      // mini 条根（Card）
-lv_obj_t* s_mini_title = nullptr;
-lv_obj_t* s_mini_sub = nullptr;
-lv_obj_t* s_mini_btn = nullptr;      // 右侧 play-pause 触区
-lv_obj_t* s_mini_glyph = nullptr;    // 该触区内的图元容器
-lv_obj_t* s_mini_prog = nullptr;     // 底部 2px 进度线
-bool s_mini_ctx = true;              // 当前视图是否允许显示（Go 设置）
-bool s_mini_shown = false;           // 当前实际可见（用于淡入触发一次）
+lv_obj_t* s_parent = nullptr;    // pi_screen 的 screen 对象（Open() 用）
 
-constexpr int32_t kMiniH = 60;
-constexpr int32_t kMiniMargin = 16;
-constexpr int32_t kMiniInnerW = kW - 2 * kMiniMargin;
+struct InlineBar {
+    lv_obj_t* root = nullptr;
+    lv_obj_t* glyph = nullptr;   // play/pause 图元容器
+    lv_obj_t* title = nullptr;   // "title · sub" 单行
+    lv_obj_t* prog = nullptr;    // 底部 2px 进度线
+    bool gated = false;          // true = 受 s_mini_ctx 门控（Idle 屏幕级实例）
+    bool shown = false;          // 当前实际可见（用于淡入触发一次）
+    int cache_state = -1;
+    std::string cache_line;
+};
+std::vector<InlineBar> s_bars;
+bool s_mini_ctx = true;  // 屏幕级实例是否允许显示（Go 设置；仅 Idle 为 true）
+
+constexpr int32_t kInlineH = 36;     // 紧凑行默认高（调用方可覆盖）
+constexpr int32_t kInlineGlyph = 22; // play/pause 图元边长
 
 lv_timer_t* s_timer = nullptr;
 
-void OnMiniToggle(lv_event_t*) { MediaController::Instance().Toggle(); }
-void OnMiniBody(lv_event_t*) { pi_media::Open(); }
+void OnInlineToggle(lv_event_t*) { MediaController::Instance().Toggle(); }
+void OnInlineBody(lv_event_t*) { pi_media::Open(); }
 
 // play/pause 图元：clear host 后按 playing 重建（play=填充三角，pause=双竖条）。
 void SetGlyph(lv_obj_t* host, bool playing, Tok tok, int32_t s) {
@@ -238,144 +243,128 @@ void SetGlyph(lv_obj_t* host, bool playing, Tok tok, int32_t s) {
     }
 }
 
-void CreateMiniBarImpl(lv_obj_t* parent) {
-    s_mini = lv_obj_create(parent);
-    screen_strip_obj_chrome(s_mini);
-    lv_obj_remove_flag(s_mini, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(s_mini, kMiniInnerW, kMiniH);
-    lv_obj_set_pos(s_mini, kMiniMargin, kH - kBandH - kMiniH - 10);
-    lv_obj_set_style_radius(s_mini, 16, LV_PART_MAIN);
-    pi_theme::ApplyBg(s_mini, Tok::Card);
-    lv_obj_set_style_bg_opa(s_mini, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_mini, 1, LV_PART_MAIN);
-    pi_theme::ApplyBorder(s_mini, Tok::Line);
-    lv_obj_set_style_clip_corner(s_mini, true, LV_PART_MAIN);  // 底部进度线不越圆角
-    lv_obj_add_flag(s_mini, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_mini, OnMiniBody, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_flag(s_mini, LV_OBJ_FLAG_HIDDEN);
-
-    // 左：40px 圆形小 art + 迷你音符
-    lv_obj_t* art = lv_obj_create(s_mini);
-    screen_strip_obj_chrome(art);
-    lv_obj_remove_flag(art, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(art, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(art, 40, 40);
-    lv_obj_set_pos(art, 14, (kMiniH - 40) / 2);
-    lv_obj_set_style_radius(art, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    pi_theme::ApplyBg(art, Tok::AccentDim);
-    lv_obj_set_style_bg_opa(art, LV_OPA_COVER, LV_PART_MAIN);
-    Circle(art, 12, Tok::Bg, -4, 6, LV_OPA_COVER);            // 音符头
-    Bar(art, 3, 18, Tok::Bg, 3, -1);                          // 符干
-
-    // 中：title + subtitle（两行紧凑，flex 列，占中段）
-    lv_obj_t* col = lv_obj_create(s_mini);
-    screen_strip_obj_chrome(col);
-    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(col, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(col, kMiniInnerW - 40 - 14 - 12 - 44 - 16 - 14, kMiniH);
-    lv_obj_set_pos(col, 14 + 40 + 12, 0);
-    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(col, 2, LV_PART_MAIN);
-    s_mini_title = Label(col, "--", &font_puhui_20_4, Tok::Tx);
-    lv_label_set_long_mode(s_mini_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_mini_title, LV_PCT(100));
-    s_mini_sub = Label(col, "", &font_puhui_20_4, Tok::Dim);
-    lv_label_set_long_mode(s_mini_sub, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_mini_sub, LV_PCT(100));
-
-    // 右：44px play-pause
-    s_mini_btn = lv_obj_create(s_mini);
-    screen_strip_obj_chrome(s_mini_btn);
-    lv_obj_remove_flag(s_mini_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(s_mini_btn, 44, 44);
-    lv_obj_set_pos(s_mini_btn, kMiniInnerW - 44 - 12, (kMiniH - 44) / 2);
-    lv_obj_set_style_bg_opa(s_mini_btn, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_add_flag(s_mini_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(s_mini_btn, 10);
-    lv_obj_add_event_cb(s_mini_btn, OnMiniToggle, LV_EVENT_CLICKED, nullptr);
-    s_mini_glyph = lv_obj_create(s_mini_btn);
-    screen_strip_obj_chrome(s_mini_glyph);
-    lv_obj_remove_flag(s_mini_glyph, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(s_mini_glyph, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(s_mini_glyph, 30, 30);
-    lv_obj_center(s_mini_glyph);
-    lv_obj_set_style_bg_opa(s_mini_glyph, LV_OPA_TRANSP, LV_PART_MAIN);
-    SetGlyph(s_mini_glyph, false, Tok::Dim, 30);
-
-    // 底部 2px accent 进度线（clip_corner 保证不越圆角）
-    s_mini_prog = lv_obj_create(s_mini);
-    screen_strip_obj_chrome(s_mini_prog);
-    lv_obj_remove_flag(s_mini_prog, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(s_mini_prog, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(s_mini_prog, 0, 2);
-    lv_obj_align(s_mini_prog, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    pi_theme::ApplyBg(s_mini_prog, Tok::Accent);
-    lv_obj_set_style_bg_opa(s_mini_prog, LV_OPA_COVER, LV_PART_MAIN);
-}
-
-// mini 条淡入
-void MiniFadeIn() {
-    lv_obj_remove_flag(s_mini, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_opa(s_mini, LV_OPA_TRANSP, LV_PART_MAIN);
+// 紧凑行淡入
+void InlineFadeIn(lv_obj_t* o) {
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(o, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_anim_t a;
     lv_anim_init(&a);
-    lv_anim_set_var(&a, s_mini);
+    lv_anim_set_var(&a, o);
     lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
     lv_anim_set_duration(&a, 320);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a, [](void* o, int32_t v) {
-        lv_obj_set_style_opa(static_cast<lv_obj_t*>(o), static_cast<lv_opa_t>(v), LV_PART_MAIN);
+    lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) {
+        lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(v), LV_PART_MAIN);
     });
     lv_anim_start(&a);
 }
 
-// mini 条状态缓存（避免每秒重设标题）
-struct MiniCache {
-    int state = -1;
-    std::string title;
-} s_mini_cache;
+// 一个紧凑行实例：flex row [play/pause 触区][title 单行]，底部 2px 进度线悬浮。
+// 透明底、无卡片 chrome——视觉上融入宿主（Chat dock / Idle 提示带）。
+lv_obj_t* CreateInlineBarImpl(lv_obj_t* parent, bool gated) {
+    InlineBar b;
+    b.gated = gated;
+    b.root = lv_obj_create(parent);
+    screen_strip_obj_chrome(b.root);
+    lv_obj_remove_flag(b.root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(b.root, LV_PCT(100), kInlineH);
+    lv_obj_set_style_bg_opa(b.root, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(b.root, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b.root, OnInlineBody, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_flag(b.root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_flex_flow(b.root, LV_FLEX_FLOW_ROW);
+    // Idle 屏幕级实例（gated）内容居中——下方「按住说话」提示行是居中的，左对齐会显得
+    // 整簇偏左；dock 实例左对齐与 token 统计行同列头。
+    lv_obj_set_flex_align(b.root, gated ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(b.root, 10, LV_PART_MAIN);
 
-void RefreshMini() {
-    if (s_mini == nullptr) return;
+    // 左：play/pause 触区（行高见方，ext_click_area 抬触摸）
+    lv_obj_t* btn = lv_obj_create(b.root);
+    screen_strip_obj_chrome(btn);
+    lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(btn, kInlineH, kInlineH);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(btn, 12);
+    lv_obj_add_event_cb(btn, OnInlineToggle, LV_EVENT_CLICKED, nullptr);
+    b.glyph = lv_obj_create(btn);
+    screen_strip_obj_chrome(b.glyph);
+    lv_obj_remove_flag(b.glyph, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(b.glyph, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(b.glyph, kInlineGlyph, kInlineGlyph);
+    lv_obj_center(b.glyph);
+    lv_obj_set_style_bg_opa(b.glyph, LV_OPA_TRANSP, LV_PART_MAIN);
+    SetGlyph(b.glyph, false, Tok::Dim, kInlineGlyph);
+
+    // 中："title · sub" 单行。dock 实例占满余宽（左对齐）；居中实例按内容收缩、
+    // 超长时被 max_width 钳住出省略号。
+    b.title = Label(b.root, "--", &font_puhui_20_4, Tok::Tx);
+    lv_label_set_long_mode(b.title, LV_LABEL_LONG_DOT);
+    if (gated) {
+        lv_obj_set_style_max_width(b.title, LV_PCT(85), LV_PART_MAIN);
+    } else {
+        lv_obj_set_flex_grow(b.title, 1);
+    }
+
+    // 底：2px accent 进度线（悬浮，不参与 flex）
+    b.prog = lv_obj_create(b.root);
+    screen_strip_obj_chrome(b.prog);
+    lv_obj_remove_flag(b.prog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(b.prog, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(b.prog, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_size(b.prog, 0, 2);
+    lv_obj_align(b.prog, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    pi_theme::ApplyBg(b.prog, Tok::Accent);
+    lv_obj_set_style_bg_opa(b.prog, LV_OPA_COVER, LV_PART_MAIN);
+
+    s_bars.push_back(b);
+    return b.root;
+}
+
+void RefreshInline() {
+    if (s_bars.empty()) return;
     MediaController& mc = MediaController::Instance();
     MediaState st = mc.state();
-    bool want = s_mini_ctx && st != MediaState::Stopped;
-    if (!want) {
-        if (s_mini_shown) {
-            lv_obj_add_flag(s_mini, LV_OBJ_FLAG_HIDDEN);
-            s_mini_shown = false;
-        }
-        return;
-    }
-    if (!s_mini_shown) {
-        MiniFadeIn();
-        s_mini_shown = true;
-    }
-
+    bool active = st != MediaState::Stopped;
     MediaItem cur = mc.current();
-    if (cur.title != s_mini_cache.title) {
-        s_mini_cache.title = cur.title;
-        lv_label_set_text(s_mini_title, cur.title.empty() ? "--" : cur.title.c_str());
-    }
-    lv_label_set_text(s_mini_sub, cur.subtitle.c_str());
-
-    bool playing = st == MediaState::Playing;
-    if (static_cast<int>(st) != s_mini_cache.state) {
-        s_mini_cache.state = static_cast<int>(st);
-        SetGlyph(s_mini_glyph, playing, playing ? Tok::Accent : Tok::Dim, 30);
-    }
-
-    // 进度线：文件按 pct，直播（duration 0）隐藏
+    // 进度百分比（文件按 pct，直播/未知 -1 = 隐藏）
     int dur = mc.duration_s();
-    if (cur.is_stream || dur <= 0) {
-        lv_obj_set_width(s_mini_prog, 0);
-    } else {
-        int pct = mc.position_s() * 100 / dur;
+    int pct = -1;
+    if (!cur.is_stream && dur > 0) {
+        pct = mc.position_s() * 100 / dur;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
-        lv_obj_set_width(s_mini_prog, kMiniInnerW * pct / 100);
+    }
+    std::string line = cur.title.empty() ? "--" : cur.title;
+    if (!cur.subtitle.empty()) line += " · " + cur.subtitle;  // "title · sub"
+    bool playing = st == MediaState::Playing;
+
+    for (InlineBar& b : s_bars) {
+        if (b.root == nullptr) continue;
+        bool want = active && (!b.gated || s_mini_ctx);
+        if (!want) {
+            if (b.shown) {
+                lv_obj_add_flag(b.root, LV_OBJ_FLAG_HIDDEN);
+                b.shown = false;
+            }
+            continue;
+        }
+        if (!b.shown) {
+            InlineFadeIn(b.root);
+            b.shown = true;
+        }
+        if (line != b.cache_line) {
+            b.cache_line = line;
+            lv_label_set_text(b.title, line.c_str());
+        }
+        if (static_cast<int>(st) != b.cache_state) {
+            b.cache_state = static_cast<int>(st);
+            SetGlyph(b.glyph, playing, playing ? Tok::Accent : Tok::Dim, kInlineGlyph);
+        }
+        // 行宽随宿主布局而变（dock 列 flex / Idle 定宽），每 tick 现取
+        int32_t w = lv_obj_get_width(b.root);
+        lv_obj_set_width(b.prog, (pct < 0 || w <= 0) ? 0 : w * pct / 100);
     }
 }
 
@@ -442,7 +431,7 @@ void ApplyId3(std::string& title, std::string& sub, const std::string& path) {
     media_id3::Tags t = media_id3::ReadTags(path);
     if (!t.title.empty()) title = t.title;
     if (!t.album.empty() && !t.artist.empty())
-        sub = t.album + " \xc2\xb7 " + t.artist;  // "专辑 · 艺人"
+        sub = t.album + " · " + t.artist;  // "专辑 · 艺人"
     else if (!t.album.empty())
         sub = t.album;
     else if (!t.artist.empty())
@@ -1034,6 +1023,19 @@ void OnListBtn(lv_event_t*) {
         BuildDrawer();
 }
 void OnBackBtn(lv_event_t*) { pi_media::Back(); }
+
+// 叉掉播放器：停止播放（列表保留、NVS 续播记录不清，快捷面板「音乐」仍可续）并关页；
+// 紧凑媒体行随 Stopped 态在下一 tick 自动消失。停止前抓当前曲目名，静默备注给模型
+// （note 不起新一轮：对话中插下一轮，空闲排队到下次提问；无会话时被丢弃）——否则模型
+// 会一直以为还在播，后续 media.control 全踩 "nothing playing"。
+void OnStopBtn(lv_event_t*) {
+    MediaItem cur = MediaController::Instance().current();
+    MediaController::Instance().Stop();
+    pi_media::Close();
+    std::string note = "「播放器」用户手动关闭了播放器，停止播放";
+    if (!cur.title.empty()) note += "：" + cur.title;
+    pi_agent_task_note(note.c_str());
+}
 void OnPrev(lv_event_t*) { MediaController::Instance().Prev(); }
 void OnNext(lv_event_t*) { MediaController::Instance().Next(); }
 void OnPlay(lv_event_t*) { MediaController::Instance().Toggle(); }
@@ -1115,12 +1117,15 @@ void BuildPage() {
     lv_obj_add_flag(s_root, LV_OBJ_FLAG_CLICKABLE);  // edge-nav 兜底命中
     lv_obj_add_flag(s_root, LV_OBJ_FLAG_PRESS_LOCK);
 
-    // 顶栏：返回箭头 + 播放列表钮
+    // 顶栏：返回箭头 + 播放列表钮 + 停止叉（最右角；停止播放并关页）
     lv_obj_t* back = MakeTopBtn(s_root, OnBackBtn, 16);
     lv_obj_center(pi_card::MakeIcon(back, "chevron-left", 28, Tok::Dim));
 
-    lv_obj_t* list = MakeTopBtn(s_root, OnListBtn, kW - 52 - 16);
+    lv_obj_t* list = MakeTopBtn(s_root, OnListBtn, kW - 52 - 16 - 52 - 12);
     lv_obj_center(pi_card::MakeIcon(list, "list-music", 28, Tok::Dim));
+
+    lv_obj_t* stop = MakeTopBtn(s_root, OnStopBtn, kW - 52 - 16);
+    lv_obj_center(pi_card::MakeIcon(stop, "x", 28, Tok::Dim));
 
     s_eyebrow = Label(s_root, "NOW PLAYING", &font_pi_mono_14, Tok::Faint);
     lv_obj_set_style_text_letter_space(s_eyebrow, 4, LV_PART_MAIN);
@@ -1317,9 +1322,15 @@ void OnThemeChanged() {
 }
 
 void TimerCb(lv_timer_t*) {
-    RefreshMini();
+    RefreshInline();
     RefreshPage();
     PersistPoll();  // 断点续播：变化即存、稳态播放每 60s 采样一次
+}
+
+// 刷新定时器 + 主题监听（CreateInlineBar 可先于 Init 被调，两处都懒起）
+void EnsureTicker() {
+    if (s_theme_listener < 0) s_theme_listener = pi_theme::AddListener(OnThemeChanged);
+    if (s_timer == nullptr) s_timer = lv_timer_create(TimerCb, 1000, nullptr);
 }
 
 }  // namespace
@@ -1329,18 +1340,21 @@ void TimerCb(lv_timer_t*) {
 // ---------------------------------------------------------------------------
 namespace pi_media {
 
-void CreateMiniBar(lv_obj_t* parent) {
-    if (s_mini != nullptr) return;
-    s_parent = parent;
-    CreateMiniBarImpl(parent);
-    if (s_theme_listener < 0) s_theme_listener = pi_theme::AddListener(OnThemeChanged);
-    if (s_timer == nullptr) s_timer = lv_timer_create(TimerCb, 1000, nullptr);
-    RefreshMini();
+void Init(lv_obj_t* screen) {
+    s_parent = screen;
+    EnsureTicker();
+}
+
+lv_obj_t* CreateInlineBar(lv_obj_t* parent, bool gate_by_context) {
+    lv_obj_t* root = CreateInlineBarImpl(parent, gate_by_context);
+    EnsureTicker();
+    RefreshInline();
+    return root;
 }
 
 void SetMiniBarContext(bool allowed) {
     s_mini_ctx = allowed;
-    RefreshMini();
+    RefreshInline();
 }
 
 void Open() {
@@ -1489,9 +1503,8 @@ void OnScreenUnloaded() {
     s_drawer_rows.clear();
     s_root = nullptr;
     s_art_host = nullptr;  // widget 随 screen 删除；防止在途 OnCoverReady 误用（gen 双保险）
-    s_mini = s_mini_title = s_mini_sub = s_mini_btn = s_mini_glyph = s_mini_prog = nullptr;
-    s_mini_shown = false;
-    s_mini_cache = MiniCache{};
+    s_bars.clear();
+    s_mini_ctx = true;
     s_cover_gen.fetch_add(1);  // 作废在途封面加载
     StopCoverWorker();         // 停后台 worker 并 join，避免其在 teardown 后再投递 async
     FreeCoverBitmap(&s_cover);

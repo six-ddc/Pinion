@@ -32,8 +32,9 @@ char *pi_media_tool_run(const cJSON *args, bool *is_error);
     "Play SD-card music/podcasts, or live radio. mode:'search' scans SD (Music/Podcasts "            \
     "subdirs=albums/shows) -> {items:[{index,title,album,path}]} (query=fuzzy filter); mode:'radio' " \
     "lists built-in CN stations -> {stations:[{index,name,genre}]} (query filters); mode:'play' "     \
-    "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int] (from "    \
-    "radio list) -> now-playing snapshot. After play succeeds, ui_render a control card: label "      \
+    "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int,...] (from " \
+    "radio list; pass several stations, requested one first, so next/prev can switch channels) -> "   \
+    "now-playing snapshot. After play succeeds, ui_render a control card: label "                     \
     "bind:'media.title'/'media.state', bar bind:'media.progress_pct', buttons "                        \
     "{icon:'skip-back'|'play'|'skip-forward'} invoke media.prev/toggle/next, list bind_data:"          \
     "'tracks' rows {do:'set',path:'media.play_index',value:'{i}'}. "                                   \
@@ -49,7 +50,8 @@ char *pi_media_tool_run(const cJSON *args, bool *is_error);
     "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"local file "     \
     "paths (from search) to play\"},\"start_index\":{\"type\":\"number\",\"description\":\"index "    \
     "into paths to start at (default 0)\"},\"station_indices\":{\"type\":\"array\",\"items\":"        \
-    "{\"type\":\"number\"},\"description\":\"radio station indices (from the radio list) to play\"},"  \
+    "{\"type\":\"number\"},\"description\":\"radio station indices (from the radio list) to play; "   \
+    "pass multiple for channel switching\"},"                                                          \
     "\"action\":{\"type\":\"string\",\"enum\":[\"toggle\",\"pause\",\"resume\",\"next\",\"prev\","    \
     "\"stop\",\"open\"],\"description\":\"for mode:'control' — what to do to the current playback\"}"  \
     "},\"required\":[\"mode\"]}"

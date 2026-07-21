@@ -47,8 +47,10 @@ typedef struct {
    TOOL_END: s1=name,s2=output,i1=elapsed_ms;
    TEXT_DELTA: s1=fragment（i2 保留：流式期间无 token 计数，输出量以 DONE 的 usage
    为准）; ERROR: s1=msg;
-   DONE: i1=usage.input,i2=usage.output（本次 run 最后一条 assistant 消息的真实
-   pi_usage_t 用量，来自 pi-c MESSAGE_END 事件的 message->usage，非估算值）。
+   DONE: i1=会话累计输入,i2=会话累计输出（真实 pi_usage_t 累加：每条 assistant 消息的
+   MESSAGE_END 都累加、跨 run 存活、new_session 清零；IN 为完整 prompt 量
+   input+cache_read+cache_write——pi-c 的 usage.input 刨掉了 DeepSeek 缓存命中，
+   直接用会看起来"每轮重置"）。当前上下文占用另走 pi_agent_ctx_tokens()。
    CARD_RENDER: s1=root 子树 json,s2=card_id,s3=data json(可 NULL),i1=display(0chat/1overlay),
    i2=ttl_ms; CARD_UPDATE: s1=card_id,s3=pi_card_tool_update 整份 args 的 json（{id,props}和/或
    {data:{...}}，OnUpdateEvent 内部分流）; CARD_CLOSE: s1=card_id。 */
@@ -68,6 +70,7 @@ uint32_t pi_agent_task_run_gen(void); /* 当前 run 代次，worker 线程内的
    pi_ui_evt_t.s1（TEXT above: "ERROR: s1=msg"）——POD 已经够用，未新增字段。 */
 const char *pi_agent_model_name(void); /* 真实模型名（model.name，缺省退回 model.id） */
 uint32_t pi_agent_context_window(void); /* model.context_window（deepseek=1000000）；模型未加载时 0 */
+uint32_t pi_agent_ctx_tokens(void); /* 最后一次请求的完整 prompt 量(含缓存命中)=当前上下文占用；未有完成轮时 0 */
 
 /* TTS 播报开关（火山 volc_tts；同样是"加不减"扩展）。开关本体在 agent 线程侧
    消费（text_delta 是否喂给 volc_tts）；持久化（NVS "pi_screen"/"tts_on"）由
@@ -110,6 +113,12 @@ void pi_agent_task_tts_clear_cut(void);
    pi_agent_steer 插到下一轮之前；空闲则起一轮让助手回应用户的选择。线程安全，
    从 LVGL 线程（动作分发）调用。见 pi_card/pi_card_actions.cc。 */
 void pi_agent_task_inject(const char *text);
+
+/* 静默上下文备注：把设备侧发生的事（如用户手动关闭播放器）告知模型，但**绝不
+   自己起一轮**——运行中同 steer 插到下一轮之前；空闲时留在 steering 队列，由下一次
+   用户 prompt 的首轮 drain 注入（pi-c loop 每轮开始都 drain_steering）。会话里尚无
+   任何消息时丢弃（没有"对话中"可言）。LVGL 线程调。 */
+void pi_agent_task_note(const char *text);
 
 #ifdef __cplusplus
 }

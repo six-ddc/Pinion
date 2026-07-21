@@ -10,8 +10,8 @@
 //      最后一个子对象故 z 序最高）：生成式母题 art、传输排、进度、列表抽屉。
 //      视觉语言延续 pi_settings（Bg 底 + Card + 1px Line + 唯一琥珀强调 + mono
 //      小字 caption + 大圆角）。
-//   2) 常驻 mini 播放条（挂 pi_screen 的 screen 对象，浮在底部提示/输入区上方）：
-//      state != stopped 时浮现，tap 条体打开全屏页。
+//   2) 紧凑媒体行（多实例，嵌入 pi_screen 的底部区域：Chat dock 左列 + Idle 提示带
+//      上方的屏幕级条）：state != stopped 时浮现，tap 行体打开全屏页、tap 图元切播放。
 //
 // 数据源：直接读 media::MediaController 快照（任意线程安全）+ 一条 1Hz lv_timer
 // 刷新，不经 DataHub。控制走 MediaController 方法（Toggle/Next/Prev/PlayIndex）。
@@ -22,15 +22,21 @@
 // ---------------------------------------------------------------------------
 namespace pi_media {
 
-// 构建常驻 mini 条（隐藏态）并记住 parent 供 Open() 使用。pi_screen Create 调一次。
-void CreateMiniBar(lv_obj_t* parent);
+// 记住 screen 对象供 Open() 使用 + 起 1Hz 刷新。pi_screen Create 调一次。
+void Init(lv_obj_t* screen);
 
-// pi_screen 的 Go() 通知：当前视图是否允许显示 mini 条（Idle / Chat = true，
-// Listen = false）。mini 条实际可见 = 允许 && media.state != stopped。
+// 构建一个紧凑媒体行实例（默认 HIDDEN；state != stopped 时浮现），返回根对象由调用方
+// 定位/定宽。gate_by_context=true 的实例额外受 SetMiniBarContext 门控（Idle 屏幕级条
+// 用——它建在 ptt 层之上、不随视图容器显隐）；嵌在视图容器内的实例传 false。
+// 可先于 Init 调用（内部懒起刷新定时器/主题监听）。
+lv_obj_t* CreateInlineBar(lv_obj_t* parent, bool gate_by_context);
+
+// pi_screen 的 Go() 通知：屏幕级媒体行（gate_by_context=true 实例）是否允许显示
+//（仅 Idle = true）。实际可见 = 允许 && media.state != stopped。
 void SetMiniBarContext(bool allowed);
 
-// 打开全屏 Now-Playing 页（LVGL 线程；重复调用 no-op）。media.open 命令与 mini
-// 条 tap 都走这里。用 CreateMiniBar 记住的 parent。
+// 打开全屏 Now-Playing 页（LVGL 线程；重复调用 no-op）。media.open 命令与媒体行
+// tap 都走这里。用 Init 记住的 parent。
 void Open();
 
 // 整页关闭并删除（未打开时 no-op）。不影响播放。
