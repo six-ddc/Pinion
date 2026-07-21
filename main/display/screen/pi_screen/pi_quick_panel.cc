@@ -278,7 +278,7 @@ void OnOffReleased(lv_event_t* e) {
     if (was_arming && lv_event_get_code(e) == LV_EVENT_RELEASED) {
         // 短点（没撑满 2s 就松开）：闪提示
         ShowToast(
-            "\xe9\x95\xbf\xe6\x8c\x89 2 \xe7\xa7\x92\xe5\x85\xb3\xe6\x9c\xba",  // "长按 2 秒关机"
+            "长按 2 秒关机",
             &font_puhui_20_4, Tok::Dim);
     }
 }
@@ -327,7 +327,7 @@ void BuildActionGrid(lv_obj_t* parent) {
     lv_obj_set_style_pad_column(grid, 16, LV_PART_MAIN);
 
     // 「✚ 新对话」
-    lv_obj_t* btn_new = MakeGridBtn(grid, "\xe6\x96\xb0\xe5\xaf\xb9\xe8\xaf\x9d");  // "新对话"
+    lv_obj_t* btn_new = MakeGridBtn(grid, "新对话");
     pi_card::MakeIcon(lv_obj_get_child(btn_new, 0), "plus", 24, Tok::Accent);
     lv_obj_add_event_cb(
         btn_new,
@@ -339,7 +339,7 @@ void BuildActionGrid(lv_obj_t* parent) {
         LV_EVENT_CLICKED, nullptr);
 
     // 「⚙ 设置」（P1 已接线：收起面板 -> 推入设置 Hub）
-    lv_obj_t* btn_set = MakeGridBtn(grid, "\xe8\xae\xbe\xe7\xbd\xae");  // "设置"
+    lv_obj_t* btn_set = MakeGridBtn(grid, "设置");
     pi_card::MakeIcon(lv_obj_get_child(btn_set, 0), "settings", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_set,
@@ -352,7 +352,7 @@ void BuildActionGrid(lv_obj_t* parent) {
 
     // 「◐ 主题」。P2 接线：一键在深/浅主题间切换（共享样式即时翻转，面板
     // 本身也当场换装），持久化 NVS "ui"/"theme"。
-    lv_obj_t* btn_theme = MakeGridBtn(grid, "\xe4\xb8\xbb\xe9\xa2\x98");  // "主题"
+    lv_obj_t* btn_theme = MakeGridBtn(grid, "主题");
     pi_card::MakeIcon(lv_obj_get_child(btn_theme, 0), "sun-moon", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_theme, [](lv_event_t*) { pi_theme::Set(!pi_theme::IsLight()); }, LV_EVENT_CLICKED,
@@ -361,7 +361,7 @@ void BuildActionGrid(lv_obj_t* parent) {
     // 「⌂ 文件管理」。仅 WiFi 已连接才能打开（4G 有运营商 NAT，外部连不
     // 进来）；未连接点按只吐 toast，不置灰——省一份"打开时刷新按钮态"的
     // 常驻逻辑，点按时判一次足够。
-    lv_obj_t* btn_files = MakeGridBtn(grid, "\xe6\x96\x87\xe4\xbb\xb6");  // "文件"
+    lv_obj_t* btn_files = MakeGridBtn(grid, "文件");
     pi_card::MakeIcon(lv_obj_get_child(btn_files, 0), "folder", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_files,
@@ -371,7 +371,7 @@ void BuildActionGrid(lv_obj_t* parent) {
             if (!wifi_up) {
                 // "需连接 WiFi"
                 ShowToast(
-                    "\xe9\x9c\x80\xe8\xbf\x9e\xe6\x8e\xa5 WiFi", &font_puhui_20_4, Tok::Dim);
+                    "需连接 WiFi", &font_puhui_20_4, Tok::Dim);
                 return;
             }
             pi_quick_panel::Close();
@@ -382,14 +382,14 @@ void BuildActionGrid(lv_obj_t* parent) {
 
     // 「♪ 音乐」：继续上次播放。正在播 / 有持久化记录则打开播放页续播；都没有点按
     // 只吐 toast（不置灰——同「文件」的判定策略，点按时判一次足够）。
-    lv_obj_t* btn_music = MakeGridBtn(grid, "\xe9\x9f\xb3\xe4\xb9\x90");  // "音乐"
+    lv_obj_t* btn_music = MakeGridBtn(grid, "音乐");
     pi_card::MakeIcon(lv_obj_get_child(btn_music, 0), "music", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_music,
         [](lv_event_t*) {
             // "没有可继续的播放"
             const char* kNone =
-                "\xe6\xb2\xa1\xe6\x9c\x89\xe5\x8f\xaf\xe7\xbb\xa7\xe7\xbb\xad\xe7\x9a\x84\xe6\x92\xad\xe6\x94\xbe";
+                "没有可继续的播放";
             if (!pi_media::HasResumable()) {
                 ShowToast(kNone, &font_puhui_20_4, Tok::Dim);
                 return;
@@ -400,12 +400,12 @@ void BuildActionGrid(lv_obj_t* parent) {
                     break;
                 case pi_media::ResumeResult::NoNetwork:
                     // "无网络连接"
-                    ShowToast("\xe6\x97\xa0\xe7\xbd\x91\xe7\xbb\x9c\xe8\xbf\x9e\xe6\x8e\xa5",
+                    ShowToast("无网络连接",
                               &font_puhui_20_4, Tok::Dim);
                     break;
                 case pi_media::ResumeResult::FilesGone:
                     // "文件已不存在"
-                    ShowToast("\xe6\x96\x87\xe4\xbb\xb6\xe5\xb7\xb2\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8",
+                    ShowToast("文件已不存在",
                               &font_puhui_20_4, Tok::Dim);
                     break;
                 default:
@@ -416,7 +416,7 @@ void BuildActionGrid(lv_obj_t* parent) {
         LV_EVENT_CLICKED, nullptr);
 
     // 「⏻ 关机」：长按 2s 才关机
-    s_off_btn = MakeGridBtn(grid, "\xe5\x85\xb3\xe6\x9c\xba");  // "关机"
+    s_off_btn = MakeGridBtn(grid, "关机");
     pi_card::MakeIcon(lv_obj_get_child(s_off_btn, 0), "power", 24, Tok::Dim);
     lv_obj_add_event_cb(s_off_btn, OnOffPressed, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(s_off_btn, OnOffReleased, LV_EVENT_RELEASED, nullptr);

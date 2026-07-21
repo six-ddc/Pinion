@@ -983,14 +983,14 @@ void RenderBadCard(const char* spec, const char* tag) {
 constexpr const char* kCardStandby =
     "{\"display\":\"standby\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
     "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"\xe7\x94\xb5\xe9\x87\x8f\"},"
+    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"电量\"},"
     "{\"type\":\"spacer\"},"
     "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.level\",\"fmt\":\"%d%%\"}]},"
     "{\"type\":\"chart\",\"bind_history\":\"battery.level\",\"points\":30},"
     "{\"type\":\"row\",\"gap\":10,\"children\":["
-    "{\"type\":\"button\",\"text\":\"\xe9\x87\x8d\xe8\xbf\x9e\xe7\xbd\x91\xe7\xbb\x9c\","
+    "{\"type\":\"button\",\"text\":\"重连网络\","
     "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"net.reconnect\"}]},"
-    "{\"type\":\"button\",\"text\":\"\xe5\x88\x87\xe6\x8d\xa2\xe7\xbd\x91\xe7\xbb\x9c\","
+    "{\"type\":\"button\",\"text\":\"切换网络\","
     "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"net.switch_type\"}]}"
     "]}]}}";
 

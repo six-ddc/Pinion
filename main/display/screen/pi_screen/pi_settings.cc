@@ -537,7 +537,7 @@ void MakeHubRow(lv_obj_t* parent, int idx, const char* icon_name, const char* ti
 }
 
 void BuildHubPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Hub, "\xe8\xae\xbe\xe7\xbd\xae", out_page, kHintH);
+    lv_obj_t* content = MakePage(PageId::Hub, "设置", out_page, kHintH);
     // Hub 行区不要左右 pad（行自带 28），行间 1px 细线
     lv_obj_set_style_pad_hor(content, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(content, 0, LV_PART_MAIN);
@@ -546,14 +546,7 @@ void BuildHubPage(lv_obj_t** out_page) {
     // 「文件管理」不在这张 Hub 表里——单一入口在快捷面板（下拉面板一步直达
     // pi_settings::OpenFiles()），设置栈保持"网络/蓝牙/声音/显示/对话/关于"六页干净。
     static const char* kIcons[6] = {"wifi", "bluetooth", "volume-2", "sun", "message-circle", "info"};
-    static const char* kTitles[6] = {
-        "\xe7\xbd\x91\xe7\xbb\x9c",  // 网络
-        "\xe8\x93\x9d\xe7\x89\x99",  // 蓝牙
-        "\xe5\xa3\xb0\xe9\x9f\xb3",  // 声音
-        "\xe6\x98\xbe\xe7\xa4\xba",  // 显示
-        "\xe5\xaf\xb9\xe8\xaf\x9d",  // 对话
-        "\xe5\x85\xb3\xe4\xba\x8e",  // 关于
-    };
+    static const char* kTitles[6] = {"网络", "蓝牙", "声音", "显示", "对话", "关于"};
     for (int i = 0; i < 6; i++) {
         MakeHubRow(content, i, kIcons[i], kTitles[i]);
         if (i < 5)
@@ -596,16 +589,16 @@ void RefreshHub() {
     bool up = mhal::network::IsConnected();
     if (wifi) {
         std::snprintf(
-            buf, sizeof(buf), "WiFi \xc2\xb7 %s",
-            up ? "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5" : "\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5");
+            buf, sizeof(buf), "WiFi · %s",
+            up ? "已连接" : "未连接");
     } else {
         int csq = mhal::network::GetSignalStrength();
         if (up && csq >= 0 && csq <= 31) {
-            std::snprintf(buf, sizeof(buf), "4G \xc2\xb7 %ddBm", -113 + 2 * csq);
+            std::snprintf(buf, sizeof(buf), "4G · %ddBm", -113 + 2 * csq);
         } else {
-            std::snprintf(buf, sizeof(buf), "4G \xc2\xb7 %s",
-                          up ? "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5"
-                             : "\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5");
+            std::snprintf(buf, sizeof(buf), "4G · %s",
+                          up ? "已连接"
+                             : "未连接");
         }
     }
     lv_label_set_text(s_hub_val[0], buf);
@@ -616,15 +609,15 @@ void RefreshHub() {
         const char* mode_txt =
             m == mhal::bt::Mode::Tx
                 ? "TX"
-                : (m == mhal::bt::Mode::None ? "\xe5\x85\xb3\xe9\x97\xad" : "RX");  // "关闭"
+                : (m == mhal::bt::Mode::None ? "关闭" : "RX");
         if (mhal::bt::GetConnState() == mhal::bt::ConnState::Connected) {
             // 已连接：优先显示缓存的最近连接设备名（拿不到地址查询，名称
             // 即最佳近似）；无缓存退化为"已连接"。
             std::string name = BtCachedDisplayName();
             if (!name.empty()) {
-                std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s", mode_txt, name.c_str());
+                std::snprintf(buf, sizeof(buf), "%s · %s", mode_txt, name.c_str());
             } else {
-                std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 \xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5",
+                std::snprintf(buf, sizeof(buf), "%s · 已连接",
                               mode_txt);  // "· 已连接"
             }
         } else {
@@ -636,9 +629,9 @@ void RefreshHub() {
     // 声音
     bool tts_on = s_hooks.get_tts != nullptr && s_hooks.get_tts();
     std::snprintf(buf, sizeof(buf),
-                  "\xe9\x9f\xb3\xe9\x87\x8f %d \xc2\xb7 TTS %s",  // "音量 N · TTS"
+                  "音量 %d · TTS %s",  // "音量 N · TTS"
                   mhal::audio::GetVolume(),
-                  tts_on ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  // 开/关
+                  tts_on ? "开" : "关");  // 开/关
     lv_label_set_text(s_hub_val[2], buf);
 
     // 显示（P1 起息屏档位接真：NVS "ui"/"sleep_s"）
@@ -647,25 +640,21 @@ void RefreshHub() {
         int32_t sleep_s = ui.GetInt("sleep_s", 0);
         char sleep_txt[16];
         if (sleep_s <= 0) {
-            std::snprintf(sleep_txt, sizeof(sleep_txt), "\xe6\xb0\xb8\xe4\xb8\x8d");  // "永不"
+            std::snprintf(sleep_txt, sizeof(sleep_txt), "永不");
         } else if (sleep_s < 60) {
             std::snprintf(sleep_txt, sizeof(sleep_txt), "%ds", static_cast<int>(sleep_s));
         } else {
             std::snprintf(sleep_txt, sizeof(sleep_txt), "%dmin", static_cast<int>(sleep_s / 60));
         }
-        std::snprintf(buf, sizeof(buf),
-                      "\xe4\xba\xae\xe5\xba\xa6 %d \xc2\xb7 %s \xc2\xb7 "
-                      "\xe6\x81\xaf\xe5\xb1\x8f %s",  // "亮度 N · 深色/浅色 · 息屏 X"
+        std::snprintf(buf, sizeof(buf), "亮度 %d · %s · 息屏 %s",
                       static_cast<int>(mhal::backlight::GetBrightness()),
-                      pi_theme::IsLight() ? "\xe6\xb5\x85\xe8\x89\xb2"   // "浅色"
-                                          : "\xe6\xb7\xb1\xe8\x89\xb2",  // "深色"
-                      sleep_txt);
+                      pi_theme::IsLight() ? "浅色" : "深色", sleep_txt);
     }
     lv_label_set_text(s_hub_val[3], buf);
 
     // 对话
     bool zen = s_hooks.get_zen != nullptr && s_hooks.get_zen();
-    std::snprintf(buf, sizeof(buf), "%s%s", zen ? "ZEN" : "FLOW", tts_on ? " \xc2\xb7 TTS" : "");
+    std::snprintf(buf, sizeof(buf), "%s%s", zen ? "ZEN" : "FLOW", tts_on ? " · TTS" : "");
     lv_label_set_text(s_hub_val[4], buf);
 
     // 关于（"▲" 不在字体子集 -> "^"）
@@ -674,7 +663,7 @@ void RefreshHub() {
         bool chg = false, dis = false;
         bool have = mhal::power::GetBatteryLevel(level, chg, dis);
         if (have) {
-            std::snprintf(buf, sizeof(buf), "claw6 v%s \xc2\xb7 ^%d%%", pi_sys_fw_version(), level);
+            std::snprintf(buf, sizeof(buf), "claw6 v%s · ^%d%%", pi_sys_fw_version(), level);
         } else {
             std::snprintf(buf, sizeof(buf), "claw6 v%s", pi_sys_fw_version());
         }
@@ -736,17 +725,11 @@ void BuildNetConfirmSheet() {
     lv_obj_align(sheet, LV_ALIGN_BOTTOM_MID, 0, 24);  // 底部圆角藏出屏外
 
     lv_obj_t* title = lv_label_create(sheet);
-    // "切换网络通道？"
-    lv_label_set_text(title,
-                      "\xe5\x88\x87\xe6\x8d\xa2\xe7\xbd\x91\xe7\xbb\x9c\xe9\x80\x9a\xe9\x81\x93"
-                      "\xef\xbc\x9f");
+    lv_label_set_text(title, "切换网络通道？");
     SetLabelFont(title, &font_puhui_30_4, Tok::Tx);
 
     lv_obj_t* note = lv_label_create(sheet);
-    // "切换网络通道将重启设备"
-    lv_label_set_text(note,
-                      "\xe5\x88\x87\xe6\x8d\xa2\xe7\xbd\x91\xe7\xbb\x9c\xe9\x80\x9a\xe9\x81\x93"
-                      "\xe5\xb0\x86\xe9\x87\x8d\xe5\x90\xaf\xe8\xae\xbe\xe5\xa4\x87");
+    lv_label_set_text(note, "切换网络通道将重启设备");
     SetLabelFont(note, &font_puhui_20_4, Tok::Faint);
 
     lv_obj_t* btn_row = lv_obj_create(sheet);
@@ -781,12 +764,12 @@ void BuildNetConfirmSheet() {
         return b;
     };
     lv_obj_t* cancel =
-        make_btn(btn_row, Tok::Line2, "\xe5\x8f\x96\xe6\xb6\x88", Tok::Dim);  // "取消"
+        make_btn(btn_row, Tok::Line2, "取消", Tok::Dim);
     lv_obj_add_event_cb(cancel, [](lv_event_t*) { CloseNetConfirm(); }, LV_EVENT_CLICKED, nullptr);
     // "切换并重启"
     lv_obj_t* confirm =
         make_btn(btn_row, Tok::Accent,
-                 "\xe5\x88\x87\xe6\x8d\xa2\xe5\xb9\xb6\xe9\x87\x8d\xe5\x90\xaf", Tok::Accent);
+                 "切换并重启", Tok::Accent);
     lv_obj_add_event_cb(confirm, OnNetConfirmSwitch, LV_EVENT_CLICKED, nullptr);
 }
 
@@ -812,14 +795,9 @@ void SetPortalActiveVisual(const char* info) {
         shown = s_portal_info;
     char buf[128];
     if (!shown.empty()) {
-        // "配网中 · <ssid|url>"
-        std::snprintf(buf, sizeof(buf), "\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad \xc2\xb7 %s",
-                      shown.c_str());
+        std::snprintf(buf, sizeof(buf), "配网中 · %s", shown.c_str());  // <ssid|url>
     } else {
-        // "配网中 (热点已开启)"
-        std::snprintf(buf, sizeof(buf),
-                      "\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad (\xe7\x83\xad\xe7\x82\xb9\xe5\xb7\xb2"
-                      "\xe5\xbc\x80\xe5\x90\xaf)");
+        std::snprintf(buf, sizeof(buf), "配网中 (热点已开启)");
     }
     lv_label_set_text(s_net_portal_state, buf);
     lv_obj_remove_flag(s_net_portal_state, LV_OBJ_FLAG_HIDDEN);
@@ -834,10 +812,7 @@ void OnPortalClicked(lv_event_t*) {
         return;
     s_portal_started = true;
     if (s_net_portal_state != nullptr) {
-        // "即将重启进入配网…"
-        lv_label_set_text(s_net_portal_state,
-                          "\xe5\x8d\xb3\xe5\xb0\x86\xe9\x87\x8d\xe5\x90\xaf\xe8\xbf\x9b\xe5\x85\xa5"
-                          "\xe9\x85\x8d\xe7\xbd\x91\xe2\x80\xa6");
+        lv_label_set_text(s_net_portal_state, "即将重启进入配网…");
         lv_obj_remove_flag(s_net_portal_state, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_net_portal_btn != nullptr)
@@ -864,7 +839,7 @@ void OnPortalExitClicked(lv_event_t*) {
 }
 
 void BuildNetworkPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Network, "\xe7\xbd\x91\xe7\xbb\x9c", out_page);  // "网络"
+    lv_obj_t* content = MakePage(PageId::Network, "网络", out_page);
 
     // WiFi / 4G 分段
     lv_obj_t* seg_row = MakeFlexRow(content, kSegH);
@@ -876,9 +851,7 @@ void BuildNetworkPage(lv_obj_t** out_page) {
     lv_obj_set_style_pad_column(warn, 12, LV_PART_MAIN);
     pi_card::MakeIcon(warn, "triangle-alert", 18, Tok::Accent);
     lv_obj_t* warn_lbl = lv_label_create(warn);
-    lv_label_set_text(warn_lbl,
-                      "\xe5\x88\x87\xe6\x8d\xa2\xe7\xbd\x91\xe7\xbb\x9c\xe9\x80\x9a\xe9\x81\x93"
-                      "\xe5\xb0\x86\xe9\x87\x8d\xe5\x90\xaf\xe8\xae\xbe\xe5\xa4\x87");
+    lv_label_set_text(warn_lbl, "切换网络通道将重启设备");
     SetLabelFont(warn_lbl, &font_puhui_20_4, Tok::Faint);
 
     // 状态卡片（cap 与 kv 行随类型在 RefreshNetworkPage 填充）
@@ -890,10 +863,7 @@ void BuildNetworkPage(lv_obj_t** out_page) {
     // 配网卡片
     lv_obj_t* portal = MakeCard(content, "PORTAL");
     lv_obj_t* hint = lv_label_create(portal);
-    // "手机连接配网热点完成配网"
-    lv_label_set_text(hint,
-                      "\xe6\x89\x8b\xe6\x9c\xba\xe8\xbf\x9e\xe6\x8e\xa5\xe9\x85\x8d\xe7\xbd\x91"
-                      "\xe7\x83\xad\xe7\x82\xb9\xe5\xae\x8c\xe6\x88\x90\xe9\x85\x8d\xe7\xbd\x91");
+    lv_label_set_text(hint, "手机连接配网热点完成配网");
     SetLabelFont(hint, &font_puhui_20_4, Tok::Dim);
     s_net_portal_state = lv_label_create(portal);
     lv_label_set_text(s_net_portal_state, "");
@@ -903,8 +873,8 @@ void BuildNetworkPage(lv_obj_t** out_page) {
     bool portal_on = mhal::network::IsConfigPortalActive();
     s_net_portal_btn = MakeActionBtn(
         portal,
-        portal_on ? "\xe9\x80\x80\xe5\x87\xba\xe9\x85\x8d\xe7\xbd\x91"       // "退出配网"
-                  : "\xe5\xbc\x80\xe5\xa7\x8b\xe9\x85\x8d\xe7\xbd\x91",     // "开始配网"
+        portal_on ? "退出配网"
+                  : "开始配网",
         portal_on ? OnPortalExitClicked : OnPortalClicked);
 
     BuildNetConfirmSheet();
@@ -921,7 +891,7 @@ void RefreshNetworkPage() {
     SegSetSelected(s_net_seg, 2, wifi ? 0 : 1);
 
     char buf[96];
-    std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s", wifi ? "WIFI" : "4G",
+    std::snprintf(buf, sizeof(buf), "%s · %s", wifi ? "WIFI" : "4G",
                   up ? "CONNECTED" : "OFFLINE");
     lv_label_set_text(s_net_cap, buf);
     pi_theme::ApplyText(s_net_cap, up ? Tok::Ok : Tok::Faint);
@@ -933,10 +903,10 @@ void RefreshNetworkPage() {
             lv_label_set_text(s_net_v[0], ssid.c_str());
         } else {
             // 拿不到 SSID 时退化为连接状态文案（"已连接/未连接"）
-            lv_label_set_text(s_net_v[0], up ? "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5"
-                                             : "\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5");
+            lv_label_set_text(s_net_v[0], up ? "已连接"
+                                             : "未连接");
         }
-        lv_label_set_text(s_net_k[1], "\xe4\xbf\xa1\xe5\x8f\xb7");  // "信号"
+        lv_label_set_text(s_net_k[1], "信号");
         int rssi = mhal::network::GetWifiRssi();
         if (rssi != 0) {
             std::snprintf(buf, sizeof(buf), "%ddBm", rssi);
@@ -945,7 +915,7 @@ void RefreshNetworkPage() {
             lv_label_set_text(s_net_v[1], "--");
         }
     } else {
-        lv_label_set_text(s_net_k[0], "\xe4\xbf\xa1\xe5\x8f\xb7");  // "信号"
+        lv_label_set_text(s_net_k[0], "信号");
         int csq = mhal::network::GetSignalStrength();
         if (csq >= 0 && csq <= 31) {
             std::snprintf(buf, sizeof(buf), "%ddBm (CSQ %d)", -113 + 2 * csq, csq);
@@ -953,14 +923,14 @@ void RefreshNetworkPage() {
         } else {
             lv_label_set_text(s_net_v[0], "--");
         }
-        lv_label_set_text(s_net_k[1], "\xe6\xb3\xa8\xe5\x86\x8c");  // "注册"
+        lv_label_set_text(s_net_k[1], "注册");
         // GetRegistrationStateJson: {"stat":1,...}，stat 1/5 = 已注册
         std::string reg = mhal::network::GetRegistrationStateJson();
         const char* p = std::strstr(reg.c_str(), "\"stat\":");
         int stat = (p != nullptr) ? std::atoi(p + 7) : -1;
         lv_label_set_text(s_net_v[1], (stat == 1 || stat == 5)
-                                          ? "\xe5\xb7\xb2\xe6\xb3\xa8\xe5\x86\x8c"    // "已注册"
-                                          : "\xe6\x9c\xaa\xe6\xb3\xa8\xe5\x86\x8c");  // "未注册"
+                                          ? "已注册"
+                                          : "未注册");
     }
 
     std::string ip = mhal::network::GetIpAddress();
@@ -1001,7 +971,7 @@ void SetBtStateLabel(mhal::bt::ConnState st) {
     }
     if (s_bt_dev_cap != nullptr) {
         lv_label_set_text(s_bt_dev_cap, st == mhal::bt::ConnState::Scanning
-                                            ? "DEVICES \xc2\xb7 SCANNING"
+                                            ? "DEVICES · SCANNING"
                                             : "DEVICES");
     }
 }
@@ -1021,14 +991,14 @@ void SetBtRowAction(lv_obj_t* row, int state /*0=可连 1=连接中 2=已连接*
     if (action == nullptr)
         return;
     if (state == 2) {
-        lv_label_set_text(action, "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5");  // "已连接"
+        lv_label_set_text(action, "已连接");
         pi_theme::ApplyText(action, Tok::Ok);
     } else if (state == 1) {
         lv_label_set_text(action, "...");
         pi_theme::ApplyText(action, Tok::Accent);
     } else {
         lv_label_set_text(action,
-                          "\xe7\x82\xb9\xe6\x8c\x89\xe8\xbf\x9e\xe6\x8e\xa5");  // "点按连接"
+                          "点按连接");
         pi_theme::ApplyText(action, Tok::Accent);
     }
 }
@@ -1132,7 +1102,7 @@ void OnBtRescanClicked(lv_event_t*) {
 }
 
 void BuildBluetoothPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Bluetooth, "\xe8\x93\x9d\xe7\x89\x99", out_page);  // 蓝牙
+    lv_obj_t* content = MakePage(PageId::Bluetooth, "蓝牙", out_page);  // 蓝牙
 
     // 进页采样：扫描会把 ConnState 顶成 Scanning，"已连接"判定要用这份快照；
     // 缓存地址读一次备行匹配（见 AppendBtDeviceRow）。
@@ -1142,15 +1112,15 @@ void BuildBluetoothPage(lv_obj_t** out_page) {
     // 两档分段：音箱 RX / 发射 TX（模组无"关闭"AT，不设关闭档）
     lv_obj_t* seg_row = MakeFlexRow(content, kSegH);
     s_bt_seg[0] =
-        MakeSegBtn(seg_row, "\xe9\x9f\xb3\xe7\xae\xb1 RX", &font_puhui_24_4, OnBtSegClicked, 0);
+        MakeSegBtn(seg_row, "音箱 RX", &font_puhui_24_4, OnBtSegClicked, 0);
     s_bt_seg[1] =
-        MakeSegBtn(seg_row, "\xe5\x8f\x91\xe5\xb0\x84 TX", &font_puhui_24_4, OnBtSegClicked, 1);
+        MakeSegBtn(seg_row, "发射 TX", &font_puhui_24_4, OnBtSegClicked, 1);
     SegSetSelected(s_bt_seg, 2, BtSegIndexOf(mhal::bt::GetMode()));
 
     // 状态行：左中文"状态"，右 mono 状态
     lv_obj_t* st_row = MakeFlexRow(content, 40);
     lv_obj_t* st_k = lv_label_create(st_row);
-    lv_label_set_text(st_k, "\xe7\x8a\xb6\xe6\x80\x81");  // "状态"
+    lv_label_set_text(st_k, "状态");
     SetLabelFont(st_k, &font_puhui_20_4, Tok::Dim);
     lv_obj_t* sp = lv_obj_create(st_row);
     screen_strip_obj_chrome(sp);
@@ -1176,7 +1146,7 @@ void BuildBluetoothPage(lv_obj_t** out_page) {
     lv_obj_set_style_pad_row(s_bt_dev_list, 4, LV_PART_MAIN);
 
     // 「重新扫描」（"↻" 不在字体子集，省略图标）
-    MakeActionBtn(content, "\xe9\x87\x8d\xe6\x96\xb0\xe6\x89\xab\xe6\x8f\x8f", OnBtRescanClicked);
+    MakeActionBtn(content, "重新扫描", OnBtRescanClicked);
 
     SetBtStateLabel(mhal::bt::GetConnState());
 
@@ -1299,7 +1269,7 @@ void OnVolReleased(lv_event_t*) {
 }
 
 void BuildSoundPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Sound, "\xe5\xa3\xb0\xe9\x9f\xb3", out_page);  // "声音"
+    lv_obj_t* content = MakePage(PageId::Sound, "声音", out_page);
 
     // 音量卡片（测试音按钮省略：无现成提示音资源，TTS 播放依赖在线会话，
     // 成本与耦合都超出本期 —— 见工作包报告）
@@ -1319,7 +1289,7 @@ void BuildSoundPage(lv_obj_t** out_page) {
     lv_obj_t* lbl = lv_label_create(row);
     // "回复语音播报"
     lv_label_set_text(lbl,
-                      "\xe5\x9b\x9e\xe5\xa4\x8d\xe8\xaf\xad\xe9\x9f\xb3\xe6\x92\xad\xe6\x8a\xa5");
+                      "回复语音播报");
     SetLabelFont(lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_t* sp = lv_obj_create(row);
     screen_strip_obj_chrome(sp);
@@ -1409,7 +1379,7 @@ void OnSleepSegClicked(lv_event_t* e) {
 }
 
 void BuildDisplayPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Display, "\xe6\x98\xbe\xe7\xa4\xba", out_page);  // "显示"
+    lv_obj_t* content = MakePage(PageId::Display, "显示", out_page);
 
     // 亮度卡片（下限 5%，同快捷面板/backlight::Restore）
     lv_obj_t* brt_card = MakeCard(content, "BRT");
@@ -1445,8 +1415,8 @@ void BuildDisplayPage(lv_obj_t** out_page) {
         lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(c, 10, LV_PART_MAIN);
         lv_obj_t* lbl = lv_label_create(c);
-        lv_label_set_text(lbl, i == 0 ? "\xe6\xb7\xb1\xe8\x89\xb2"    // "深色"
-                                      : "\xe6\xb5\x85\xe8\x89\xb2");  // "浅色"
+        lv_label_set_text(lbl, i == 0 ? "深色"
+                                      : "浅色");
         lv_obj_set_style_text_font(lbl, &font_puhui_24_4, LV_PART_MAIN);
         lv_obj_set_style_text_color(lbl, pv.dim, LV_PART_MAIN);  // 真值在 ApplyThemeCardVisual
         lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
@@ -1460,7 +1430,7 @@ void BuildDisplayPage(lv_obj_t** out_page) {
     lv_obj_t* sleep_card = MakeCard(content, "SLEEP");
     lv_obj_t* sleep_row = MakeFlexRow(sleep_card, kSegH);
     static const char* kSleepTexts[4] = {"30s", "1min", "5min",
-                                         "\xe6\xb0\xb8\xe4\xb8\x8d"};  // "永不"
+                                         "永不"};
     for (int i = 0; i < 4; i++) {
         s_sleep_seg[i] = MakeSegBtn(sleep_row, kSleepTexts[i], &font_puhui_24_4, OnSleepSegClicked,
                                     static_cast<intptr_t>(i));
@@ -1481,7 +1451,7 @@ void OnModeSegClicked(lv_event_t* e) {
 }
 
 void BuildChatPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::Chat, "\xe5\xaf\xb9\xe8\xaf\x9d", out_page);  // "对话"
+    lv_obj_t* content = MakePage(PageId::Chat, "对话", out_page);
 
     lv_obj_t* mode_card = MakeCard(content, "MODE");
     lv_obj_t* seg_row = MakeFlexRow(mode_card, kSegH);
@@ -1490,10 +1460,7 @@ void BuildChatPage(lv_obj_t** out_page) {
     bool zen = s_hooks.get_zen != nullptr && s_hooks.get_zen();
     SegSetSelected(s_mode_seg, 2, zen ? 1 : 0);
     lv_obj_t* desc = lv_label_create(mode_card);
-    // "FLOW 过程全显 · ZEN 只看结果"
-    lv_label_set_text(desc,
-                      "FLOW \xe8\xbf\x87\xe7\xa8\x8b\xe5\x85\xa8\xe6\x98\xbe \xc2\xb7 ZEN "
-                      "\xe5\x8f\xaa\xe7\x9c\x8b\xe7\xbb\x93\xe6\x9e\x9c");
+    lv_label_set_text(desc, "FLOW 过程全显 · ZEN 只看结果");
     SetLabelFont(desc, &font_puhui_20_4, Tok::Faint);
 
     // 历史会话入口（展示性占位：会话历史规划走云端服务，本地不做——置灰
@@ -1501,7 +1468,7 @@ void BuildChatPage(lv_obj_t** out_page) {
     lv_obj_t* hist_card = MakeCard(content, nullptr);
     lv_obj_t* row = MakeFlexRow(hist_card, 56);
     lv_obj_t* lbl = lv_label_create(row);
-    lv_label_set_text(lbl, "\xe5\x8e\x86\xe5\x8f\xb2\xe4\xbc\x9a\xe8\xaf\x9d");  // "历史会话"
+    lv_label_set_text(lbl, "历史会话");
     SetLabelFont(lbl, &font_puhui_24_4, Tok::Faint);
     lv_obj_t* sp = lv_obj_create(row);
     screen_strip_obj_chrome(sp);
@@ -1530,26 +1497,22 @@ void RefreshFilesPage() {
     if (running) {
         std::string url = media_admin::httpd::GetUrl();
         std::snprintf(buf, sizeof(buf),
-                      "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad \xc2\xb7 %s",  // "运行中 · <url>"
+                      "运行中 · %s",  // "运行中 · <url>"
                       url.empty() ? "http://?" : url.c_str());
         lv_label_set_text(s_file_state_lbl, buf);
         pi_theme::ApplyText(s_file_state_lbl, Tok::Accent);
     } else if (!wifi_up) {
-        // "需连接 WiFi（4G 无法从外部访问）"
-        lv_label_set_text(s_file_state_lbl,
-                          "\xe9\x9c\x80\xe8\xbf\x9e\xe6\x8e\xa5 WiFi\xef\xbc\x88""4G "
-                          "\xe6\x97\xa0\xe6\xb3\x95\xe4\xbb\x8e\xe5\xa4\x96\xe9\x83\xa8"
-                          "\xe8\xae\xbf\xe9\x97\xae\xef\xbc\x89");
+        lv_label_set_text(s_file_state_lbl, "需连接 WiFi（4G 无法从外部访问）");
         pi_theme::ApplyText(s_file_state_lbl, Tok::Faint);
     } else {
         lv_label_set_text(s_file_state_lbl,
-                          "\xe6\x9c\xaa\xe5\x90\xaf\xe5\x8a\xa8");  // "未启动"
+                          "未启动");
         pi_theme::ApplyText(s_file_state_lbl, Tok::Dim);
     }
     if (s_file_btn_lbl != nullptr) {
         lv_label_set_text(s_file_btn_lbl,
-                          running ? "\xe5\x81\x9c\xe6\xad\xa2\xe6\x9c\x8d\xe5\x8a\xa1"   // "停止服务"
-                                  : "\xe5\x90\xaf\xe5\x8a\xa8\xe6\x9c\x8d\xe5\x8a\xa1");  // "启动服务"
+                          running ? "停止服务"
+                                  : "启动服务");
     }
 }
 
@@ -1570,14 +1533,12 @@ void OnFileToggleClicked(lv_event_t*) {
 void BuildFilesPage(lv_obj_t** out_page) {
     // "文件管理"
     lv_obj_t* content = MakePage(PageId::Files,
-                                 "\xe6\x96\x87\xe4\xbb\xb6\xe7\xae\xa1\xe7\x90\x86", out_page);
+                                 "文件管理", out_page);
 
     lv_obj_t* card = MakeCard(content, "MEDIA WEB ADMIN");
     // "在浏览器管理 SD 卡里 Music / Podcasts 的 MP3（列表 / 上传 / 目录 / 删除）"
     lv_obj_t* desc = lv_label_create(card);
-    lv_label_set_text(desc,
-                      "\xe5\x9c\xa8\xe6\xb5\x8f\xe8\xa7\x88\xe5\x99\xa8\xe7\xae\xa1\xe7\x90\x86 "
-                      "SD \xe5\x8d\xa1\xe9\x87\x8c Music / Podcasts \xe7\x9a\x84 MP3");
+    lv_label_set_text(desc, "在浏览器管理 SD 卡里 Music / Podcasts 的 MP3");
     SetLabelFont(desc, &font_puhui_20_4, Tok::Faint);
     lv_obj_set_width(desc, LV_PCT(100));
     lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
@@ -1589,7 +1550,7 @@ void BuildFilesPage(lv_obj_t** out_page) {
     lv_label_set_long_mode(s_file_state_lbl, LV_LABEL_LONG_WRAP);
 
     // 启动/停止按钮
-    lv_obj_t* btn = MakeActionBtn(card, "\xe5\x90\xaf\xe5\x8a\xa8\xe6\x9c\x8d\xe5\x8a\xa1",
+    lv_obj_t* btn = MakeActionBtn(card, "启动服务",
                                   OnFileToggleClicked);
     s_file_btn_lbl = lv_obj_get_child(btn, 0);
 
@@ -1600,18 +1561,18 @@ void BuildFilesPage(lv_obj_t** out_page) {
 // 关于页（只读 kv，打开时刷新一次）
 // ---------------------------------------------------------------------------
 void BuildAboutPage(lv_obj_t** out_page) {
-    lv_obj_t* content = MakePage(PageId::About, "\xe5\x85\xb3\xe4\xba\x8e", out_page);  // "关于"
+    lv_obj_t* content = MakePage(PageId::About, "关于", out_page);
 
     lv_obj_t* card = MakeCard(content, "DEVICE");
     char buf[96];
 
     // 电量（充电状态）
-    lv_obj_t* v_batt = MakeKvRow(card, "\xe7\x94\xb5\xe9\x87\x8f");  // "电量"
+    lv_obj_t* v_batt = MakeKvRow(card, "电量");
     int level = 0;
     bool chg = false, dis = false;
     if (mhal::power::GetBatteryLevel(level, chg, dis)) {
         if (chg) {
-            std::snprintf(buf, sizeof(buf), "%d%% \xc2\xb7 \xe5\x85\x85\xe7\x94\xb5\xe4\xb8\xad",
+            std::snprintf(buf, sizeof(buf), "%d%% · 充电中",
                           level);  // "· 充电中"
         } else {
             std::snprintf(buf, sizeof(buf), "%d%%", level);
@@ -1620,7 +1581,7 @@ void BuildAboutPage(lv_obj_t** out_page) {
     }
 
     // 电压 mV
-    lv_obj_t* v_volt = MakeKvRow(card, "\xe7\x94\xb5\xe5\x8e\x8b");  // "电压"
+    lv_obj_t* v_volt = MakeKvRow(card, "电压");
     uint16_t mv = 0;
     if (mhal::power::GetVoltageMv(mv)) {
         std::snprintf(buf, sizeof(buf), "%u mV", static_cast<unsigned>(mv));
@@ -1628,22 +1589,22 @@ void BuildAboutPage(lv_obj_t** out_page) {
     }
 
     // 固件版本（pi_sys_info.h 平台接口）
-    lv_obj_t* v_fw = MakeKvRow(card, "\xe5\x9b\xba\xe4\xbb\xb6");  // "固件"
+    lv_obj_t* v_fw = MakeKvRow(card, "固件");
     std::snprintf(buf, sizeof(buf), "claw6 v%s", pi_sys_fw_version());
     lv_label_set_text(v_fw, buf);
 
     // 网络类型 / IP
-    lv_obj_t* v_net = MakeKvRow(card, "\xe7\xbd\x91\xe7\xbb\x9c");  // "网络"
+    lv_obj_t* v_net = MakeKvRow(card, "网络");
     {
         bool wifi = mhal::network::GetType() == mhal::network::Type::WiFi;
         std::string ip = mhal::network::GetIpAddress();
-        std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s", wifi ? "WiFi" : "4G",
+        std::snprintf(buf, sizeof(buf), "%s · %s", wifi ? "WiFi" : "4G",
                       ip.empty() ? "--" : ip.c_str());
         lv_label_set_text(v_net, buf);
     }
 
     // 屏幕
-    lv_obj_t* v_scr = MakeKvRow(card, "\xe5\xb1\x8f\xe5\xb9\x95");  // "屏幕"
+    lv_obj_t* v_scr = MakeKvRow(card, "屏幕");
     lv_label_set_text(v_scr, "720x720 MIPI-DSI");
 }
 

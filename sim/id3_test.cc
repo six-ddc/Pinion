@@ -281,7 +281,7 @@ int RunUnitTests() {
         media_id3::Tags t = media_id3::ReadTags(tmp);
         Check(!t.title.empty() && t.title.back() != '\0', "T5 GBK title has no trailing NUL",
              "bytes=" + std::to_string(t.title.size()));
-        Check(t.title == "\xE4\xBD\xA0\xE5\xA5\xBD", "T5 GBK '你好' decoded", "title='" + t.title + "'");
+        Check(t.title == "你好", "T5 GBK '你好' decoded", "title='" + t.title + "'");
     }
 
     // ---- T6: ProbeDurationS —— CBR 估算与 Xing 帧数两条路径 ----------------

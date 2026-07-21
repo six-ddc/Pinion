@@ -1390,7 +1390,7 @@ extern "C" const char* pi_card_render_desc(void) {
         " COMMANDS (invoke cmd): " + BuildCommandsClause(true) +
         ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (survives new chats/"
         "reboot, replaces any prior pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an "
-        "on-screen \xe2\x9c\x95 also removes it).";
+        "on-screen ✕ also removes it).";
     return s.c_str();
 }
 
