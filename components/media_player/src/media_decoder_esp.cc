@@ -33,7 +33,13 @@ constexpr size_t kMaxGarbageBytes = 64 * 1024;
 
 void RegisterDefaultDecodersOnce() {
     static std::once_flag flag;
-    std::call_once(flag, [] { esp_audio_simple_dec_register_default(); });
+    std::call_once(flag, [] {
+        // 两层都要注册：esp_audio_dec_register_default 注册编解码器本体（MP3/AAC…，
+        // 受 CONFIG_AUDIO_DECODER_*_SUPPORT 控制）；simple 版只注册容器解析器
+        //（WAV/M4A/TS/OGG）。漏掉前者 open(TYPE_AAC) 直接 NOT_SUPPORT（真机实测 -7）。
+        esp_audio_dec_register_default();
+        esp_audio_simple_dec_register_default();
+    });
 }
 
 class EspDecoder : public MediaDecoder {
