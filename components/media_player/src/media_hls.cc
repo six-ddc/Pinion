@@ -175,8 +175,10 @@ class HlsStreamSource : public MediaSource {
                         ? playlist_.media_sequence
                         : std::max(playlist_.media_sequence, last - kLiveEdgeBack);
         demux_.Reset();
-        ESP_LOGI(TAG, "hls resolved: %d segs, target %ds, seq %lld%s", (int)playlist_.segment_urls.size(),
-                 playlist_.target_duration_s, (long long)next_seq_, playlist_.endlist ? " (vod)" : "");
+        // 日志一律避开 %lld/%zu：真机 newlib-nano 不认，变参错位会把后续 %s 当指针解引用
+        // 直接崩（实测 MTVAL 里全是 URL 文本）。序号打印取低位够诊断用。
+        ESP_LOGI(TAG, "hls resolved: %d segs, target %ds, seq %u%s", (int)playlist_.segment_urls.size(),
+                 playlist_.target_duration_s, (unsigned)next_seq_, playlist_.endlist ? " (vod)" : "");
         return true;
     }
 
@@ -187,8 +189,8 @@ class HlsStreamSource : public MediaSource {
             const int64_t first = playlist_.media_sequence;
             const int64_t end = first + (int64_t)playlist_.segment_urls.size();
             if (next_seq_ < first) {  // 落后滑窗（暂停过久/服务端重启）：跳回直播沿，丢中断的 PES
-                ESP_LOGW(TAG, "behind live window (seq %lld < %lld), rejoin edge", (long long)next_seq_,
-                         (long long)first);
+                ESP_LOGW(TAG, "behind live window (seq %u < %u), rejoin edge", (unsigned)next_seq_,
+                         (unsigned)first);
                 next_seq_ = std::max(first, end - kLiveEdgeBack);
                 demux_.Reset();
             }
@@ -238,12 +240,12 @@ class HlsStreamSource : public MediaSource {
                     adts_pos_ = 0;
                     demux_.Feed((const uint8_t*)seg.data(), seg.size(), adts_);
                     if (adts_.empty() && !demux_.found_unsupported()) {
-                        ESP_LOGW(TAG, "segment yielded no audio (%zuB ts)", seg.size());
+                        ESP_LOGW(TAG, "segment yielded no audio (%uB ts)", (unsigned)seg.size());
                         continue;  // 空片：直接试下一片
                     }
                     return true;
                 }
-                ESP_LOGW(TAG, "segment fetch failed (http %d), seq %lld", status, (long long)next_seq_);
+                ESP_LOGW(TAG, "segment fetch failed (http %d), seq %u", status, (unsigned)next_seq_);
             }
             // —— 失败：退避 + 整链重解析（token 过期换新会话）——
             if (fail_streak_start_us_ == 0) {
