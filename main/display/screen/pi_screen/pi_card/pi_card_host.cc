@@ -775,7 +775,7 @@ void OnUpdateEvent(const char* card_id, const char* payload_json) {
                 if (i) joined += "、";
                 joined += "'" + missing[i] + "'";
             }
-            ESP_LOGW(TAG, "update: %zu/%d batch patch node(s) not found", missing.size(),
+            ESP_LOGW(TAG, "update: %u/%d batch patch node(s) not found", (unsigned)missing.size(),
                      cJSON_GetArraySize(patchesj));
             ReportAsyncError(std::string("ui_update 批量 patch 部分失败：节点 ") + joined +
                              " 不存在（渲染时须给该节点一个 id 才能后续 update；其余已生效的节点不受影响）");

@@ -512,7 +512,7 @@ void DoSaveLast() {
     Settings s(kNvsNs, /*read_write=*/true);
     s.SetString(kNvsKey, j);
     s_last_saved = j;
-    ESP_LOGI(TAG, "media last saved (%zuB)", j.size());
+    ESP_LOGI(TAG, "media last saved (%uB)", (unsigned)j.size());
 }
 
 // TimerCb 每秒调：曲目/状态/列表变化立即存；稳态播放每 60s 采样一次 pos。
@@ -683,7 +683,7 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
 
     if (buf == nullptr) return false;
     s_cover_alloc_count++;
-    ESP_LOGI(TAG, "cover bitmap allocated %zuB, alloc_count=%d", buf_size, s_cover_alloc_count);
+    ESP_LOGI(TAG, "cover bitmap allocated %uB, alloc_count=%d", (unsigned)buf_size, s_cover_alloc_count);
     out->data = buf;
     out->dsc.header.cf = cf;
     out->dsc.header.w = out_w;
@@ -759,7 +759,9 @@ void CoverWorkerRun() {
             free(bytes);
             continue;
         }
-        ESP_LOGI(TAG, "cover: read %zuB in %ums mime=%s -> decode on LVGL thread", sz,
+        // %zu 是真机地雷：newlib-nano 不认、不消费参数，后面 %s 变参错位把耗时毫秒数当
+        // 指针 strlen → Load access fault（真机实测：播带封面 MP3 开全屏必崩）。
+        ESP_LOGI(TAG, "cover: read %uB in %ums mime=%s -> decode on LVGL thread", (unsigned)sz,
                  static_cast<unsigned>(t1 - t0), mime.c_str());
         // lv_async_call 操作 LVGL 内部链表，非线程安全：设备端持 esp_lv_adapter 锁，
         // sim 端（LV_USE_OS=PTHREAD）持 lv_lock，与各自的 lv_timer_handler 泵互斥。
