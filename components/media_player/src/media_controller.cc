@@ -207,18 +207,21 @@ struct MediaController::Impl : public PumpHost {
         esp_pthread_cfg_t prev_cfg;
         const bool had_prev_cfg = esp_pthread_get_cfg(&prev_cfg) == ESP_OK;
         esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-        // prio 与 LVGL 适配层同级（1）：解码若追不上实时会长期不阻塞，任何更高
-        // 优先级都会把 LVGL/IDLE 饿死（真机实测 UI 整机冻结 + task_wdt）。同级
-        // 靠 FreeRTOS 时间片轮转与 UI 分享核，播放任务(prio 4)消费侧不受影响。
+        // prio 2：高于 LVGL 适配层（1）、低于播放消费任务（4）。曾与 LVGL 同级靠时间片
+        // 分享核，但 AAC(esp_audio_codec) 解码比 minimp3 重，核 1 高负载时 prio 1 抢不到
+        // 片、解码跑不到实时 → 播放队列欠载嘟嘟卡顿（真机实测）。现在解码有 3s 水位
+        // 节流 + 每帧 2ms 让步 + FeedPlayback 背压，突发有界，不会复现早期"高优先级把
+        // LVGL/IDLE 饿死"的跑飞场景（那时无节流）。对照：官方固件 simple_player 任务
+        // prio 5 在同硬件上 UI 流畅。
         //
-        // 栈放 PSRAM（SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY 已开）：内部 SRAM 占用归零。
-        // 曾用 28KB 内部栈装 minimp3 scratch，低内存时拿不出连续内部块，pthread 建不
-        // 出来 → std::thread 抛异常 terminate 重启（真机实测）。scratch 现走 _ex 堆
-        // 分配（见 media_pump），16KB PSRAM 栈绰绰有余。约束：这两线程不得做需要
-        // 关 cache 的 flash 操作（SD 走 SDMMC、网络走 esp-hosted，均不涉及）。
-        cfg.prio = 1;
+        // 栈放**内部 SRAM**：曾放 PSRAM（当时动机是 minimp3 28KB 内部栈教训 + 内部占用
+        // 归零），但 esp_audio_codec 的 AAC 解码栈上工作集大，栈走 PSRAM 实测把解码拖到
+        // 近实时边缘（dec 占墙钟 ~90%），是卡顿另一半根因。16KB×2=32KB 内部堆可承受
+        //（解码器大状态在库内堆分配，不吃栈）。约束不变：这两线程不得做需要关 cache 的
+        // flash 操作（SD 走 SDMMC、网络走 esp-hosted，均不涉及）。
+        cfg.prio = 2;
         cfg.stack_size = 16 * 1024;
-        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+        cfg.stack_alloc_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
         esp_pthread_set_cfg(&cfg);
 #endif
         // 建线程可能因低内存失败抛 std::system_error：不接就是 std::terminate 整机
