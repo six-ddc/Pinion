@@ -50,12 +50,13 @@ class EspDecoder : public MediaDecoder {
     bool Open() {
         RegisterDefaultDecodersOnce();
         esp_audio_simple_dec_cfg_t cfg = {};
-        esp_aac_dec_cfg_t aac_cfg = {};
         if (codec_ == MediaCodec::AacAdts) {
             cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_AAC;
-            aac_cfg.aac_plus_enable = true;  // 电台可能是 HE-AAC，一并支持；ADTS 头自带参数
-            cfg.dec_cfg = &aac_cfg;
-            cfg.cfg_size = sizeof(aac_cfg);
+            // dec_cfg 用成员而非栈局部：官方例程里该结构在整个解码期间存活（simp_dec_all_t
+            // 函数级作用域），按闭源库可能持有指针的最保守假设对齐生命周期。
+            aac_cfg_.aac_plus_enable = true;  // 电台可能是 HE-AAC，一并支持；ADTS 头自带参数
+            cfg.dec_cfg = &aac_cfg_;
+            cfg.cfg_size = sizeof(aac_cfg_);
         } else {
             cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
         }
@@ -83,11 +84,17 @@ class EspDecoder : public MediaDecoder {
             esp_audio_simple_dec_out_t frame = {};
             frame.buffer = out_.data();
             frame.len = (uint32_t)out_.size();
+            raw.consumed = 0;
             esp_audio_err_t err = esp_audio_simple_dec_process(dec_, &raw, &frame);
             if (err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
                 out_.resize(frame.needed_size);  // 扩容重试，输入位置不动
                 continue;
             }
+            // 库**不自行推进输入**：官方例程每轮 process 后手动 raw.len -= consumed（注释
+            // "In case that input data contain multiple frames"）。漏推进 = 同一窗口反复
+            // 解码——真机实测嘟嘟循环音 + 单次 Feed 内跑出 76s 假产出把播放队列灌爆。
+            raw.buffer += raw.consumed;
+            raw.len -= raw.consumed;
             if (err == ESP_AUDIO_ERR_DATA_LACK) break;  // 余量不足一帧，留给下次
             if (err != ESP_AUDIO_ERR_OK) {
                 // 数据错误：解析器没有消费任何字节时手动跳 1 字节重同步；连续垃圾超限
@@ -110,6 +117,12 @@ class EspDecoder : public MediaDecoder {
                     ESP_LOGE(TAG, "bad stream info: rate=%u ch=%u bits=%u", (unsigned)info.sample_rate,
                              (unsigned)info.channel, (unsigned)info.bits_per_sample);
                     return false;
+                }
+                if (!info_logged_) {
+                    info_logged_ = true;  // 每曲首帧打一次流参数（真机排查解码配置用）
+                    ESP_LOGI(TAG, "stream: rate=%u ch=%u bits=%u frame=%uB dec_out=%uB", (unsigned)info.sample_rate,
+                             (unsigned)info.channel, (unsigned)info.bits_per_sample, (unsigned)info.frame_size,
+                             (unsigned)frame.decoded_size);
                 }
                 const int frames = (int)(frame.decoded_size / (2u * info.channel));
                 if (!on_frame((const int16_t*)out_.data(), frames, (int)info.channel, (int)info.sample_rate)) {
@@ -136,6 +149,7 @@ class EspDecoder : public MediaDecoder {
         if (dec_ != nullptr) esp_audio_simple_dec_reset(dec_);
         win_.clear();
         garbage_bytes_ = 0;
+        info_logged_ = false;
     }
 
     size_t discarded_tail() const override { return discarded_tail_; }
@@ -149,6 +163,8 @@ class EspDecoder : public MediaDecoder {
     }
 
     MediaCodec codec_;
+    esp_aac_dec_cfg_t aac_cfg_ = {};  // 生命周期须覆盖整个解码期（见 Open 注释）
+    bool info_logged_ = false;
     esp_audio_simple_dec_handle_t dec_ = nullptr;
     std::vector<uint8_t> win_;   // pending 输入（未消费的压缩字节）
     std::vector<uint8_t> out_;   // 解码输出 PCM 缓冲（按 needed_size 扩容）
