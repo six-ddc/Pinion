@@ -79,19 +79,21 @@ const char *pi_card_system_prompt(void);
     "A bound label's fmt MUST match the bound type and hold ONE placeholder: number paths %d/"       \
     "\"%d%%\", string paths %s (a %s on a number path is rejected — it would crash); use mono:true "  \
     "for numbers. A bind_data label shows card data[key] (put {value} in its text to inline it). "   \
-    "EVENTS are action arrays; decide per click — can the device finish it? YES → {do:'close'} | "   \
+    "EVENTS: action arrays, zero round-trip — {do:'close'} | "                                        \
     "{do:'set',path,value?} | {do:'toggle'|'show'|'hide',target:'id'} (a hidden:true block toggled "  \
     "for 'show details') | {do:'patch',target:'id',props:{text?,value?,checked?,hidden?,tone?,"      \
     "color?}} ({v}/{value} in props.text = triggering control's value) | {do:'invoke',cmd:'…'} (safe " \
-    "cmds run at once, others pop a firmware confirm) — all zero round-trip. Only {do:'report',text:" \
+    "cmds run at once, others pop a firmware confirm). Only {do:'report',text:"                        \
     "'…{v}…{label}…'} when you must generate/decide ({v}=value, {label}=choice's selected text; a "  \
     "report auto-carries every id'd control's value, choice as idx(label)). DATA: ui_update mutates " \
     "card data (data.set/append/remove/replace) and any list/bind_data label re-renders. PRESETS "    \
-    "shapes: see system prompt. Icons: Lucide names (wifi|battery|play|sun|cloud-rain|map-pin|"       \
-    "trending-up|check|x…); unknown name → dot. "                                                     \
+    "shapes: see system prompt. Icons: Lucide names (wifi|battery|play|check|x…); unknown name → "    \
+    "dot. "                                                                                            \
     "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
-    "Table data: a grid (cols=ratios, one cell/field row-major, role:section headers) aligns "        \
-    "columns without grow tricks."
+    "LAYOUT: row packs left, cross-centered; justify:'between' -> ends, align:'center' -> lone "       \
+    "item, not w. Buttons/choices-only row splits evenly; mixed w/ label/icon -> shrink; "             \
+    "slider/bar/arc/chart always fill. "                                                               \
+    "Table data: grid aligns columns, no grow tricks (see system prompt)."
 
 #define PI_CARD_RENDER_SCHEMA \
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \

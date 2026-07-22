@@ -587,21 +587,34 @@ struct CoverReady {
 // 映射 0 号——完全合法但 esp_new_jpeg 按"色度用 1 号表"的常规假设写死，遇共享表报
 // JPEG_ERR_BAD_DATA(-5)（真机实测，周杰伦专辑封面即此形态）。重写为常规形态：DHT
 // 复制一份改 id=1、SOS 色度分量映射改 0x11。宿主已验：产物合法且像素级零差异。
-// 返回 malloc 新缓冲；无需重写（已有 1 号表/结构不匹配）返回 nullptr 用原字节。
+// DHT 段内按"表"遍历而非"段"——ffmpeg/mjpeg 风格会把 DC0+AC0 两张表塞进同一个
+// DHT 段，只看段内第一字节会漏检、还会误判 has_id1。返回 malloc 新缓冲；无需重写
+// （已有 1 号表/结构不匹配）返回 nullptr 用原字节。输入是不可信 APIC 字节，任何越界
+// 迹象一律判畸形返回 nullptr。
 uint8_t* RewriteSharedHuffJpeg(const uint8_t* in, size_t sz, size_t* out_sz) {
     if (in == nullptr || sz < 4 || in[0] != 0xFF || in[1] != 0xD8) return nullptr;
-    // 第一遍：定位 DC0/AC0 表与 SOS，确认没有 1 号表
+    // 第一遍：逐 DHT 段内逐表扫描，定位 DC0/AC0 表的精确字节区间，并确认没有 1 号表
     size_t dc0_off = 0, dc0_len = 0, ac0_off = 0, ac0_len = 0, sos_off = 0, sos_len = 0;
     bool has_id1 = false;
     for (size_t i = 2; i + 4 <= sz && in[i] == 0xFF;) {
         const uint8_t marker = in[i + 1];
         const size_t seg = 2 + (((size_t)in[i + 2] << 8) | in[i + 3]);
         if (i + seg > sz) return nullptr;
-        if (marker == 0xC4 && seg >= 5) {
-            const uint8_t tc_th = in[i + 4];
-            if (tc_th == 0x00) { dc0_off = i; dc0_len = seg; }
-            if (tc_th == 0x10) { ac0_off = i; ac0_len = seg; }
-            if ((tc_th & 0x0F) != 0) has_id1 = true;
+        if (marker == 0xC4) {
+            size_t p = i + 4;              // 段内第一张表起点（紧跟 FF C4 + 2 字节长度）
+            const size_t seg_end = i + seg;
+            while (p < seg_end) {
+                if (p + 17 > seg_end) return nullptr;  // 装不下 tc_th(1)+计数(16)，畸形
+                const uint8_t tc_th = in[p];
+                size_t sym_count = 0;
+                for (int k = 0; k < 16; k++) sym_count += in[p + 1 + k];
+                const size_t table_len = 17 + sym_count;  // tc_th(1)+计数(16)+符号(N)
+                if (p + table_len > seg_end) return nullptr;  // 表区间超出段界，畸形
+                if (tc_th == 0x00) { dc0_off = p; dc0_len = table_len; }
+                if (tc_th == 0x10) { ac0_off = p; ac0_len = table_len; }
+                if ((tc_th & 0x0F) != 0) has_id1 = true;
+                p += table_len;
+            }
         } else if (marker == 0xDA) {
             sos_off = i;
             sos_len = seg;
@@ -610,21 +623,38 @@ uint8_t* RewriteSharedHuffJpeg(const uint8_t* in, size_t sz, size_t* out_sz) {
         i += seg;
     }
     if (has_id1 || dc0_len == 0 || ac0_len == 0 || sos_off == 0 || sos_len < 8) return nullptr;
-    uint8_t* out = static_cast<uint8_t*>(malloc(sz + dc0_len + ac0_len));
+    // SOS 长度字段须与 Ns 分量数自洽（6 + 2*Ns，含长度字段自身 2 字节）；不符即畸形
+    const size_t ns = in[sos_off + 4];
+    const size_t sos_len_field = (((size_t)in[sos_off + 2] << 8) | in[sos_off + 3]);
+    if (sos_len_field != 6 + 2 * ns || sos_len != 2 + sos_len_field) return nullptr;
+    // 第二遍：按记录的表区间合成两段全新 DHT（FF C4 + 2 字节长度 + 表内容，tc_th 改 1 号）
+    const size_t new_dc_seg_len = 4 + dc0_len;
+    const size_t new_ac_seg_len = 4 + ac0_len;
+    uint8_t* out = static_cast<uint8_t*>(malloc(sz + new_dc_seg_len + new_ac_seg_len));
     if (out == nullptr) return nullptr;
     size_t o = 0;
     std::memcpy(out, in, sos_off);  // SOS 之前原样（含既有 DHT）
     o = sos_off;
-    std::memcpy(out + o, in + dc0_off, dc0_len);  // 复制表改 id=1
-    out[o + 4] = 0x01;
+    out[o++] = 0xFF;
+    out[o++] = 0xC4;
+    const size_t dc_len_field = dc0_len + 2;
+    out[o++] = static_cast<uint8_t>(dc_len_field >> 8);
+    out[o++] = static_cast<uint8_t>(dc_len_field & 0xFF);
+    std::memcpy(out + o, in + dc0_off, dc0_len);
+    out[o] = 0x01;  // tc_th 改 DC1
     o += dc0_len;
+    out[o++] = 0xFF;
+    out[o++] = 0xC4;
+    const size_t ac_len_field = ac0_len + 2;
+    out[o++] = static_cast<uint8_t>(ac_len_field >> 8);
+    out[o++] = static_cast<uint8_t>(ac_len_field & 0xFF);
     std::memcpy(out + o, in + ac0_off, ac0_len);
-    out[o + 4] = 0x11;
+    out[o] = 0x11;  // tc_th 改 AC1
     o += ac0_len;
     std::memcpy(out + o, in + sos_off, sz - sos_off);  // SOS + 熵流
-    const size_t ns = out[o + 4];
-    for (size_t c = 0; c < ns && o + 6 + c * 2 < sz + dc0_len + ac0_len; c++) {
-        if (out[o + 5 + c * 2] != 1) out[o + 6 + c * 2] = 0x11;  // 色度分量 → DC1/AC1
+    const size_t sos_start_in_out = o;
+    for (size_t c = 0; c < ns; c++) {
+        if (out[sos_start_in_out + 5 + c * 2] != 1) out[sos_start_in_out + 6 + c * 2] = 0x11;  // 色度分量 → DC1/AC1
     }
     *out_sz = o + (sz - sos_off);
     return out;
@@ -668,6 +698,12 @@ bool DecodeJpegDirectEsp(const uint8_t* raw_bytes, size_t raw_len, int w, int h,
             ESP_LOGW(TAG, "cover: jpeg parse_header err=%d", (int)err);
             break;
         }
+        // 闭源库自报的 dims 不可信：与此前 PeekImageSize 门控过的 w/h 比对，不一致就
+        // 放弃直解走既有回落，不把后续 outbuf_len/bitmap_size 计算建立在它之上。
+        if ((int)hi.width != w || (int)hi.height != h) {
+            ESP_LOGW(TAG, "cover: jpeg dims mismatch hdr=%dx%d peek=%dx%d", (int)hi.width, (int)hi.height, w, h);
+            break;
+        }
         if (jpeg_dec_get_outbuf_len(dec, &outbuf_len) != JPEG_ERR_OK || outbuf_len <= 0) break;
         out_aligned = static_cast<uint8_t*>(jpeg_calloc_align((size_t)outbuf_len, 16));
         if (out_aligned == nullptr) break;
@@ -682,7 +718,9 @@ bool DecodeJpegDirectEsp(const uint8_t* raw_bytes, size_t raw_len, int w, int h,
             // 解码器若按 MCU 补齐输出（如 180→192），行距假设不成立——先记录，见到再适配
             ESP_LOGW(TAG, "cover: outbuf_len=%d != w*h*3=%u", outbuf_len, (unsigned)bitmap_size);
         }
-        bitmap = static_cast<uint8_t*>(malloc(bitmap_size));
+        // outbuf_len < bitmap_size 时尾部没有解码数据覆盖——calloc 置零，不让未初始化
+        // 堆内存当像素上屏。
+        bitmap = static_cast<uint8_t*>(calloc(1, bitmap_size));
         if (bitmap == nullptr) break;
         std::memcpy(bitmap, out_aligned, std::min((size_t)outbuf_len, bitmap_size));
         // esp_new_jpeg 输出 R,G,B 字节序；LVGL 的 LV_COLOR_FORMAT_RGB888 按小端 B,G,R

@@ -71,8 +71,16 @@ class EspDecoder : public MediaDecoder {
 
     bool Feed(const uint8_t* data, size_t len, bool at_eof, const FrameFn& on_frame) override {
         if (dec_ == nullptr) return false;
-        if (data != nullptr && len > 0) win_.insert(win_.end(), data, data + len);
-        if (win_.empty()) return true;
+        if (data != nullptr && len > 0) {
+            win_.insert(win_.end(), data, data + len);
+            got_data_ = true;
+        }
+        if (win_.empty()) {
+            // win_ 空且非 EOS：无事可做。win_ 空且 EOS 但本曲从未喂过数据：解码器内部
+            // 无缓存，同样无需 flush。只有"喂过数据 + 现在到 EOS"才需要跑 flush 榨尾帧。
+            if (!at_eof || !got_data_) return true;
+            return FlushTail(on_frame);
+        }
 
         esp_audio_simple_dec_raw_t raw = {};
         raw.buffer = win_.data();
@@ -87,21 +95,25 @@ class EspDecoder : public MediaDecoder {
             raw.consumed = 0;
             esp_audio_err_t err = esp_audio_simple_dec_process(dec_, &raw, &frame);
             if (err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                out_.resize(frame.needed_size);  // 扩容重试，输入位置不动
+                if (!GrowOutBuf(frame.needed_size)) return false;
                 continue;
             }
             // 库**不自行推进输入**：官方例程每轮 process 后手动 raw.len -= consumed（注释
             // "In case that input data contain multiple frames"）。漏推进 = 同一窗口反复
             // 解码——真机实测嘟嘟循环音 + 单次 Feed 内跑出 76s 假产出把播放队列灌爆。
-            raw.buffer += raw.consumed;
-            raw.len -= raw.consumed;
+            const uint32_t consumed = raw.consumed;
+            raw.buffer += consumed;
+            raw.len -= consumed;
             if (err == ESP_AUDIO_ERR_DATA_LACK) break;  // 余量不足一帧，留给下次
             if (err != ESP_AUDIO_ERR_OK) {
-                // 数据错误：解析器没有消费任何字节时手动跳 1 字节重同步；连续垃圾超限
-                // 判不可解流（典型：非音频内容被当作码流喂入）。
+                // 数据错误：解析器完全没消费时手动跳 1 字节重同步；已消费 consumed>0 时
+                // 说明库自己推进过边界，不再额外 +1（否则会吃掉下一有效帧的首字节）。
+                // 连续垃圾超限判不可解流（典型：非音频内容被当作码流喂入）。
                 if (raw.len == 0) break;
-                raw.buffer += 1;
-                raw.len -= 1;
+                if (consumed == 0) {
+                    raw.buffer += 1;
+                    raw.len -= 1;
+                }
                 if (++garbage_bytes_ > kMaxGarbageBytes) {
                     ESP_LOGE(TAG, "stream undecodable: %uB continuous garbage (err=%d)",
                              (unsigned)garbage_bytes_, (int)err);
@@ -111,23 +123,7 @@ class EspDecoder : public MediaDecoder {
             }
             if (frame.decoded_size > 0) {
                 garbage_bytes_ = 0;
-                esp_audio_simple_dec_info_t info = {};
-                if (esp_audio_simple_dec_get_info(dec_, &info) != ESP_AUDIO_ERR_OK || info.channel == 0 ||
-                    info.sample_rate == 0 || info.bits_per_sample != 16) {
-                    ESP_LOGE(TAG, "bad stream info: rate=%u ch=%u bits=%u", (unsigned)info.sample_rate,
-                             (unsigned)info.channel, (unsigned)info.bits_per_sample);
-                    return false;
-                }
-                if (!info_logged_) {
-                    info_logged_ = true;  // 每曲首帧打一次流参数（真机排查解码配置用）
-                    ESP_LOGI(TAG, "stream: rate=%u ch=%u bits=%u frame=%uB dec_out=%uB", (unsigned)info.sample_rate,
-                             (unsigned)info.channel, (unsigned)info.bits_per_sample, (unsigned)info.frame_size,
-                             (unsigned)frame.decoded_size);
-                }
-                const int frames = (int)(frame.decoded_size / (2u * info.channel));
-                if (!on_frame((const int16_t*)out_.data(), frames, (int)info.channel, (int)info.sample_rate)) {
-                    aborted = true;  // 上层要求中止（stop）：丢弃剩余输入即可
-                }
+                if (!EmitFrame(frame, on_frame)) aborted = true;  // 上层要求中止（stop）
             } else if (raw.len == len_before) {
                 break;  // 无消费亦无输出：防御性防自旋（正常路径不应到达）
             }
@@ -150,6 +146,7 @@ class EspDecoder : public MediaDecoder {
         win_.clear();
         garbage_bytes_ = 0;
         info_logged_ = false;
+        got_data_ = false;
     }
 
     size_t discarded_tail() const override { return discarded_tail_; }
@@ -162,9 +159,63 @@ class EspDecoder : public MediaDecoder {
         }
     }
 
+    // BUFF_NOT_ENOUGH 扩容重试：needed_size 必须严格大于当前容量（否则是异常值，扩了也
+    // 白扩、会无限 continue 自旋），且不超 256KB 上限；两者违反都判不可恢复错误。
+    bool GrowOutBuf(uint32_t needed_size) {
+        constexpr size_t kMaxOutBuf = 256 * 1024;
+        if (needed_size <= out_.size() || needed_size > kMaxOutBuf) {
+            ESP_LOGE(TAG, "BUFF_NOT_ENOUGH resize rejected: needed=%u cur=%u cap=%u", (unsigned)needed_size,
+                     (unsigned)out_.size(), (unsigned)kMaxOutBuf);
+            return false;
+        }
+        out_.resize(needed_size);  // 扩容重试，输入位置不动
+        return true;
+    }
+
+    // 把 frame（已确认 decoded_size>0）交给上层；失败返回 false（流参数异常，不可恢复）。
+    bool EmitFrame(const esp_audio_simple_dec_out_t& frame, const FrameFn& on_frame) {
+        esp_audio_simple_dec_info_t info = {};
+        if (esp_audio_simple_dec_get_info(dec_, &info) != ESP_AUDIO_ERR_OK || info.channel == 0 ||
+            info.sample_rate == 0 || info.bits_per_sample != 16) {
+            ESP_LOGE(TAG, "bad stream info: rate=%u ch=%u bits=%u", (unsigned)info.sample_rate,
+                     (unsigned)info.channel, (unsigned)info.bits_per_sample);
+            return false;
+        }
+        if (!info_logged_) {
+            info_logged_ = true;  // 每曲首帧打一次流参数（真机排查解码配置用）
+            ESP_LOGI(TAG, "stream: rate=%u ch=%u bits=%u frame=%uB dec_out=%uB", (unsigned)info.sample_rate,
+                     (unsigned)info.channel, (unsigned)info.bits_per_sample, (unsigned)info.frame_size,
+                     (unsigned)frame.decoded_size);
+        }
+        const int frames = (int)(frame.decoded_size / (2u * info.channel));
+        return on_frame((const int16_t*)out_.data(), frames, (int)info.channel, (int)info.sample_rate);
+    }
+
+    // win_ 已空时的 EOS flush：库可能内部缓存了尚未吐出的尾帧（如容器解析器的
+    // look-ahead），靠 len=0 + eos=true 反复 process 直到无更多输出才算榨干。
+    bool FlushTail(const FrameFn& on_frame) {
+        for (;;) {
+            esp_audio_simple_dec_raw_t raw = {};
+            raw.eos = true;
+            esp_audio_simple_dec_out_t frame = {};
+            frame.buffer = out_.data();
+            frame.len = (uint32_t)out_.size();
+            esp_audio_err_t err = esp_audio_simple_dec_process(dec_, &raw, &frame);
+            if (err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                if (!GrowOutBuf(frame.needed_size)) return false;
+                continue;
+            }
+            if (err != ESP_AUDIO_ERR_OK || frame.decoded_size == 0) break;  // 榨干完毕
+            garbage_bytes_ = 0;
+            if (!EmitFrame(frame, on_frame)) break;  // 上层要求中止：停止 flush 即可
+        }
+        return true;
+    }
+
     MediaCodec codec_;
     esp_aac_dec_cfg_t aac_cfg_ = {};  // 生命周期须覆盖整个解码期（见 Open 注释）
     bool info_logged_ = false;
+    bool got_data_ = false;      // 本曲是否喂过任何字节（决定 EOS 时是否需要 flush）
     esp_audio_simple_dec_handle_t dec_ = nullptr;
     std::vector<uint8_t> win_;   // pending 输入（未消费的压缩字节）
     std::vector<uint8_t> out_;   // 解码输出 PCM 缓冲（按 needed_size 扩容）

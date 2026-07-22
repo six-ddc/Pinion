@@ -160,6 +160,28 @@ bool HasCjk(const char* s) {
         if (*p >= 0x80) return true;  // 任意非 ASCII 字节 → 含中文/多字节
     return false;
 }
+// text 里的下一个 UTF-8 码点：*p 指向当前起始字节，返回码点值并把 *p 推进到下一字符起点。
+// 不做严格合法性校验——调用方的 text 来自已解析的 JSON 字符串，必为合法 UTF-8；畸形字节按
+// 单字节步进兜底，只求不越界/不死循环，不追求处理非法输入的语义正确性。供 SafeFont 的
+// puhui_24_4 逐码点覆盖检查用。
+uint32_t NextUtf8Codepoint(const char*& p) {
+    const unsigned char c0 = static_cast<unsigned char>(*p);
+    if (c0 < 0x80) { ++p; return c0; }
+    int extra;
+    uint32_t cp;
+    if ((c0 & 0xE0) == 0xC0) { extra = 1; cp = c0 & 0x1F; }
+    else if ((c0 & 0xF0) == 0xE0) { extra = 2; cp = c0 & 0x0F; }
+    else if ((c0 & 0xF8) == 0xF0) { extra = 3; cp = c0 & 0x07; }
+    else { ++p; return c0; }  // 畸形起始字节：当单字节处理
+    ++p;
+    for (int i = 0; i < extra; ++i) {
+        const unsigned char cc = static_cast<unsigned char>(*p);
+        if ((cc & 0xC0) != 0x80) return cp;  // 畸形续字节：提前收尾，已读字节不回退
+        cp = (cp << 6) | (cc & 0x3F);
+        ++p;
+    }
+    return cp;
+}
 // ------------------------------ 共享几何样式 -------------------------------
 // 卡片控件的「主题无关」几何属性（圆角/内距/描边宽/阴影）收敛成一组进程级
 // 静态 lv_style_t，各控件用 lv_obj_add_style 复用，替代每次渲染逐属性 set_local。
@@ -322,13 +344,33 @@ bool IsInteractive(const char* type) {
            std::strcmp(type, "choice") == 0;
 }
 
+// button/choice 是"内容可能很短也可能很长"的交互控件：在纯控件行（IsGrowable 全员，如一排
+// 按钮）里均分整行观感最好；一旦行里混了任何非 growable 兄弟（label/icon/switch/嵌套容器等），
+// 均分会把兄弟挤没（如「温度 23°C」+「刷新」按钮，按钮吃掉大半行）——这类混排应退回内容自适应
+// 宽。slider/bar/arc/chart/spacer 不受此收窄限制（数值/进度类控件本就该撑满剩余空间），
+// 由 ApplySizing 单独判定，见调用处。
+bool IsRowGrowConditional(const char* type) {
+    return std::strcmp(type, "button") == 0 || std::strcmp(type, "choice") == 0;
+}
+
 // ------------------------------ 自适应尺寸 ---------------------------------
-// parent_flow: 0=column（含 root）, 1=row, 2=grid。growable/label 在 column 里默认全宽、
-// 在 row 里默认按比例分配（flex-grow 1），使「一排按钮均分」「一列控件铺满」这
-// 类最简 JSON 也有好布局。显式 w/grow 永远优先。grid 子项尺寸由 lv_obj_set_grid_cell
-// 的 col_align 接管（见 grid 分支），故 ApplySizing 对 grid 子项跳过全部 flex 默认。
-enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2 };
-void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_flow) {
+// parent_flow: 0=column（含 root）, 1=row, 2=grid, 3=内容宽列（FLOW_COL_CONTENT）。growable/
+// label 在普通 column 里默认全宽、在 row 里默认按比例分配（flex-grow 1），使「一排按钮均分」
+// 「一列控件铺满」这类最简 JSON 也有好布局。显式 w/grow 永远优先。grid 子项尺寸由
+// lv_obj_set_grid_cell 的 col_align 接管（见 grid 分支），故 ApplySizing 对 grid 子项跳过全部
+// flex 默认。FLOW_COL_CONTENT：嵌套在 row（或另一个内容宽列）里、自己也没显式 w/grow 的列——
+// 它自己是 LV_SIZE_CONTENT（内容宽，见 RenderNode 的建容器段落），子节点若还按普通 FLOW_COL
+// 默认 100% 宽，就是「父等子内容、子等父 100%」的循环引用，LVGL 实测直接塌陷成 0 宽、整卡
+// 空白——FLOW_COL_CONTENT 下子节点一律退回自然宽，打破循环。
+enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2, FLOW_COL_CONTENT = 3 };
+
+// row_all_growable：本节点所在这一整行的子节点是否**清一色**都是 IsGrowable 类型——由调用方
+// （RenderNode/RenderPreviewNode/PreviewSyncContainer 的 row 子节点遍历处）扫一遍该行的 JSON
+// children 算出，只在 parent_flow==FLOW_ROW 且 type 是 IsRowGrowConditional（button/choice）
+// 时被读取；其它类型/其它 parent_flow 下这个参数是死值，调用方不关心时传默认 true 即可
+// （容器自身、grid 单元等场景）。
+void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_flow,
+                 bool row_all_growable = true) {
     if (parent_flow == FLOW_GRID) {
         // grid 单元的 growable/STRETCH 由 set_grid_cell 决定，这里只落显式 w/h（无则不动）。
         if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
@@ -345,15 +387,46 @@ void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_
         // 吃掉竖向空间把卡片撑高。列内当固定小间隔（见下方默认高）。
         if (parent_flow == FLOW_ROW) lv_obj_set_flex_grow(obj, 1);
     } else if (std::strcmp(type, "divider") == 0) {
-        lv_obj_set_width(obj, LV_PCT(100));
+        // 行内竖分隔：定宽 2px，不参与均分/自适应，高度交给下方"显式 h 优先，否则跟随交叉轴"
+        // 的兜底段落；普通 column/顶层维持横线全宽不变；FLOW_COL_CONTENT（内容宽列）里同 R-1
+        // 的循环引用问题，不强推 PCT(100)，退自然宽（罕见用法：分隔线极少配在窄内容列里）。
+        if (parent_flow == FLOW_ROW) lv_obj_set_width(obj, 2);
+        else if (parent_flow != FLOW_COL_CONTENT) lv_obj_set_width(obj, LV_PCT(100));
     } else if (parent_flow == FLOW_ROW) {
-        if (IsGrowable(type)) lv_obj_set_flex_grow(obj, 1);
-        // row 里的 label/icon/switch 保持自然宽，多件并排更自然
-    } else {  // column
+        if (IsGrowable(type)) {
+            // button/choice 只在整行都是 growable 类型时才均分；混了 label/icon/switch/嵌套
+            // 容器等非 growable 兄弟时保持内容自适应宽（不设 flex_grow，即 LVGL 默认行为）。
+            if (!IsRowGrowConditional(type) || row_all_growable) lv_obj_set_flex_grow(obj, 1);
+        }
+        // row 里的 label/icon/switch（以及行内有非 growable 兄弟时的 button/choice）保持自然宽
+    } else if (parent_flow == FLOW_COL_CONTENT) {
+        // 内容宽列：子节点一律自然宽，不做 100% 默认（见枚举头注的循环引用说明）。显式 w/grow
+        // 已在链首两个分支处理过，这里什么都不用做。
+    } else {  // column（含顶层 root）
         if (IsGrowable(type) || std::strcmp(type, "label") == 0) lv_obj_set_width(obj, LV_PCT(100));
     }
     if (HasKey(node, "h")) lv_obj_set_height(obj, GetInt(node, "h", 0));
     else if (spacer && parent_flow != FLOW_ROW) lv_obj_set_height(obj, 8);
+    else if (std::strcmp(type, "divider") == 0 && parent_flow == FLOW_ROW) {
+        // 撑满行交叉轴：实测 LV_PCT(100) 在"行自身是 LV_SIZE_CONTENT"时不解析（塌成 0 高、
+        // 线不可见）——LVGL 这里没有做"先量内容定容器高、再解析百分比子项"的二次布局，百分比
+        // 高度子项按当时容器高求值，容器还没定型就是 0。改用固定像素高（20px，贴近单行正文
+        // 字高），实测可见、跨常见字号不突兀。create 分支的默认 1px 到此被覆盖。
+        lv_obj_set_height(obj, 20);
+    }
+}
+
+// 供 RenderNode（正式渲染）与 RenderPreviewNode/PreviewSyncContainer（流式预览）在各自的 row
+// 子节点遍历入口调用一次：该行的 JSON children 是否清一色都是 IsGrowable 类型。非数组/缺失
+// 按"清一色"处理（回落旧行为，反正没有子节点可判）。
+bool RowChildrenAllGrowable(const cJSON* children) {
+    if (!children || !cJSON_IsArray(children)) return true;
+    const cJSON* c = nullptr;
+    cJSON_ArrayForEach(c, children) {
+        const char* ct = GetStr(c, "type");
+        if (!ct || !IsGrowable(ct)) return false;
+    }
+    return true;
 }
 
 // ------------------------------ 默认精致样式 -------------------------------
@@ -688,6 +761,23 @@ bool SafeFont(const lv_font_t*& font, const char* text) {
         font = &font_puhui_20_4;
         return true;
     }
+    // font_puhui_24_4 是「UI chrome 静态文案子集」（pi_fonts.h 头注：静态文案子集，缺字重跑
+    // gen_puhui_24.py），不是完整常用字集——role:heading 用它时，动态/未预料到的中文常缺字
+    // 渲成豆腐块 □（design_guide 实测：晴/暴/雨在 heading 缺字，在 title/label 正常）。逐码点
+    // 用 lv_font_get_glyph_dsc 查真实字形覆盖——与渲染器实际取字形同一 API（含 fallback 链），
+    // 结果与实际渲染是否豆腐块完全一致；有一个缺字就整串回退到 puhui_30_4（下一档完整字集，
+    // 24→30 略大但不豆腐，唯一代价）。ASCII/已覆盖文本原样留在 24px，不受影响。
+    if (font == &font_puhui_24_4 && text && *text) {
+        const char* p = text;
+        while (*p) {
+            const uint32_t cp = NextUtf8Codepoint(p);
+            lv_font_glyph_dsc_t dsc;
+            if (!lv_font_get_glyph_dsc(&font_puhui_24_4, &dsc, cp, 0)) {
+                font = &font_puhui_30_4;
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -836,7 +926,7 @@ bool TemplateUsesIndex(const cJSON* item_tpl) {
 
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
                      int depth, int& node_count, std::string& err, int parent_flow,
-                     bool in_list_row) {
+                     bool in_list_row, bool row_all_growable) {
     EnsureCardStyles();  // 惰性初始化共享几何样式（首次进入即建，覆盖全部下游入口）
     if (!cJSON_IsObject(node)) {
         err = "node is not an object";
@@ -861,12 +951,34 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
 
     if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
         const bool is_row = std::strcmp(type, "row") == 0;
-        this_flow = is_row ? FLOW_ROW : FLOW_COL;
+        // col_content_width：本容器是不是"列、且自己会被判定为内容宽"（父是 row 或父本身也是
+        // 内容宽列、且自己无显式 w/grow——有 grow 会被 flex_grow 撑成确定宽，不算）。是的话，
+        // this_flow 用 FLOW_COL_CONTENT 而非普通 FLOW_COL 往下传：ApplySizing 的列分支默认给
+        // growable/label 打 100% 宽，但"父是内容宽（未定）、子又要 100%"是循环引用——LVGL 实测
+        // 直接塌陷成 0 宽、整卡空白（不是理论推测，是本轮踩出来的真实 bug）。FLOW_COL_CONTENT
+        // 让子节点也退回自然宽，打破循环；FLOW_ROW 不受影响（row 子节点从不用百分比宽，只用
+        // flex_grow 或自然宽，没有这个循环）。
+        const bool col_content_width = !is_row &&
+                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                       !HasKey(node, "w") && !HasKey(node, "grow");
+        this_flow = is_row ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
         obj = lv_obj_create(parent);
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+        // 嵌套容器默认宽：父是 row（或父是内容宽列，链式传递）时用内容宽（LV_SIZE_CONTENT），
+        // 让并排的两个 column/row 各自窄到自己内容、不再互相挤到下一行；父是 column/顶层（含
+        // grid，未受影响）时维持 PCT(100)——列内容器满宽本就是正确默认。显式 grow 仍优先：
+        // ApplySizing 随后若见到 grow 键会用 flex_grow 撑开，不受这里初始宽度影响（LVGL
+        // flex_grow>0 时按主轴权重分配，不看 width 属性——这也是 grow 转义舱不受循环引用影响
+        // 的原因：flex_grow 撑出的是确定宽，不是内容宽）。
+        if (HasKey(node, "w")) {
+            lv_obj_set_width(obj, GetInt(node, "w", 0));
+        } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) {
+            lv_obj_set_width(obj, LV_SIZE_CONTENT);
+        } else {
+            lv_obj_set_width(obj, LV_PCT(100));
+        }
         lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
         // row 支持自动换行，超宽不裁剪 —— 自适应关键。
         lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
@@ -950,7 +1062,17 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
         if (const char* txt = GetStr(node, "text")) lv_label_set_text(obj, txt);
-        lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        if (parent_flow == FLOW_ROW) {
+            // 行内 label 天生自然宽、不设宽度上限——超长文本会把行撑宽到自动换行
+            // （LV_FLEX_FLOW_ROW_WRAP），把 button 等兄弟挤到下一行竖排（坑F）。夹一个
+            // max_width（占行 60%，短文本不受影响，仍是内容宽）+ 单行省略号，超长文本在自己
+            // 槽位内截断，不再挤占兄弟的位置。列内 label（含顶层）保持原 WRAP 换行，不变——
+            // 那是段落文本的正确默认。
+            lv_obj_set_style_max_width(obj, LV_PCT(60), LV_PART_MAIN);
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+        } else {
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        }
         ApplyLabelStyle(obj, node);  // role/size 排版 + 颜色
     } else if (std::strcmp(type, "icon") == 0) {
         Tok tok = Tok::Dim;  // 图标默认次要（Dim）；重点图标可 tone:tx/accent
@@ -1159,7 +1281,7 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     ApplyDefaultStyle(obj, type, depth);
     // label/button/icon 的字体与颜色已在各自分支处理。
     ApplyCommonProps(obj, type, node, card, in_list_row);
-    ApplySizing(obj, type, node, parent_flow);  // 自适应尺寸：按父容器主轴定默认
+    ApplySizing(obj, type, node, parent_flow, row_all_growable);  // 自适应尺寸：按父容器主轴定默认
 
     // bind（放在 value/checked 之后覆盖静态初值）
     if (const char* path = GetStr(node, "bind")) ApplyBind(obj, type, path, node, card);
@@ -1213,11 +1335,15 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     // 递归子节点（把本容器的 flow 传给子级做自适应尺寸）
     if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
         const cJSON* children = GetItem(node, "children");
+        // row 里 button/choice 是否均分整行取决于这一整行的兄弟构成，扫一遍算一次，传给每个
+        // 孩子（column 场景下这个值是死值，不影响什么）。见 ApplySizing/IsRowGrowConditional。
+        const bool child_row_all_growable =
+            this_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) {
                 if (!RenderNode(obj, child, card, limits, depth + 1, node_count, err, this_flow,
-                               in_list_row))
+                               in_list_row, child_row_all_growable))
                     return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
             }
         }
@@ -1274,8 +1400,16 @@ int CountPreviewNodes(lv_obj_t* obj) {
 // 生长路径上的容器每帧重调完全安全。缺省值与 RenderNode 的缺省一致（column START/START/
 // START、row START/CENTER/CENTER），未知枚举值静默回落（同 RenderNode；预览不做 Lint
 // 提示——那是校验期的事，见 pi_card_render.cc 顶部 Lint 分支）。
-void ApplyPreviewContainerGeom(lv_obj_t* obj, bool is_row, const cJSON* node) {
-    lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+void ApplyPreviewContainerGeom(lv_obj_t* obj, bool is_row, const cJSON* node, int parent_flow) {
+    // 宽度默认口径与 RenderNode 的 column/row 分支一致（见那里、以及 FLOW_COL_CONTENT 枚举头
+    // 注的循环引用说明）：父是 row 或父是内容宽列时内容宽，否则（含顶层）PCT(100)；显式 w 优先。
+    if (HasKey(node, "w")) {
+        lv_obj_set_width(obj, GetInt(node, "w", 0));
+    } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) {
+        lv_obj_set_width(obj, LV_SIZE_CONTENT);
+    } else {
+        lv_obj_set_width(obj, LV_PCT(100));
+    }
     lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
     int gap = GetInt(node, "gap", 12);
@@ -1324,6 +1458,13 @@ uint32_t PreviewNodeSignature(const cJSON* node, bool strip_children, bool strip
 // 可能停在多字节字符中间（"三城�"），LVGL 会渲出替换乱码一闪而过。渲进预览 label 前把结尾
 // 那半个字符剪掉（最多回看 3 字节找 lead byte，纯 ASCII 尾部零开销）。只影响预览观感；正式
 // 渲染拿到的是校验过的完整 JSON，不经过这里。
+// heading（puhui_24_4 静态子集字体）的原地文本更新全部收敛到这一个函数（PreviewLabelText 的
+// 静态 text 分支 / PreviewRenderDataLabel 的 bind_data 分支都走它）——流式生长期 label 的字体
+// 只在 RenderPreviewNode 首次建对象时由 ApplyLabelStyle 定过一次，之后签名不变全靠这里原地
+// 更新文本（PreviewNodeSignature 对 label 剔除了 text），不会再回头重新过 SafeFont；若标题
+// 前几个字符恰好是 ASCII/已覆盖汉字、后面才吐出缺字新字符，不在这里补一次检查就会长成
+// "先正常后半句豆腐"。故每次落文本前都用最终（剪过尾）的文本重过一遍 SafeFont，一旦回退到
+// puhui_30_4 就不会再变回 24（font 已不等于 &font_puhui_24_4，判据自然短路）。
 void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
     size_t len = std::strlen(txt);
     size_t cut = len;
@@ -1335,12 +1476,11 @@ void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
         if (need > back) cut = len - back;  // 序列没凑齐字节数 → 从 lead 处剪断
         break;  // 找到 lead（或非法字节）即定论；再往前都是已完整的字符
     }
-    if (cut == len) {
-        lv_label_set_text(lbl, txt);
-    } else {
-        std::string t(txt, cut);
-        lv_label_set_text(lbl, t.c_str());
-    }
+    const std::string cut_buf = (cut == len) ? std::string() : std::string(txt, cut);
+    const char* final_txt = (cut == len) ? txt : cut_buf.c_str();
+    const lv_font_t* f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+    if (SafeFont(f, final_txt)) lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+    lv_label_set_text(lbl, final_txt);
 }
 
 // 预览期 bind 一次性取值（流式期 bind 控件不再空转占位）：不走 Acquire——那会动 refcount、
@@ -1474,7 +1614,7 @@ void RefreshPreviewDataLabels(lv_obj_t* obj) {
 }
 
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
-                            int parent_flow) {
+                            int parent_flow, bool row_all_growable) {
     EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
     if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
     if (depth > kPreviewMaxDepth) return MakePreviewPlaceholder(parent);
@@ -1499,7 +1639,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        ApplyPreviewContainerGeom(obj, is_row, node);
+        ApplyPreviewContainerGeom(obj, is_row, node, parent_flow);
     } else if (std::strcmp(type, "grid") == 0) {
         // 预览版 grid：镜像 RenderNode 的 grid 分支（行主序自动放置 + span + 轨道 dsc 堆分配随
         // DELETE 释放），去掉 bind/事件/id。流式期 cols 可能整个还没吐——一列都没有就占位等待
@@ -1569,7 +1709,14 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
-        lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        // 口径同 RenderNode：行内 label 夹 max_width + 单行省略号，避免超长文本把 button 等
+        // 兄弟挤到下一行（坑F）；列内保持原 WRAP 换行。
+        if (parent_flow == FLOW_ROW) {
+            lv_obj_set_style_max_width(obj, LV_PCT(60), LV_PART_MAIN);
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+        } else {
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+        }
         ApplyLabelStyle(obj, node);  // 先落字体/角色，PreviewSeedBindLabel 的 SafeFont 才有正确基准
         PreviewLabelText(obj, node);
     } else if (std::strcmp(type, "icon") == 0) {
@@ -1670,15 +1817,28 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
     if (GetBool(node, "hidden")) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
     // 自适应尺寸按真实父容器主轴走（曾经统一按 FLOW_COL 近似——row 里铺满宽的 label 会把
     // icon+标题挤成两行，adopt 才并回一行，真机抓到的跳变；现与正式渲染同口径）。
-    ApplySizing(obj, type, node, parent_flow);
+    ApplySizing(obj, type, node, parent_flow, row_all_growable);
 
     if (is_container) {
-        const int child_flow = std::strcmp(type, "row") == 0 ? FLOW_ROW : FLOW_COL;
+        const bool is_row_type = std::strcmp(type, "row") == 0;
+        // 口径同 RenderNode：本容器若是内容宽列（父是 row/内容宽列、自己无显式 w/grow），
+        // 子节点传 FLOW_COL_CONTENT 而非普通 FLOW_COL，打破"父等子内容、子等父 100%"循环
+        // 引用（见 FLOW_COL_CONTENT 枚举头注）。
+        const bool col_content_width = !is_row_type &&
+                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                       !HasKey(node, "w") && !HasKey(node, "grow");
+        const int child_flow =
+            is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
         const cJSON* children = GetItem(node, "children");
+        // 口径同 RenderNode：row 里 button/choice 均分整行还是内容自适应宽，取决于这一行当前
+        // 已知的兄弟构成，扫一遍传给每个孩子。
+        const bool child_row_all_growable =
+            child_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) {
-                RenderPreviewNode(obj, child, depth + 1, node_count, child_flow);  // 静默跳过失败子节点
+                RenderPreviewNode(obj, child, depth + 1, node_count, child_flow,
+                                  child_row_all_growable);  // 静默跳过失败子节点
             }
         }
         // 打预览容器记号 + 记 committed 游标：认定最后一个已建子节点仍是"生长边"，留给下次
@@ -1692,7 +1852,7 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
 }
 
 lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count, int parent_flow) {
+                          int& node_count, int parent_flow, bool row_all_growable) {
     const char* type = GetStr(node_spec, "type");
     if (!type) {
         // 类型还没吐出来：维持原状——但这个位置必须有个占位对齐下标（首次到达这个位置，
@@ -1705,7 +1865,7 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
             return existing;  // 指针不变——递归深入继续生长，不推倒重来
         }
         if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算，不在此回补
-        return RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
+        return RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
     }
     if (std::strcmp(type, "grid") == 0) {
         // grid 不做逐子增量生长：行主序落位使 cols/children/span 任一变化都可能让所有 cell
@@ -1716,7 +1876,7 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
         const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
         if (existing && cacheable && s_leaf_sig[depth] == sig) return existing;
         if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
         if (cacheable) s_leaf_sig[depth] = sig;
         return obj;
     }
@@ -1738,15 +1898,18 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
             return existing;  // 原地更新文本，不重建——长文本不闪烁
         }
         if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
+        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
         if (cacheable) s_leaf_sig[depth] = sig;
         return obj;
     }
     // 其它叶子类型（button/icon/slider/arc/bar/switch/qrcode/choice/divider/spacer）：没有
-    // label 那样的原地更新通道，签名不变原对象不动、变了删旧重渲。
+    // label 那样的原地更新通道，签名不变原对象不动（同一位置一直是"生长边"时，row 组成没变，
+    // 旧对象的 grow 状态就是最后一次用正确的 row_all_growable 算出来的，不必重算）、变了删旧
+    // 重渲（这条路径含 button/choice——重渲会用调用方最新算出的 row_all_growable 重新定尺寸，
+    // 见 PreviewSyncContainer 的"定稿"循环：一旦本行来了新兄弟，旧的生长边会被强制删旧重渲）。
     if (same_sig) return existing;
     if (existing) lv_obj_delete(existing);
-    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow);
+    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
     if (cacheable) s_leaf_sig[depth] = sig;
     return obj;
 }
@@ -1761,7 +1924,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     // 单独拎出来双向纠正（不是"缺省不动"）：AI_TO_UI 文档明载"hidden:true 的块做展开详情"
     // 这个用法，容器的 hidden 迟到会让本该藏起来的详情块生长期先闪现再消失，观感比不做还差。
     const char* type = GetStr(json_container, "type");
-    ApplyPreviewContainerGeom(lv_container, std::strcmp(type, "row") == 0, json_container);
+    ApplyPreviewContainerGeom(lv_container, std::strcmp(type, "row") == 0, json_container, parent_flow);
     ApplyDefaultStyle(lv_container, type, depth);
     if (HasKey(json_container, "pad")) {
         lv_obj_set_style_pad_all(lv_container, GetInt(json_container, "pad", 0), LV_PART_MAIN);
@@ -1771,12 +1934,45 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     if (GetBool(json_container, "hidden")) lv_obj_add_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
 
-    const int child_flow = std::strcmp(type, "row") == 0 ? FLOW_ROW : FLOW_COL;
+    const bool is_row_type = std::strcmp(type, "row") == 0;
+    // 口径同 RenderNode/RenderPreviewNode：本容器若是内容宽列，子节点传 FLOW_COL_CONTENT 打破
+    // 循环引用（见 FLOW_COL_CONTENT 枚举头注）。
+    const bool col_content_width = !is_row_type &&
+                                   (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                   !HasKey(json_container, "w") && !HasKey(json_container, "grow");
+    const int child_flow =
+        is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
     const cJSON* children = GetItem(json_container, "children");
+    // 口径同 RenderNode/RenderPreviewNode：按这一行**当前已知**的全部 children（定稿区+生长边）
+    // 算一次是否清一色 growable，本帧内统一用这个值——这正是"button 先 grow、label 追加后收回"
+    // 得以成立的关键：label 一旦进入 children 数组（哪怕还在生长边位置、属性没吐全），本帧算出
+    // 的 row_all_growable 就是 false，下面 while 循环会把此前已建的 button 强制删旧重渲成
+    // 内容自适应宽。
+    const bool child_row_all_growable =
+        child_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
     int n = (children && cJSON_IsArray(children)) ? cJSON_GetArraySize(children) : 0;
     if (n == 0) return;  // 还没孩子，等下一帧
     intptr_t committed = reinterpret_cast<intptr_t>(lv_obj_get_user_data(lv_container));
     int lv_n = lv_obj_get_child_count(lv_container);
+
+    // 已建子对象的 grow 幂等纠偏（verifier 抓到的真实 bug）：下面的 while 循环只重渲"定稿
+    // 游标"位置，行内更早、已经冻结进定稿区的 button/choice 子对象不会被再摸一次——若它们是
+    // 在本行还清一色 growable 时建的（那时 grow=1 是对的），后来行里追加了非 growable 兄弟
+    // （label 等）使 child_row_all_growable 翻成 false，这些更早的兄弟就会残留过期的 grow=1。
+    // row 一旦混排，mixed 状态单调不可逆（定稿区内容只增不改型，不会倒退回清一色），故只需
+    // 单向纠偏：混排时把已建的 button/choice（且 JSON 未显式给 grow/w）清 grow=0；反向（重新
+    // 变回清一色）不会发生，不需要处理。
+    if (!child_row_all_growable) {
+        const int scan_n = std::min(lv_n, n);
+        for (int i = 0; i < scan_n; i++) {
+            const cJSON* cj = cJSON_GetArrayItem(children, i);
+            const char* ct = GetStr(cj, "type");
+            if (ct == nullptr || !IsRowGrowConditional(ct)) continue;
+            if (HasKey(cj, "grow") || HasKey(cj, "w")) continue;  // 显式给过，不覆盖
+            if (lv_obj_t* existing_child = lv_obj_get_child(lv_container, static_cast<uint32_t>(i)))
+                lv_obj_set_flex_grow(existing_child, 0);
+        }
+    }
 
     // 1) 定稿区 [committed, n-2]：这些位置后面已经出现了更晚的兄弟，证明不会再变了——逐个
     //    渲染成最终形（若该位是上一轮生长边留下的半成品，先删再重渲）。
@@ -1787,7 +1983,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
             lv_n = lv_obj_get_child_count(lv_container);
         }
         RenderPreviewNode(lv_container, cJSON_GetArrayItem(children, static_cast<int>(committed)),
-                          depth + 1, node_count, child_flow);
+                          depth + 1, node_count, child_flow, child_row_all_growable);
         lv_n = lv_obj_get_child_count(lv_container);
         committed++;
     }
@@ -1796,7 +1992,7 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     lv_obj_t* existing_edge =
         (lv_n > committed) ? lv_obj_get_child(lv_container, static_cast<uint32_t>(committed)) : nullptr;
     SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1), depth + 1,
-                    node_count, child_flow);
+                    node_count, child_flow, child_row_all_growable);
     lv_obj_set_user_data(lv_container, reinterpret_cast<void*>(static_cast<intptr_t>(committed)));
 }
 
@@ -1805,7 +2001,14 @@ bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err) {
         err = "props is not an object";
         return false;
     }
-    if (const char* txt = GetStr(props, "text")) lv_label_set_text(obj, txt);
+    if (const char* txt = GetStr(props, "text")) {
+        // do:'patch' 改 heading（puhui_24_4）标签文本也是一个动态落文本点，同样可能吐出缺字
+        // 新中文——SafeFont 兜一遍（非 heading 字体空操作）。是本函数唯一改文本的地方，不必
+        // 判 obj 是不是 label：ApplyProps 只会被派给带 text 的节点。
+        const lv_font_t* f = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+        if (SafeFont(f, txt)) lv_obj_set_style_text_font(obj, f, LV_PART_MAIN);
+        lv_label_set_text(obj, txt);
+    }
     if (HasKey(props, "value")) {
         int v = GetInt(props, "value", 0);
         if (lv_obj_check_type(obj, &lv_slider_class)) lv_slider_set_value(obj, v, LV_ANIM_ON);
@@ -2249,28 +2452,41 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
                                 "' is not a recognized value (start|center|end); it is ignored and "
                                 "the default is used.");
         }
-        // row 的 justify=between/around/evenly 分配「剩余空间」，但 row 内 growable 子项默认
-        // grow:1 会吃光剩余空间 → justify 视觉上无效。提示改用显式 w 或去掉 grow。
+        // row 的 justify=between/around/evenly 分配「剩余空间」，但 row 内会 grow 的子项会吃光
+        // 剩余空间 → justify 视觉上无效。提示改用显式 w 或去掉 grow。是否会 grow 现按 ApplySizing
+        // 的真实规则判定：显式 grow>0（不管默认/显式来源，反正吃空间）→ 算；显式 w → 不算（占
+        // 固定宽，不挤占）；否则按类型默认——spacer 恒 grow；button/choice 只在整行清一色
+        // growable（RowChildrenAllGrowable）时才默认 grow，混排时保持内容宽、不算；
+        // slider/bar/arc/chart 恒默认 grow。
         const bool is_row = std::strcmp(type, "row") == 0;
         const bool space_justify = jz != nullptr && (std::strcmp(jz, "between") == 0 ||
                                                      std::strcmp(jz, "around") == 0 ||
                                                      std::strcmp(jz, "evenly") == 0);
         const cJSON* children = GetItem(node, "children");
         if (is_row && space_justify && children != nullptr && cJSON_IsArray(children)) {
+            const bool row_all_growable = RowChildrenAllGrowable(children);
             bool has_default_grow = false;
             const cJSON* c = nullptr;
             cJSON_ArrayForEach(c, children) {
                 const char* ct = GetStr(c, "type");
                 if (ct == nullptr) continue;
+                if (HasKey(c, "grow") && GetInt(c, "grow", 0) > 0) {
+                    has_default_grow = true;  // 显式 grow>0：不管默认规则，反正会吃空间
+                    break;
+                }
+                if (HasKey(c, "w") || HasKey(c, "grow")) continue;  // 显式定宽，或显式 grow:0
                 const bool grows = std::strcmp(ct, "spacer") == 0 ||
-                                   (IsGrowable(ct) && !HasKey(c, "w") && !HasKey(c, "grow"));
+                                   (IsGrowable(ct) && (!IsRowGrowConditional(ct) || row_all_growable));
                 if (grows) { has_default_grow = true; break; }
             }
             if (has_default_grow) {
+                // 文案不分"默认拿到的 grow"和"显式给的 grow"——两种场景下这条 hint 都可能触发
+                // （见上面的判定：显式 grow>0 与整行清一色 growable 的默认 grow 走的是同一个
+                // has_default_grow=true 结论），措辞须两态皆准，不能说成"defaults to"。
                 st.hints->push_back(std::string("justify '") + jz +
-                                    "' distributes free space, but a growable child in this row "
-                                    "defaults to grow:1 and eats it, so the spacing has no visible "
-                                    "effect; give children an explicit w or drop grow.");
+                                    "' distributes free space, but a child in this row has grow "
+                                    "and eats it, so the spacing has no visible effect; give it an "
+                                    "explicit w or drop grow.");
             }
         }
         if (children != nullptr && cJSON_IsArray(children)) {

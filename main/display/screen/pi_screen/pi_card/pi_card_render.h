@@ -47,9 +47,13 @@ bool ChoiceLabel(lv_obj_t* obj, std::string& out);
 // parent_flow: 父容器主轴（0=column/root, 1=row, 2=grid），用于自适应尺寸默认值。
 // in_list_row: 本节点是否位于 list 的 item 模板重渲实例内——为真时不注册 id 进 card->nodes
 // （N 行实例 id 不唯一）。
+// row_all_growable: 仅在 parent_flow==FLOW_ROW 时有意义——本节点所在这一行的 JSON children
+// 是否清一色都是 IsGrowable 类型（RenderNode 自己的 row 子节点遍历处算出并传给每个孩子）；
+// 决定 button/choice 是均分整行还是内容自适应宽（见 pi_card_render.cc 的 ApplySizing）。
+// 非 row 场景/调用方不关心时传默认 true 即可。
 lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
                      int depth, int& node_count, std::string& err, int parent_flow = 0,
-                     bool in_list_row = false);
+                     bool in_list_row = false, bool row_all_growable = true);
 
 // update：把 props（cJSON 对象）套到已有控件上。未知字段忽略。
 bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err);
@@ -81,8 +85,11 @@ void PlayCardEntrance(lv_obj_t* tree, bool adopted);
 // 一致），决定子控件的自适应尺寸默认（column 里 label/growable 铺满全宽、row 里保持自然宽/
 // 按比例分配、grid 里交给 set_grid_cell）。曾经预览统一按 column 近似，row 里的 icon+标题
 // 被铺满宽的 label 挤成两行、adopt 后又并回一行——真机抓到的跳变，故改为全程如实传递。
+// row_all_growable：仅在 parent_flow==FLOW_ROW 时有意义，口径同 RenderNode（见上）——本节点
+// 所在这一行的 JSON children 是否清一色都是 IsGrowable 类型，决定 button/choice 均分整行还是
+// 内容自适应宽。默认 true（不关心时/容器自身场景）。
 lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
-                            int parent_flow = 0);
+                            int parent_flow = 0, bool row_all_growable = true);
 
 // 位置游标增量对齐：lv_container 是先前调用建出的、打了 USER_2 标记的容器；json_container 是
 // 它这次收到的最新 partial 节点（读它的 "children" 数组，N 个孩子）。[0, N-2]（如果还没被上
@@ -100,8 +107,12 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
 // lv_label_set_text（不重建，长文本不闪烁）；其它叶子类型无状态可原地更新，签名（含 text——
 // 它们没有原地文本通道）变了删旧重渲（成本低，也是团队定稿点名的做法）。这是
 // PreviewSyncContainer 的生长边分支与流式会话顶层 tree 同步共用的唯一入口。
+// row_all_growable：仅在 parent_flow==FLOW_ROW 时有意义（口径同 RenderNode），本节点若在删旧
+// 重建时落到 RenderPreviewNode，原样转发给它；existing 原地复用（same_sig/文本更新）分支不需要
+// 它——row 组成不变时（同一位置一直是"生长边"）旧对象的 grow 状态本就是最后一次用正确的
+// row_all_growable 算出来的，不必重算。
 lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count, int parent_flow = 0);
+                          int& node_count, int parent_flow = 0, bool row_all_growable = true);
 
 // 预算重算：删除节点时不精确回补 node_count（子树带走几个节点不值得追踪），调用方
 // （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后应该用这个函数对整棵预览树重新计数，

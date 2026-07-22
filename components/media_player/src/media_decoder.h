@@ -1,7 +1,9 @@
 // media_decoder — 解码器抽象：pump 的 decoder 线程只认这个接口，不关心具体编解码库。
 // 工厂按端各自提供（分端范式同 media_http_stream）：
 //   真机: media_decoder_esp.cc      — espressif/esp_audio_codec 的 esp_audio_simple_dec（官方闭源 .a，MP3+AAC）
-//   sim : media_decoder_minimp3.cc  — MP3 用 minimp3（滑窗语义在 impl 内部）；AAC 由 helix-aac impl 提供
+//   sim : media_decoder_minimp3.cc  — MP3 用 minimp3（滑窗语义在 impl 内部）；AAC 由 macOS AudioToolbox
+//         impl 提供（media_decoder_atb_aac.cc，AudioConverter）——helix-aac 是 32 位定点库，
+//         在 64 位宿主上有 UB（非确定性崩溃/卡死），已弃用，勿再引入
 // 约定：
 //   - Feed 由 decoder 线程独占调用（非并发）。实现自持输入缓冲（滑窗/内部积累），接受任意
 //     大小分块；所有大块状态**堆分配**——设备端解码线程栈紧张（minimp3 曾因 28KB 栈上

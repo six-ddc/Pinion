@@ -79,6 +79,10 @@ idf.py -p /dev/ttyACM0 flash monitor   # P4 port = "USB JTAG/serial debug unit";
 - `pi-c` is a **path dependency** (`main/idf_component.yml`): the two repos must stay siblings —
   `Code/esp32/MetalioClaw6` ↔ `Code/six-ddc/pi-c`.
 - Code style: `.clang-format` (Google-based, 4-space indent, 120 col). Format C/C++ before committing.
+- **格式串红线（真机 newlib-nano）**：`%zu/%lld/%llu` 不支持且**不消费变参**，后随 `%s` 会把非指针
+  当地址解引用直接崩，且 sim（macOS libc）永远复现不了。一律 `%u/%d` + 显式强转。注意
+  `lv_snprintf`/`lv_label_set_text_fmt` 也中招——本仓 `CONFIG_LV_USE_CLIB_SPRINTF=y`，LVGL 格式化
+  同样落到 nano vsnprintf，不是 LVGL 自带实现。
 
 ## Host simulator (sim/)
 

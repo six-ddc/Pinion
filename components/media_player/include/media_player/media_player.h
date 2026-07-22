@@ -1,8 +1,10 @@
-// media_player — 媒体播放核心（SD 卡 MP3 + 网络电台 MP3 流共用一条可移植管线）。
+// media_player — 媒体播放核心（SD 卡 MP3 + 网络电台 MP3/HLS-AAC 流共用一条可移植管线）。
 //
-// 管线：MP3 字节源 → minimp3 解码 → stereo 降混 + 定点线性重采样到 16kHz mono →
-// mhal::audio_pipeline::FeedPlayback。核心 device/sim 同源（C++17 线程 + POSIX 文件），
-// 只有 HTTP 流字节源分双端实现（media_http_esp.cc / media_http_curl.cc）。
+// 管线：MP3/AAC-ADTS 字节源 → MediaDecoder 解码（按 track_codec 分派：真机 esp_audio_codec
+// 官方库 MP3+AAC；sim 端 minimp3(MP3)+AudioToolbox(AAC)——helix-aac 在 64 位宿主有 UB 已弃）
+// → stereo 降混 + 定点线性重采样到 16kHz mono → mhal::audio_pipeline::FeedPlayback。核心
+// device/sim 同源（C++17 线程 + POSIX 文件），只有 HTTP 流字节源分双端实现
+// （media_http_esp.cc / media_http_curl.cc）。
 //
 // 与 TTS 共用同一条 FeedPlayback 播放管线（2MB PSRAM 抖动队列，EnsurePlayback 幂等）：
 // media 播放时占用该队列；TTS 要发声时通过 SuspendForSpeech/ResumeFromSpeech 让路。

@@ -5,8 +5,9 @@
 //   无限流不 EOF。流式播放用 PlaybackFilled() 做节流阀：已缓冲 PCM > kStreamBufferMaxSec 秒
 //   就暂停读，让整条链路自时钟、字节环有界。
 // decoder 线程：从字节环取压缩字节 → MediaDecoder（按 track_codec 分派：真机
-//   esp_audio_codec / sim minimp3+helix，见 media_decoder.h）榨干 → 降混+重采样到
-//   16k mono → FeedPlayback（带 pump 起播代次，打断残音竞态收口，背压落在本线程）。
+//   esp_audio_codec 官方库 MP3+AAC；sim 端 minimp3(MP3)+AudioToolbox(AAC)，见
+//   media_decoder.h）榨干 → 降混+重采样到 16k mono → FeedPlayback（带 pump 起播代次，
+//   打断残音竞态收口，背压落在本线程）。
 //
 // 参照范式：components/volc_speech/src/volc_tts.cc 的 pump 任务（环形缓冲→解码器榨干→
 // FeedPlayback、滑窗 memmove 已消费字节）。
@@ -140,6 +141,12 @@ static void ReaderRun(Pump* p) {
     }
 
     const int sr = mhal::audio_pipeline::SampleRate();
+    // 连续（未产出任何数据的）本地文件曲目失败计数：单曲打开/读取失败不该终止整个播放
+    // 列表（如 SD 卡里混了一首损坏的 MP3）——跳到下一曲即可；只有连续失败数达到整个
+    // playlist 长度（即整轮全败，真出了系统性问题：SD 卡拔出/目录整体不可读）才终止报
+    // Error。任一曲成功产出过数据即清零。流式（电台）track 不计入——维持现状读错即
+    // Error（那是 60s 重连放弃后的结果，必须让用户知道，不能被"跳下一曲"悄悄吞掉）。
+    int consec_fail = 0;
     for (;;) {
         if (p->stop) break;
         const MediaItem item = p->playlist[idx];
@@ -158,8 +165,25 @@ static void ReaderRun(Pump* p) {
             : item.is_stream ? OpenHttpStreamSource(item.path_or_url.c_str(), on_reconnecting)
                              : OpenFileSource(item.path_or_url.c_str());
         if (!src) {
-            if (p->host) p->host->OnTrackError(p, idx, "open failed");
-            break;
+            if (item.is_stream) {
+                if (p->host) p->host->OnTrackError(p, idx, "open failed");
+                break;
+            }
+            // 本地文件打开失败：本曲从未起播（reader_epoch 未推进），decoder 无需握手，
+            // 直接跳下一曲。
+            ESP_LOGW(TAG, "track %d open failed, skip", idx);
+            if (++consec_fail >= count) {
+                if (p->host) p->host->OnTrackError(p, idx, "all tracks failed");
+                break;
+            }
+            idx++;
+            if (idx >= count) {
+                p->stop = true;
+                p->cv.notify_all();
+                if (p->host) p->host->OnAllFinished(p);
+                return;
+            }
+            continue;
         }
         {
             std::lock_guard<std::mutex> lk(p->mu);
@@ -179,6 +203,7 @@ static void ReaderRun(Pump* p) {
 
         uint8_t buf[kReaderChunk];
         bool read_err = false;
+        bool any_data = false;  // 本曲是否至少成功产出过一次读到的数据
         for (;;) {
             if (p->stop) break;
             // 流式节流阀：已缓冲 PCM 超过阈值就暂停读（PlaybackFilled 字节 /(sr*2) = 秒）。
@@ -195,6 +220,7 @@ static void ReaderRun(Pump* p) {
             }
             if (r == 0) break;  // EOF（无限流不会到这）
             RingWrite(p, buf, (size_t)r);
+            any_data = true;
         }
         {
             std::lock_guard<std::mutex> lk(p->mu);
@@ -204,11 +230,25 @@ static void ReaderRun(Pump* p) {
 
         if (p->stop) break;
         if (read_err) {
-            if (p->host) p->host->OnTrackError(p, idx, "read error");
+            if (item.is_stream) {
+                if (p->host) p->host->OnTrackError(p, idx, "read error");
+                break;
+            }
+            // 本地文件曲中读失败（损坏/SD 抖动）：已产出的数据仍走下面的正常握手交给
+            // decoder 榨干，随后跳下一曲；未达连续失败阈值前不终止整场。
+            ESP_LOGW(TAG, "track %d read error, skip to next", idx);
+        }
+        if (!read_err || any_data) {
+            consec_fail = 0;  // 成功放完/至少产出过数据，不计入连续失败
+        } else if (++consec_fail >= count) {
+            // 本曲一字节都没读到就失败，且连续失败已达整个 playlist 长度：真出了系统性
+            // 问题，报错收场（本 epoch decoder 还没收到任何数据，无需等握手）。
+            if (p->host) p->host->OnTrackError(p, idx, "all tracks failed");
             break;
         }
 
-        // 文件 EOF：标记 input_done，等 decoder 把本曲字节全部解码搬完（握手）。
+        // 文件 EOF（或非流失败已跳过）：标记 input_done，等 decoder 把本曲字节全部解码
+        // 搬完（握手）。
         int my_epoch;
         {
             std::unique_lock<std::mutex> lk(p->mu);

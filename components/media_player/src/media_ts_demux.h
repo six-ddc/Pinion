@@ -2,8 +2,9 @@
 // 可移植零依赖（device/sim 同源），供 media_hls.cc 在源内部使用、sim ts_demux_test 单测。
 //
 // 范围与取向（够用即可，不是通用 demuxer）：
-//   - 只认音频：PAT→PMT→首个 stream_type 0x0F（ADTS AAC）的 ES；LATM(0x11) 与其他类型
-//     明确拒绝（found_unsupported() 供上层报错，而不是无声空转）。
+//   - 只认音频：PAT→PMT→遍历全部 ES 条目，锁定 stream_type 0x0F（ADTS AAC）的 PID；
+//     全表无 0x0F（LATM 0x11、MP1/MP2 0x03/0x04 等，或一个 ES 都没有）时明确拒绝
+//     （found_unsupported() 供上层报错，而不是无声空转）。
 //   - 字节流式 Feed：接受任意大小分块，自持 <188B 残包拼接；非 188 对齐/中途起流/垃圾
 //     前缀靠 0x47 同步字节扫描重同步（带下一包校验，抗 payload 里的伪 0x47）。
 //   - 连续计数断档：丢当前 PES 余量、等下一个 PUSI 再续（ADTS 自带同步字，解码器可从
@@ -28,7 +29,8 @@ class TsDemux {
 
     // 已锁定音频 ES（PMT 解析成功且 stream_type 受支持）。
     bool audio_locked() const { return audio_pid_ >= 0; }
-    // PMT 里首个音频流是不支持的类型（如 LATM 0x11）：上层据此报"流不支持"而非静默无声。
+    // PMT 全表无 0x0F（不支持的类型如 LATM 0x11，或无 ES）：上层据此报"流不支持"而非静默无声。
+    // unsupported_stream_type() 为见过的首个 stream_type；一个 ES 都没有时为 -1。
     bool found_unsupported() const { return unsupported_stream_type_ != 0; }
     int unsupported_stream_type() const { return unsupported_stream_type_; }
 

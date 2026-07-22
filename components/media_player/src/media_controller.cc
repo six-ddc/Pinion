@@ -114,6 +114,23 @@ struct MediaController::Impl : public PumpHost {
         }
     }
 
+    // 阻塞收掉最老的一个 zombie：仅在 StartPump 发现 zombies_ 堆积（弱网连续切台，旧
+    // reader 最长要 ~2.5s 才观察到 Abort，见 TeardownCurrent 注释）到 ≥2 个时兜底调用，
+    // 防止泵线程栈（内部 SRAM，2×16KB/泵）无界堆积打穿堆。等待有界：上界即上述 ~2.5s。
+    // 要求已持 ctrl_mu_、且调用点不持 mu_（先在 mu_ 下摘出指针再放锁 join，避免持锁等
+    // 线程退出）。
+    void ReapOldestZombieBlocking() {
+        Pump* oldest = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (zombies_.empty()) return;
+            oldest = zombies_.front();
+            zombies_.erase(zombies_.begin());
+        }
+        JoinPump(oldest);
+        delete oldest;
+    }
+
     // 析构专用：阻塞等所有 zombie 线程退出后释放（进程退出路径，不在 UI 线程上）。
     void DrainZombiesBlocking() {
         std::vector<Pump*> dead;
@@ -165,6 +182,18 @@ struct MediaController::Impl : public PumpHost {
 
     // 起一个新 pump 从 start_index 播放（skip_samples 用于续播近似 seek）。要求已持 ctrl_mu_。
     void StartPump(int start_index, uint64_t skip_samples) {
+        // 建新泵前先非阻塞收一轮（TeardownCurrent 刚把旧泵挂进 zombies_）；弱网下连按
+        // 切台 4-5 次会让 zombies_ 迅速堆到 3-4 个，每个泵占 2×16KB 内部 SRAM 栈——
+        // 堆到 ≥2 就同步等最老的一个退出再继续，把堆积上限钳在 1-2 个泵。
+        ReapZombies();
+        size_t zombie_count;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            zombie_count = zombies_.size();
+        }
+        if (zombie_count >= 2) {
+            ReapOldestZombieBlocking();
+        }
         mhal::audio_pipeline::EnsurePlayback();
         mhal::audio_pipeline::FlushPlayback();  // 干净起播：清残音，并推进代次
 

@@ -704,6 +704,11 @@ void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
         if (dc.kind == UiCard::DataConsumer::Label) {
             const cJSON* v = cJSON_GetObjectItem(card->data, dc.key.c_str());
             std::string txt = dc.text_tpl.empty() ? Stringify(v) : SubstDataValue(dc.text_tpl, v);
+            // heading（puhui_24_4 静态子集字体）的 bind_data 标签，卡数据变了之后可能才吐出
+            // 缺字的新中文——这里是它的唯一落文本点，SafeFont 兜一遍（同 SetPreviewLabelText
+            // 的道理，见 render.cc 头注）；非 heading 字体这一步是空操作。
+            const lv_font_t* f = lv_obj_get_style_text_font(dc.obj, LV_PART_MAIN);
+            if (SafeFont(f, txt.c_str())) lv_obj_set_style_text_font(dc.obj, f, LV_PART_MAIN);
             lv_label_set_text(dc.obj, txt.c_str());
         } else if (need_full) {
             RefreshListFull(card, dc);
@@ -1423,9 +1428,9 @@ extern "C" const char* pi_card_render_desc(void) {
     if (!s.empty()) return s.c_str();
     s = std::string(PI_CARD_DESC_HEAD) + BuildPathsClause(true) + " " + PI_CARD_DESC_TAIL +
         " COMMANDS (invoke cmd): " + BuildCommandsClause(true) +
-        ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (survives new chats/"
-        "reboot, replaces any prior pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an "
-        "on-screen ✕ also removes it).";
+        ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (replaces any prior "
+        "pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an on-screen ✕ also removes "
+        "it).";
     return s.c_str();
 }
 
@@ -1446,36 +1451,36 @@ extern "C" const char* pi_card_system_prompt(void) {
         "ui_update/ui_close) to SHOW controls, status, choices, forms, lists, dashboards instead of "
         "describing them. There is NO read tool -- rendering a card that binds a device path IS how "
         "you read the device; ui_render's return value gives live values (state).\n\n"
-        "WHEN A CARD, NOT CHAT: SET something (brightness/volume/theme) -> control card, slider "
-        "writes hardware directly, no round-trip. STATUS -> small dashboard card binding the paths, "
-        "read+shown at once. CHOICE/CONFIRM/FORM/LIST -> render it, tap rides back on report. Plain "
-        "chit-chat -> just text. Prefer 'chat' (inline); 'overlay' only for a modal moment -- "
-        "auto-closes, capped.\n\n"
+        "WHEN A CARD, NOT CHAT: SET something (brightness/volume/theme) -> control card, "
+        "writes hardware directly. STATUS -> small dashboard binding the paths. CHOICE/CONFIRM/FORM/"
+        "LIST -> render it, tap rides back on report. Plain chit-chat -> just text. Prefer 'chat' "
+        "(inline); 'overlay' only for a modal moment -- auto-closes, capped.\n\n"
         "DESIGN -- lean on pi's look, don't hand-style: header=eyebrow+title, group related rows. "
-        "Exactly ONE primary (amber) button -- theme already paints slider/arc fill, on-switch and "
-        "selected choice amber, don't also color text amber (keep tx/dim). Use semantic tone/fill "
-        "tokens (accent/ok/err/tx/dim/...), not raw hex.\n\n"
-        "COMPACT -- small window, dense beats tall. Lay data in a grid: cols=column ratios (e.g. "
-        "[2,1,1], or \"auto\"), one cell/field row-major so columns align (no grow tricks); 2-4 "
+        "Exactly ONE primary (amber) button -- theme already paints fill/on-switch/selected-choice "
+        "amber, don't also color text amber. Use tone/fill tokens, not raw hex. One focus/card: key "
+        "value as role:title on top, rest smaller below. Columns side by side default content-width; "
+        "grow:1 each splits evenly (simple pair: leaf+spacer). Encode state: tone ok/err/accent + "
+        "icon, not bare words. Button text = the result (清空/重试), not 确定. >3 facts -> grid; big "
+        "number uses role:value (mono).\n\n"
+        "COMPACT -- small window, dense beats tall. Lay data in a grid (see grid{}): 2-4 "
         "cols, role:section headers, full-width rule = divider span=<#cols>. Never one fact/line, "
-        "never dump prose -- labels 1-3 words, value cell right of label, clamp lists with max.\n\n"
+        "never dump prose -- labels 1-3 words, clamp lists with max.\n\n"
         "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
         "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
         "generate new content or a NEW decision -- full round-trip, shows as a user message; never "
         "report to browse/expand/echo a value, use toggle/patch. A report auto-carries every id'd "
         "control's value (choice as idx(label)) -- id a control instead of writing its value into "
         "text.\n\n"
-        "UPDATE vs RE-RENDER: change one node's text/value/visibility, or card data, via ui_update, "
-        "not a fresh ui_render. Re-render only for a structurally different card.\n\n"
+        "UPDATE vs RE-RENDER: change text/value/visibility/data via ui_update, not a fresh "
+        "ui_render; re-render only if structurally different.\n\n"
         "WRITABLE device paths you can set: " +
         BuildPathsClause(false) +
         ".\n\n"
         "HOME WIDGET -- display:'standby' pins one card to the home/clock screen (survives new "
-        "chats/reboot; a status panel or chart kept in view). Prefer local actions/invoke in it -- a "
-        "report from it runs you in the BACKGROUND, keep that rare. Remove via ui_close card:'pin'.\n"
+        "chats/reboot). Prefer local actions/invoke in it -- a report runs you in the BACKGROUND, "
+        "keep rare. Remove via ui_close card:'pin'.\n"
         "DEVICE COMMANDS -- {do:'invoke',cmd} for real actions a data path can't do (reconnect, "
-        "switch network, new chat); confirm-level ones pop a firmware confirm you cannot bypass. "
-        "Available: " +
+        "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
         BuildCommandsClause(false) +
         ".\n\n"
         "PRESETS -- for common shapes pass {preset,slots} instead of a hand-built tree; expands to a "

@@ -223,9 +223,9 @@ system_prompt，`pi_agent.c:58-60`，故 new_session 重建 agent 再借同一�
 |---|---|---|
 | 1 身份 | "You are pi, the on-device assistant living in a palm-size 720×720 touch screen… Reply short, warm, in the user's language (usually Chinese). Your text is read aloud by TTS, so avoid markdown symbols, links, and long bullet lists in prose." | 语音场景：回复要能读出来 |
 | 2 屏幕能力 | "You have a SCREEN… There is NO read tool: rendering a card that binds a device path IS how you read the device, and ui_render's return value gives you the live values (state)." | 教会"渲染即读取"这个非常规心智模型 |
-| 3 何时用卡 | SET → 控制卡（slider 直写硬件零往返）；STATUS → 小 dashboard；CHOICE/CONFIRM/FORM/LIST → 渲染出来让点击经 report 回来；闲聊 → 纯文本。"Prefer 'chat'; 'overlay' only for a modal moment — auto-closes and capped." | 防止过度渲染和 overlay 滥用 |
-| 4 DESIGN | 靠 pi 既有观感别手调样式：header = eyebrow+title；**恰好一个** primary（琥珀）按钮——主题已把 slider 填充/开态 switch/选中 choice 涂琥珀，别再把文字也涂琥珀；用语义 tone/fill token 不用裸 hex | 视觉一致性 |
-| 5 COMPACT | 窗口小、密胜于高：数据摆成多列表格行（每条记录一行、每字段一个 label、**每个 label 都 grow:1** 才跨行对齐），每行 2-4 列；短事实绝不一行一条；长文不进卡片；label 1-3 词；list 用 max 夹紧 | 720px 宽度下的信息密度 |
+| 3 何时用卡 | SET → 控制卡（直写硬件）；STATUS → 小 dashboard；CHOICE/CONFIRM/FORM/LIST → 渲染出来让点击经 report 回来；闲聊 → 纯文本。"Prefer 'chat'; 'overlay' only for a modal moment — auto-closes and capped." | 防止过度渲染和 overlay 滥用 |
+| 4 DESIGN | 靠 pi 既有观感别手调样式：header=eyebrow+title、分组相关行；**恰好一个** primary（琥珀）按钮——主题已把 fill/开态 switch/选中 choice 涂琥珀，别再把文字也涂琥珀；用 tone/fill 语义 token 不用裸 hex。外加 5 条从黄金样例提炼的设计杠杆：①一张卡一个焦点，大数值用 role:title 置顶、其余弱化；②并排 column 默认已是内容宽（见 §5.4），要**均分**才需显式给每个 grow:1，简单的一对信息更适合"叶子+spacer"；③状态用 tone(ok/err/accent)+icon 编码，不用裸文字；④按钮文案写结果（"清空"/"重试"），不写"确定"；⑤超过 3 条事实用 grid，大数值用 role:value（等宽字体）。曾经的第 3 条"heading 是 ASCII 子集字体"已整条删除——渲染器 SafeFont 的逐字覆盖回退（§5.2）已经兜底，不用再教模型绕着走 | 视觉一致性 + 让卡从"能用"变"好看" |
+| 5 COMPACT | 窗口小、密胜于高：数据摆成 `grid`（用法见 DESC 的 grid{} 类型定义，不在这里重复 cols/row-major 细节），2-4 列，role:section 做表头，跨列分割线用 divider span=<列数>；短事实绝不一行一条；长文不进卡片；label 1-3 词；list 用 max 夹紧 | 720px 宽度下的信息密度 |
 | 6 ACTION ECONOMICS | 设备自己能完成 → LOCAL action（瞬时、零往返、聊天不可见）；只有要生成新内容/新决策才 REPORT（一整轮往返 + 显示成用户消息）；绝不为浏览/展开/回显值而 report，用 toggle/patch；report 自动携带每个带 id 控件的值（choice 是 idx(label)），所以给控件 id 而不是把值写进 text | 省 token 省往返 |
 | 7 UPDATE vs RE-RENDER | 改一个节点的 text/value/显隐或卡数据 → ui_update；只有结构不同才重新 ui_render | 防重复渲染 |
 | 8 可写路径 | `"WRITABLE device paths you can set: " + BuildPathsClause(false)` | 活体清单，运行时拼入 |
@@ -267,28 +267,33 @@ bind → data-label → 事件 → 死控件降级 → 递归 children（仅 col
 **容器**
 
 - `column` / `row {children:[], gap?}`：flex 容器，gap 默认 12。row 用 ROW_WRAP（放不下自动
-  换行不裁切）并 flex_align(START,CENTER)。**depth==0 的顶层 column/row 自动获得卡片外观**：
-  Card 底色 + radius 18 + Line 边框 + pad_all 24（`render.cc:308-315`）——LLM 不需要也不能
-  自己画卡壳。
+  换行不裁切）并 flex_align(START,CENTER)。嵌套在 row 里的 column/row 默认**内容宽**、天然
+  并排显示，无需任何配置；要让它们**均分**整行则给每个显式 `grow:1`（细节见 §5.4）。
+  **depth==0 的顶层 column/row 自动获得卡片外观**：Card 底色 + radius 18 + Line 边框 +
+  pad_all 24（`render.cc:308-315`）——LLM 不需要也不能自己画卡壳。
 
 **文本与展示**
 
-- `label {text?, role?, bind?, fmt?, bind_data?}`：WRAP 长文本。列内默认全宽，行内自然宽。
-  role 字号阶梯见 §5.2。`bind` 绑设备路径实时显示（配 `fmt`）；`bind_data` 绑卡级 data key
-  （text 里可用 `{value}` 内联）。bind 与 bind_data 同给时 bind 优先。
+- `label {text?, role?, bind?, fmt?, bind_data?}`：列内默认全宽、WRAP 换行；行内自然宽，但
+  夹 `max_width:60%`，超长文本单行省略号截断而不是把兄弟挤到下一行（细节见 §5.4）。role 字号
+  阶梯见 §5.2。`bind` 绑设备路径实时显示（配 `fmt`）；`bind_data` 绑卡级 data key（text 里可用
+  `{value}` 内联）。bind 与 bind_data 同给时 bind 优先。
 - `icon {icon:'name', size?}`：无图标字体，全部用 LVGL 图元（条/圆/环/弧）拼出，size 默认 22
   像素，tone 默认 dim。名称清单（含别名，`pi_card_icons.h:11-16`）：check/ok、close/x、
   plus/add、minus、chevron/arrow/next、dot（未知名回落）、gear/settings、info、warning/alert、
   battery、charging/bolt（琥珀闪电）、wifi/signal、cellular、sun/brightness、volume /
   volume_high / volume_low / mute（红斜杠）/ music / mic、clock。
-- `divider`：1px 全宽 Line 色横线。
+- `divider`：列内/顶层 1px 全宽 Line 色横线；**行内**（父是 row）渲成竖分隔线（宽 2px、固定
+  高 20px，细节见 §5.4）。
 - `spacer`：行内 flex_grow=1 顶开两侧；列内**绝不 grow**（否则撑高卡片），默认高 8。
 - `qrcode {text, size?}`：size 默认 160 钳 [96,320]；text 非空且 ≤256 字节。配色**固定**
   浅底深码不随主题反色——保可扫描性（`render.cc:713-715`）。
 
 **输入控件**
 
-- `button {text, variant?, on_click}`：variant 见 §5.3。行内自动 grow。
+- `button {text, variant?, on_click}`：variant 见 §5.3。行内是否自动 grow 取决于兄弟：整行都是
+  可生长类型（纯按钮行）才均分；混了 label/icon/switch 等非可生长兄弟时保持内容自适应宽，不挤占
+  兄弟空间（显式 `grow`/`w` 永远优先）。
 - `slider {min, max, value, bind?, id?, on_change?, on_release?}`：min/max 默认 0/100
   （max≤min 时自动 +1 兜底）。高 6px 轨道，琥珀填充，**中性色把手**（把手不抢琥珀），
   ext_click_area 20 扩大触区。绑可写路径→直写硬件；绑定路径有量程时**量程覆盖 JSON min/max**
@@ -298,7 +303,7 @@ bind → data-label → 事件 → 死控件降级 → 递归 children（仅 col
 - `bar {min, max, value, bind?}`：只读进度条，无回写（观察者手动同步值）。
 - `choice {options:[2-6], value?, id?, bind?, on_change?}`：分段选择器（segmented picker），
   2-6 个选项，选中段琥珀底。内部按钮**整体只计 1 个节点**。value 是选中下标；report 时报
-  `idx(label)` 双份。
+  `idx(label)` 双份。行内是否自动 grow 与 button 同规则（见上）。
 
 **数据驱动**
 
@@ -321,9 +326,13 @@ bind → data-label → 事件 → 死控件降级 → 递归 children（仅 col
 | caption | pi_mono_14 | Faint | 0 | 脚注 |
 
 无 role 时按 `size`（默认 20）+`mono`（默认 false）选字体档位。**SafeFont 护栏**
-（`render.cc:533-539`）：pi_mono 系列只有 ASCII 字集，文本含任何非 ASCII 字节时无条件回退
-puhui_20_4 并去字距——中文进等宽字体不会变豆腐块。文本颜色优先级：tone（语义 token）>
-color（#hex）> role 默认。
+（`render.cc:759` 起）两道防线：① pi_mono 系列只有 ASCII 字集，文本含任何非 ASCII 字节时无
+条件回退 puhui_20_4 并去字距——中文进等宽字体不会变豆腐块；② `puhui_24_4`（heading 用的那档）
+是「UI chrome 静态文案子集」而非完整常用字集，逐 UTF-8 码点用 `lv_font_get_glyph_dsc` 查真实
+覆盖，只要有一个字缺字就整串回退到完整字集的 `puhui_30_4`（heading 因此可能变成与 title 同档
+的 30px，唯一代价，远胜豆腐块）。这道检查覆盖静态 text、`bind`/`bind_data` 动态取值、流式
+生长期原地更新文本、`ui_update`/`patch` 改文本等所有文本落点，不止建对象那一次。文本颜色
+优先级：tone（语义 token）> color（#hex）> role 默认。
 
 ### 5.3 button variant（`render.cc:188-216`）
 
@@ -343,11 +352,35 @@ color（#hex）> role 默认。
 `mono`、`tone`/`color`（文字）、`fill`/`bg`（背景，fill 用语义 token 优先，自动 radius 12）、
 `hidden`（初始隐藏，配 toggle/show 做"展开详情"）。
 
-布局尺寸决策（`ApplySizing`，`render.cc:234-255`）：显式 `w` > `grow` > 类型默认。**行内**：
-可生长类型（button/slider/bar/spacer/arc/choice/chart）自动 grow=1，label/icon/switch 保持
-自然宽；**列内**：可生长类型和 label 全宽。整体自适应为主——工具描述明确 "layout is
-adaptive — rarely need w/h"。表格对齐技巧（描述 + prompt 双处强调）：多列表格 = 堆 row，
-每行**每个 label 都 grow:1**，否则 label 收缩到文本宽、列对不齐。
+布局尺寸决策（`ApplySizing`，`render.cc:372-420`）：显式 `w` > `grow` > 类型默认。**行内**：
+slider/bar/arc/chart/spacer 恒自动 grow=1；button/choice 只在**整行子节点清一色可生长类型**
+（如一排纯按钮）时才自动 grow=1 均分，一旦行里混了 label/icon/switch/嵌套容器等非可生长兄弟，
+就保持内容自适应宽，不挤占兄弟空间；label/icon/switch 恒保持自然宽。
+
+嵌套 `column`/`row` 容器同样默认**内容宽**（不是撑满整行）——`row:[column][column]` 天然并排
+显示各自的内容，不需要任何额外配置就能左右分栏；要让它们**均分**整行则给每个显式 `grow:1`
+（该值会撑成确定宽度，覆盖内容宽默认）。行内 `divider` 渲成竖分隔线：定宽 2px、固定高 20px
+（不是撑满行交叉轴的百分比——LVGL 对"父容器高度未定时子项要 100% 高"不解析，会塌成 0 高不
+可见，固定像素是实测可靠的写法）。行内 `label` 夹 `max_width:60%` + 单行省略号截断
+（`LV_LABEL_LONG_DOT`），超长文本在自己槽位内截断，不会把 button 等兄弟挤到下一行；短文本不
+受影响，仍是内容宽。
+
+**列内**：可生长类型和 label 全宽——但**内容宽列自己的子节点例外**：一个内容宽列（嵌套在
+row 里、自己无显式 w/grow 的 column）如果也让子节点默认 100%，会形成"父按内容定宽、子按父的
+100% 定宽"的循环引用，LVGL 实测直接塌陷成 0 宽、整卡空白；因此内容宽列的子节点一律退回自然
+宽，不受"列内默认全宽"规则约束（渲染器内部用第 4 个 flow 值 `FLOW_COL_CONTENT` 区分，见
+`render.cc:365`）。这条只影响"内容宽列的子节点"，普通列（顶层卡壳、或父不是 row 的列）不受
+影响，仍然全宽。
+
+整体自适应为主——工具描述明确 "layout is adaptive — rarely need w/h"。多列表格对齐用 `grid`
+（cols=列宽比例或 "auto"，一格一字段按行主序排列，天然跨列对齐，不用 grow 技巧），2-4 列，
+role:section 做表头，跨列分割线用 divider + span=<列数>（DESC/system prompt 两处口径一致，
+见 §5.1 grid 类型）。
+
+已知局限：button/choice 是否默认 grow 由**渲染时**这一行的兄弟构成一次性决定；`ui_update` 的
+`patch` 改某节点的 `hidden`/`text`/`value` 等 props 不会回头重估同行兄弟的 grow——例如
+patch 把行里唯一的 label 隐藏掉，行内的 button 不会因此从"内容自适应宽"变回"均分"，需要重新
+`ui_render` 才会按新的兄弟构成算一遍。这是刻意取舍（patch 只改属性、不重排布局），不是 bug。
 
 ### 5.5 主题：语义 token 与双主题自适应
 

@@ -40,12 +40,16 @@ struct AdtsHeader {
 // 解析 buf 处的 ADTS 头；不合法返回 false。调用方保证 buf 至少 7 字节。
 bool ParseAdts(const uint8_t* b, size_t avail, AdtsHeader* h) {
     if (avail < 7 || b[0] != 0xFF || (b[1] & 0xF0) != 0xF0) return false;
+    if ((b[1] & 0x06) != 0) return false;  // layer 位必须为 0（ADTS 固定），滤掉伪同步头
+    const int header_len = (b[1] & 0x01) ? 7 : 9;  // protection_absent=1 → 无 CRC → 7
     const int rate = kAdtsRates[(b[2] >> 2) & 0x0F];
     const int ch = ((b[2] & 0x01) << 2) | (b[3] >> 6);
     const int len = ((b[3] & 0x03) << 11) | (b[4] << 3) | (b[5] >> 5);
-    if (rate == 0 || ch == 0 || len < 7) return false;
+    // len 必须严格大于 header_len：等于时 payload 为空、小于时下溢成巨值，两者都会让
+    // 后续 payload = frame_len - header_len 越界。
+    if (rate == 0 || ch == 0 || len <= header_len) return false;
     h->frame_len = len;
-    h->header_len = (b[1] & 0x01) ? 7 : 9;  // protection_absent=1 → 无 CRC → 7
+    h->header_len = header_len;
     h->sample_rate = rate;
     h->channels = ch;
     return true;

@@ -167,6 +167,139 @@ void TestSynthetic() {
           "LATM 应记录为不支持类型\n");
 }
 
+// —— 多 ES PMT / 损坏 PES 的定向白盒断言（覆盖 ES 遍历、drop-till-PUSI、重同步尾包扣留）——
+
+// 任意条数 ES 的 PMT（每条 ES_info_length=0）。section_length 随 ES 数计算。
+std::vector<uint8_t> BuildPmtMulti(int pmt_pid, int pcr_pid,
+                                   const std::vector<std::pair<uint8_t, int>>& es) {
+    std::vector<uint8_t> out;
+    PutPacketHeader(out, pmt_pid, true, 0);
+    out.push_back(0x00);  // pointer_field
+    const int section_len = 9 + 5 * (int)es.size() + 4;  // 固定头 9 + ES*5 + CRC 4
+    std::vector<uint8_t> sec = {0x02, (uint8_t)(0xB0 | ((section_len >> 8) & 0x0F)),
+                                (uint8_t)(section_len & 0xFF), 0x00, 0x01, 0xC1, 0x00, 0x00,
+                                (uint8_t)(0xE0 | ((pcr_pid >> 8) & 0x1F)), (uint8_t)(pcr_pid & 0xFF),
+                                0xF0, 0x00};  // program_info_length 0
+    for (const auto& e : es) {
+        sec.push_back(e.first);
+        sec.push_back((uint8_t)(0xE0 | ((e.second >> 8) & 0x1F)));
+        sec.push_back((uint8_t)(e.second & 0xFF));
+        sec.push_back(0xF0);
+        sec.push_back(0x00);  // ES_info_length 0
+    }
+    sec.insert(sec.end(), {0x00, 0x00, 0x00, 0x00});  // CRC 占位
+    out.insert(out.end(), sec.begin(), sec.end());
+    PadTo188(out, 0);
+    return out;
+}
+
+// PUSI 包，PES 头合法但 PES_header_data_length 巨大（跨出本包）→ demux 应 drop 至下一 PUSI。
+std::vector<uint8_t> BuildPesBadHdrLen(int pid, int cc, uint8_t hdr_len) {
+    std::vector<uint8_t> out;
+    PutPacketHeader(out, pid, true, cc);
+    const uint8_t pes_hdr[] = {0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x80, 0x00, hdr_len};
+    out.insert(out.end(), pes_hdr, pes_hdr + sizeof(pes_hdr));
+    PadTo188(out, 0);
+    return out;
+}
+
+// PUSI 包，PES 起始码损坏（非 00 00 01）→ demux 应 drop 至下一 PUSI。
+std::vector<uint8_t> BuildPesBadStart(int pid, int cc) {
+    std::vector<uint8_t> out;
+    PutPacketHeader(out, pid, true, cc);
+    const uint8_t bad[] = {0xDE, 0xAD, 0xBE, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00};
+    out.insert(out.end(), bad, bad + sizeof(bad));
+    PadTo188(out, 0);
+    return out;
+}
+
+void TestSyntheticExtra() {
+    const int kPmtPid = 0x100, kAudioPid = 0x101;
+    auto pat = BuildPat(kPmtPid);
+
+    // (a) PMT 只含 0x1B(H.264)+0x81(AC-3) → 不锁定且 unsupported 置位（记首个 0x1B）
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        auto pmt = BuildPmtMulti(kPmtPid, kAudioPid, {{0x1B, 0x101}, {0x81, 0x102}});
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt.data(), pmt.size(), out);
+        CHECK(!d.audio_locked() && d.found_unsupported() && d.unsupported_stream_type() == 0x1B,
+              "(a) 无 0x0F 的 PMT 应记不支持且记首个类型 0x1B (got locked=%d type=0x%02X)\n",
+              d.audio_locked(), d.unsupported_stream_type());
+    }
+
+    // (b) PMT ES 顺序 0x03 在前 0x0F 在后 → 锁定 0x0F 的 PID 并出帧
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        auto pmt = BuildPmtMulti(kPmtPid, kAudioPid, {{0x03, 0x105}, {0x0F, kAudioPid}});
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt.data(), pmt.size(), out);
+        CHECK(d.audio_locked() && !d.found_unsupported(), "(b) 全表扫到 0x0F 应锁定不置不支持\n");
+        auto pay = FakePayload(175, 0x33);
+        auto pes = BuildAudioPes(kAudioPid, 0, true, pay);
+        d.Feed(pes.data(), pes.size(), out);
+        CHECK(out == pay, "(b) 锁定 0x0F 的 PID 后应直通其 payload (got %zu want %zu)\n", out.size(),
+              pay.size());
+    }
+
+    // (c) PMT 无任何 ES → unsupported（类型记 -1）
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        auto pmt = BuildPmtMulti(kPmtPid, kAudioPid, {});
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt.data(), pmt.size(), out);
+        CHECK(!d.audio_locked() && d.found_unsupported() && d.unsupported_stream_type() == -1,
+              "(c) 无 ES 的 PMT 应置不支持（类型 -1）(got locked=%d type=%d)\n", d.audio_locked(),
+              d.unsupported_stream_type());
+    }
+
+    auto pmt_ok = BuildPmt(kPmtPid, kAudioPid, 0x0F);
+
+    // (d) PES_header_data_length 跨出首包 → 首包与后续 continuation 包均零输出
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt_ok.data(), pmt_ok.size(), out);
+        auto pes_bad = BuildPesBadHdrLen(kAudioPid, 0, 200);  // 200 > 184-9，跨包
+        auto cont = BuildAudioPes(kAudioPid, 1, false, FakePayload(184, 0x44));
+        d.Feed(pes_bad.data(), pes_bad.size(), out);
+        d.Feed(cont.data(), cont.size(), out);
+        CHECK(out.empty(), "(d) 超长 PES 头应 drop 首包及后续 continuation (got %zu)\n", out.size());
+    }
+
+    // (e) PUSI 包起始码损坏 → 该 PES 后续包零输出
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt_ok.data(), pmt_ok.size(), out);
+        auto pes_bad = BuildPesBadStart(kAudioPid, 0);
+        auto cont = BuildAudioPes(kAudioPid, 1, false, FakePayload(184, 0x55));
+        d.Feed(pes_bad.data(), pes_bad.size(), out);
+        d.Feed(cont.data(), cont.size(), out);
+        CHECK(out.empty(), "(e) 起始码损坏应 drop 至下一 PUSI (got %zu)\n", out.size());
+    }
+
+    // (f) 垃圾前缀 + 恰 188B 伪包（首字节 0x47）单次 Feed → 零输出（重同步后不可验证尾巴被扣住）
+    {
+        media::TsDemux d;
+        std::vector<uint8_t> out;
+        d.Feed(pat.data(), pat.size(), out);
+        d.Feed(pmt_ok.data(), pmt_ok.size(), out);
+        out.clear();
+        std::vector<uint8_t> buf(50, 0x00);  // 垃圾前缀（无 0x47）
+        buf.push_back(0x47);                  // 伪包首字节
+        auto tail = FakePayload(187, 0x66);   // 补足 188B，内容非 0x47
+        buf.insert(buf.end(), tail.begin(), tail.end());
+        d.Feed(buf.data(), buf.size(), out);
+        CHECK(out.empty(), "(f) 重同步后的 188B 伪尾包应被 carry 扣住不输出 (got %zu)\n", out.size());
+    }
+}
+
 void TestFixture(const std::vector<uint8_t>& ts) {
     // 一次性喂入
     media::TsDemux d;
@@ -287,6 +420,28 @@ void TestHlsParse() {
 
     auto vod = media::ParseM3u8("#EXTM3U\n#EXTINF:3,\na.ts\n#EXT-X-ENDLIST\n", "http://x/i.m3u8");
     CHECK(vod.endlist && vod.segment_urls.size() == 1, "ENDLIST 解析错误\n");
+
+    // (g) 不支持特性：EXT-X-MAP（fMP4）与加密 EXT-X-KEY 置 unsupported；METHOD=NONE 不置
+    auto m_map = media::ParseM3u8("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:3,\na.ts\n", "http://x/i.m3u8");
+    CHECK(m_map.unsupported, "(g) EXT-X-MAP 应置不支持\n");
+    auto m_key = media::ParseM3u8("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:3,\na.ts\n",
+                                  "http://x/i.m3u8");
+    CHECK(m_key.unsupported, "(g) 加密 EXT-X-KEY(AES-128) 应置不支持\n");
+    auto m_none = media::ParseM3u8("#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:3,\na.ts\n", "http://x/i.m3u8");
+    CHECK(!m_none.unsupported, "(g) METHOD=NONE 不应置不支持\n");
+
+    // (h) AVERAGE-BANDWIDTH 在前、BANDWIDTH 在后并存 → 取 BANDWIDTH 的精确值
+    auto m_bw = media::ParseM3u8(
+        "#EXTM3U\n#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=1000,BANDWIDTH=230000\nhttp://e/v.m3u8\n",
+        "http://x/i.m3u8");
+    CHECK(m_bw.variants.size() == 1 && m_bw.variants[0].bandwidth == 230000,
+          "(h) 应取 BANDWIDTH 精确匹配值而非 AVERAGE-BANDWIDTH (got %lld)\n",
+          (long long)(m_bw.variants.empty() ? -1 : m_bw.variants[0].bandwidth));
+
+    // (i) 协议相对 URL（//host/path）→ 接 base 的 scheme
+    CHECK(media::JoinUrl("https://a.cn/live/x/playlist.m3u8", "//cdn.b.cn/seg.ts?t=1") ==
+              "https://cdn.b.cn/seg.ts?t=1",
+          "(i) 协议相对 URL 应接 base 的 scheme\n");
 }
 
 }  // namespace
@@ -295,6 +450,7 @@ int main(int argc, char** argv) {
     const char* fixture = argc > 1 ? argv[1] : "sim/testdata/cnr_seg.ts";
     TestHlsParse();
     TestSynthetic();
+    TestSyntheticExtra();
     auto ts = ReadFile(fixture);
     if (ts.empty()) {
         std::fprintf(stderr, "ts_demux_test: fixture %s 不可读（从仓库根目录运行）\n", fixture);

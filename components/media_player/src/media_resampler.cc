@@ -23,12 +23,14 @@ void Resampler::Configure(int in_hz, int channels) {
 
     // 抗混叠：4 级 RBJ 低通 biquad 级联成 8 阶 Butterworth，截止 6.6kHz。
     // 每级 Q 为 8 阶 Butterworth 极点对的标准值；级按 Q 从低到高排，减小级间过冲。
+    // 只在真下采样（in_hz_ > kOutHz）时开启——16kHz 直通（in_hz_ == kOutHz）与所有
+    // 上采样场景（8k/11.025k/12k → 16k）没有折叠风险，压低通反而白削 6.6-8kHz 频段。
     // 截止逼近输入奈奎斯特时旁路（输入率已够低，降采样不会折叠），以 0.95 奈奎斯特
     // 为界避免系数病态。
     static const double kStageQ[kLpStages] = {0.50980, 0.60134, 0.89998, 2.56292};
     const double fc = 6600.0;
     const double fs = (double)in_hz_;
-    if (fc >= fs * 0.5 * 0.95) {
+    if (in_hz_ <= kOutHz || fc >= fs * 0.5 * 0.95) {
         lp_enabled_ = false;
     } else {
         const double w0 = 2.0 * M_PI * fc / fs;

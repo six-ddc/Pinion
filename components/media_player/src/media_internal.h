@@ -94,7 +94,9 @@ class ByteRing {
 // pump 上下文：controller 创建/持有/销毁，两条线程体在 media_pump.cc。
 // reader 线程：按 playlist 从 start_index 起逐曲开源、阻塞读 → 字节环；曲末（EOF）与
 //   decoder 握手后推进下一曲（自动连播）；无限流不 EOF。
-// decoder 线程：从字节环取压缩字节 → minimp3 榨干 → 降混+重采样 → FeedPlayback。
+// decoder 线程：从字节环取压缩字节 → MediaDecoder（按 track_codec 分派：真机
+//   esp_audio_codec 官方库 MP3+AAC；sim 端 minimp3(MP3)+AudioToolbox(AAC)）榨干 →
+//   降混+重采样 → FeedPlayback。
 struct Pump {
     PumpHost* host = nullptr;
     uint32_t session = 0;                 // 会话代次（与 controller 当前代次比对，丢弃陈旧回调）

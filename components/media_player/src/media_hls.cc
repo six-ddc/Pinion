@@ -28,13 +28,40 @@ constexpr int kPollSliceMs = 200;                     // 各类等待的分片�
 
 bool StartsWith(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
-// 取 #EXT-X-KEY:...,ATTR=值 形式里的十进制整数属性（够用：只用于 BANDWIDTH）。
+// 属性名精确边界匹配：名字前须是行首/':'/','/空白（属性表 ", " 分隔含空格），后须紧跟 '='。
+// 否则 find("BANDWIDTH") 会误命中 AVERAGE-BANDWIDTH（前接 '-'，非分隔符，正确排除）。
+// 返回属性名后 '=' 的位置（指向 '='），未匹配返回 npos。
+size_t FindAttr(const std::string& line, const char* key) {
+    const size_t klen = std::strlen(key);
+    size_t p = 0;
+    for (;;) {
+        p = line.find(key, p);
+        if (p == std::string::npos) return std::string::npos;
+        const char lc = p == 0 ? ':' : line[p - 1];
+        const bool left_ok = lc == ':' || lc == ',' || lc == ' ' || lc == '\t';
+        const size_t after = p + klen;
+        if (left_ok && after < line.size() && line[after] == '=') return after;
+        p = after;
+    }
+}
+
+// 取 #EXT-X-...:ATTR=值 形式里的十进制整数属性（够用：只用于 BANDWIDTH）。
 int64_t AttrInt(const std::string& line, const char* key) {
-    size_t p = line.find(key);
-    if (p == std::string::npos) return 0;
-    p += std::strlen(key);
-    if (p >= line.size() || line[p] != '=') return 0;
-    return std::strtoll(line.c_str() + p + 1, nullptr, 10);
+    const size_t eq = FindAttr(line, key);
+    if (eq == std::string::npos) return 0;
+    return std::strtoll(line.c_str() + eq + 1, nullptr, 10);
+}
+
+// 取字符串属性值（到下一个 ',' 或行尾；去掉两侧可能的引号）。用于 #EXT-X-KEY 的 METHOD。
+std::string AttrStr(const std::string& line, const char* key) {
+    const size_t eq = FindAttr(line, key);
+    if (eq == std::string::npos) return "";
+    size_t v = eq + 1;
+    const bool quoted = v < line.size() && line[v] == '"';
+    if (quoted) v++;
+    size_t e = v;
+    while (e < line.size() && line[e] != (quoted ? '"' : ',')) e++;
+    return line.substr(v, e - v);
 }
 
 }  // namespace
@@ -46,6 +73,7 @@ std::string JoinUrl(const std::string& base, const std::string& ref) {
     std::string b = base.substr(0, base.find('?'));
     const size_t scheme = b.find("://");
     if (scheme == std::string::npos) return ref;  // base 畸形：原样返回 ref
+    if (StartsWith(ref, "//")) return b.substr(0, scheme) + ":" + ref;  // 协议相对：接 base 的 scheme
     if (ref[0] == '/') {
         const size_t host_end = b.find('/', scheme + 3);
         return (host_end == std::string::npos ? b : b.substr(0, host_end)) + ref;
@@ -89,6 +117,11 @@ HlsPlaylist ParseM3u8(const std::string& text, const std::string& base_url) {
                 pl.target_duration_s = (int)std::strtol(line.c_str() + 22, nullptr, 10);
             } else if (StartsWith(line, "#EXT-X-ENDLIST")) {
                 pl.endlist = true;
+            } else if (StartsWith(line, "#EXT-X-MAP")) {
+                pl.unsupported = true;  // fMP4 分片：本解封装只吃 TS，不支持
+            } else if (StartsWith(line, "#EXT-X-KEY")) {
+                std::string method = AttrStr(line, "METHOD");
+                if (method != "NONE") pl.unsupported = true;  // 加密分片：不支持
             } else if (StartsWith(line, "#EXTINF:")) {
                 next_is_segment = true;
             }
@@ -120,7 +153,7 @@ class HlsStreamSource : public MediaSource {
     int Read(uint8_t* buf, size_t max) override {
         if (buf == nullptr || max == 0) return -1;
         for (;;) {
-            if (abort_.load()) return -1;
+            if (abort_.load() || fatal_) return -1;  // abort 或不支持特性等致命错误
             // 1) 缓冲有货直接吐
             if (adts_pos_ < adts_.size()) {
                 const size_t n = std::min(max, adts_.size() - adts_pos_);
@@ -132,9 +165,8 @@ class HlsStreamSource : public MediaSource {
                 ESP_LOGE(TAG, "unsupported audio stream_type 0x%02X in TS", demux_.unsupported_stream_type());
                 return -1;
             }
-            if (ended_) return 0;  // ENDLIST 且已吐完：曲末 EOF
             // 2) 拉下一片（内部带刷新/重连/退避；失败返回 false = 彻底放弃）
-            if (!NextSegment()) return abort_.load() || !ended_ ? -1 : 0;
+            if (!NextSegment()) return -1;
         }
     }
 
@@ -164,43 +196,74 @@ class HlsStreamSource : public MediaSource {
                 return false;
             }
             pl = ParseM3u8(text, media_url);
-            if (pl.is_master || pl.segment_urls.empty()) return false;  // 两层 master：不支持
+            if (pl.is_master || pl.segment_urls.empty()) {  // 两层 master：不支持
+                ESP_LOGW(TAG, "nested master or empty variant playlist, unsupported");
+                return false;
+            }
+        }
+        if (CheckUnsupported(pl)) return false;  // #EXT-X-MAP/加密：置 fatal
+        if (pl.endlist) {  // 本产品只播直播电台：ENDLIST 视同网络失败，不按点播 EOF
+            ESP_LOGW(TAG, "playlist has ENDLIST (treated as live failure, not VOD)");
+            return false;
         }
         if (pl.segment_urls.empty()) return false;
         media_url_ = std::move(media_url);
         playlist_ = std::move(pl);
-        // 直播起点：倒数 kLiveEdgeBack 片；点播（ENDLIST）从头播。
+        // 直播起点：倒数 kLiveEdgeBack 片。
         const int64_t last = playlist_.media_sequence + (int64_t)playlist_.segment_urls.size();
-        next_seq_ = playlist_.endlist
-                        ? playlist_.media_sequence
-                        : std::max(playlist_.media_sequence, last - kLiveEdgeBack);
+        next_seq_ = std::max(playlist_.media_sequence, last - kLiveEdgeBack);
         demux_.Reset();
+        // 新会话：清停滞检测，别让重连继承旧的 60s 停滞计时。
+        last_window_first_ = -1;
+        last_window_end_ = -1;
+        window_advance_us_ = 0;
         // 日志一律避开 %lld/%zu：真机 newlib-nano 不认，变参错位会把后续 %s 当指针解引用
         // 直接崩（实测 MTVAL 里全是 URL 文本）。序号打印取低位够诊断用。
-        ESP_LOGI(TAG, "hls resolved: %d segs, target %ds, seq %u%s", (int)playlist_.segment_urls.size(),
-                 playlist_.target_duration_s, (unsigned)next_seq_, playlist_.endlist ? " (vod)" : "");
+        ESP_LOGI(TAG, "hls resolved: %d segs, target %ds, seq %u", (int)playlist_.segment_urls.size(),
+                 playlist_.target_duration_s, (unsigned)next_seq_);
         return true;
     }
 
-    // 确保 playlist_ 覆盖 next_seq_：不够则按 target duration 节奏刷新；落后滑窗则跳直播沿。
-    // 只在直播（非 endlist）时刷新。返回 false = 刷新失败（网络层面）。
+    // 识别不支持特性（#EXT-X-MAP fMP4 / 加密 #EXT-X-KEY）：命中即 LOGE + 置实例级 fatal。
+    bool CheckUnsupported(const HlsPlaylist& pl) {
+        if (!pl.unsupported) return false;
+        ESP_LOGE(TAG, "unsupported HLS playlist (fMP4 EXT-X-MAP or encrypted EXT-X-KEY)");
+        fatal_ = true;
+        return true;
+    }
+
+    // 确保 playlist_ 覆盖 next_seq_：不够则按 target duration 节奏刷新；落后/超前窗口跳直播沿。
+    // 返回 false = 刷新失败（网络层面或直播沿停滞），交给 NextSegment 失败路径。
     bool RefreshUntilHasNext() {
         for (;;) {
             const int64_t first = playlist_.media_sequence;
             const int64_t end = first + (int64_t)playlist_.segment_urls.size();
-            if (next_seq_ < first) {  // 落后滑窗（暂停过久/服务端重启）：跳回直播沿，丢中断的 PES
-                ESP_LOGW(TAG, "behind live window (seq %u < %u), rejoin edge", (unsigned)next_seq_,
-                         (unsigned)first);
+            // 直播沿停滞兜底：窗口连续刷新不前进累计 ≥60s 即放弃，交给整链重解析。
+            const int64_t now_us = esp_timer_get_time();
+            if (first > last_window_first_ || end > last_window_end_) {
+                last_window_first_ = first;
+                last_window_end_ = end;
+                window_advance_us_ = now_us;  // 窗口前进：重置停滞计时
+            } else if (window_advance_us_ != 0 && (now_us - window_advance_us_) / 1000 >= kGiveUpAfterMs) {
+                ESP_LOGW(TAG, "live edge stalled %dms, bail to reconnect",
+                         (int)((now_us - window_advance_us_) / 1000));
+                return false;
+            }
+            // 落后滑窗（暂停过久/服务端重启）或超前（服务端序号重置）：跳回直播沿，丢中断的 PES
+            if (next_seq_ < first || next_seq_ > end) {
+                ESP_LOGW(TAG, "seq %u out of window [%u,%u), rejoin edge", (unsigned)next_seq_,
+                         (unsigned)first, (unsigned)end);
                 next_seq_ = std::max(first, end - kLiveEdgeBack);
                 demux_.Reset();
             }
             if (next_seq_ < end) return true;
-            if (playlist_.endlist) {
-                ended_ = true;
-                return true;
+            if (playlist_.endlist) {  // 本产品只播直播电台：ENDLIST 视同网络失败
+                ESP_LOGW(TAG, "playlist gained ENDLIST (treated as live failure, not VOD)");
+                return false;
             }
-            // 追上直播沿：睡半个 target（分片轮询 abort）再刷新
-            const int wait_ms = std::max(1, playlist_.target_duration_s * 1000 / 2);
+            // 追上直播沿：睡半个 target（分片轮询 abort）再刷新。下限 1000ms 防 TARGETDURATION
+            // 缺失/0 时 busy 轮询打爆服务器。
+            const int wait_ms = std::max(1000, playlist_.target_duration_s * 1000 / 2);
             for (int waited = 0; waited < wait_ms; waited += kPollSliceMs) {
                 if (abort_.load()) return false;
                 std::this_thread::sleep_for(std::chrono::milliseconds(kPollSliceMs));
@@ -212,6 +275,7 @@ class HlsStreamSource : public MediaSource {
                 return false;
             }
             HlsPlaylist pl = ParseM3u8(text, media_url_);
+            if (CheckUnsupported(pl)) return false;  // 刷新后出现不支持特性：置 fatal
             if (pl.segment_urls.empty()) return false;
             playlist_ = std::move(pl);
         }
@@ -221,9 +285,9 @@ class HlsStreamSource : public MediaSource {
     //（退避 + 60s 放弃 + on_reconnecting 上报）。返回 false = 彻底放弃或 abort。
     bool NextSegment() {
         for (;;) {
-            if (abort_.load()) return false;
+            if (abort_.load() || fatal_) return false;  // fatal 直接放弃，不进退避
             bool ok = RefreshUntilHasNext();
-            if (ok && ended_) return true;  // ENDLIST 榨干：Read 返回 0
+            if (fatal_) return false;  // 刷新中命中不支持特性
             if (ok) {
                 const size_t idx = (size_t)(next_seq_ - playlist_.media_sequence);
                 const std::string& seg_url = playlist_.segment_urls[idx];
@@ -235,14 +299,21 @@ class HlsStreamSource : public MediaSource {
                         fail_streak_start_us_ = 0;
                         if (on_reconnecting_) on_reconnecting_(false);
                     }
+                    attempt_ = 0;  // 分片拉取成功：清退避计数，避免恢复后从 15s 起跳
                     next_seq_++;
                     adts_.clear();
                     adts_pos_ = 0;
                     demux_.Feed((const uint8_t*)seg.data(), seg.size(), adts_);
                     if (adts_.empty() && !demux_.found_unsupported()) {
                         ESP_LOGW(TAG, "segment yielded no audio (%uB ts)", (unsigned)seg.size());
+                        if (++empty_streak_ >= 3) {  // 连续 3 片零音频：置 fatal 放弃
+                            ESP_LOGE(TAG, "3 consecutive empty segments, giving up");
+                            fatal_ = true;
+                            return false;
+                        }
                         continue;  // 空片：直接试下一片
                     }
+                    empty_streak_ = 0;  // 任一分片产出音频即清零
                     return true;
                 }
                 ESP_LOGW(TAG, "segment fetch failed (http %d), seq %u", status, (unsigned)next_seq_);
@@ -273,13 +344,17 @@ class HlsStreamSource : public MediaSource {
     std::string media_url_;                       // media playlist URL（刷新/相对拼接基准，含 token）
     HlsPlaylist playlist_;
     int64_t next_seq_ = 0;                        // 下一个要拉的分片序号
-    bool ended_ = false;                          // ENDLIST 且已榨干
+    bool fatal_ = false;                          // 不支持特性/连续空片等致命错误：Read 返 -1
     TsDemux demux_;
     std::vector<uint8_t> adts_;                   // 当前分片解出的 ADTS 缓冲
     size_t adts_pos_ = 0;
     std::atomic<bool> abort_{false};
     int64_t fail_streak_start_us_ = 0;            // 0 = 当前无失败连续段
     int attempt_ = 0;
+    int empty_streak_ = 0;                        // 连续零音频分片计数（产出音频即清零）
+    int64_t last_window_first_ = -1;              // 上次见到的窗口 [first,end)，用于停滞检测
+    int64_t last_window_end_ = -1;
+    int64_t window_advance_us_ = 0;               // 窗口最近一次前进的时刻（0 = 未初始化）
 };
 
 }  // namespace
