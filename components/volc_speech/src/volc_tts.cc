@@ -33,7 +33,7 @@ static const char* TAG = "volc_tts";
 // 端点/资源/音色与已验证的参考部署一致（ai-chat-esp32 service/.env）
 #define TTS_URL "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
 #define TTS_RESOURCE_ID "seed-tts-2.0"
-#define TTS_VOICE "zh_female_xiaohe_uranus_bigtts"
+#define TTS_VOICE "zh_female_vv_uranus_bigtts"
 #define TTS_SAMPLE_RATE 16000  // mhal::audio 板载 codec 固定 16kHz，免重采样
 #define TTS_CONNECT_TIMEOUT_MS 10000
 #define TTS_SEND_TIMEOUT_MS 5000
@@ -623,9 +623,12 @@ static TtsState* tts_get_state(void) {
     s->audio_rb_free_empty = xRingbufferGetCurFreeSize(s->audio_rb);
     s->pump_run = true;
     s->pump_alive = true;  // 先于建任务置位，避免 shutdown 在任务首行前误判已退出
-    // 优先级对齐播放任务（4）；栈 8KB：ringbuf 搬运 + opus 解码 + FeedPlayback
-    // （opus 大块 scratch 走 THREADSAFE_PSEUDOSTACK 的线程本地堆栈，不压任务栈）
-    if (xTaskCreate(tts_audio_pump_task, "tts_audio", 8192, s, 4,
+    // 优先级对齐播放任务（4）；栈 16KB：ringbuf 搬运 + opus 解码 + FeedPlayback
+    // （opus 大块 scratch 走 THREADSAFE_PSEUDOSTACK 的线程本地堆栈，不压任务栈；
+    // 8KB 历史上够用，16KB 是 2026-07 排查解码崩溃时留下的余量。那次崩溃的真根因
+    // 是 esp_audio_codec 闭源库的同名 opus 符号混链，已用
+    // CONFIG_AUDIO_DECODER_OPUS_SUPPORT=n 根除，见 sdkconfig.defaults 尾注）。
+    if (xTaskCreate(tts_audio_pump_task, "tts_audio", 16384, s, 4,
                     &s->pump_task) != pdPASS) {
         vEventGroupDelete(s->eg);
         vSemaphoreDelete(s->api_lock);
