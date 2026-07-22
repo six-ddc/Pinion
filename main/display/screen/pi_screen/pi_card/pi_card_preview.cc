@@ -126,7 +126,10 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
 void PreviewOnToolEnd() {
     // execute 已经跑完：若预览仍然存活，说明没有被 PreviewAdopt 取走——校验失败/未生成合法
     // root/其它原因，没有真卡片跟上，撤除，不留孤儿。
-    if (s_preview.active) PreviewTeardownInternal();
+    if (s_preview.active) {
+        ESP_LOGI(TAG, "preview torn down at tool end (no adopt — likely validate/queue reject)");
+        PreviewTeardownInternal();
+    }
     s_pending_tool_is_render = false;
     s_preview.disqualified = false;
 }
@@ -145,6 +148,7 @@ void PreviewCheckGen(uint32_t cur_gen) {
 
 lv_obj_t* PreviewAdopt() {
     if (!s_preview.active || s_preview.disqualified || !s_preview.row) return nullptr;
+    ESP_LOGI(TAG, "preview adopted by formal render (%d nodes)", s_preview.node_count);
     lv_obj_t* row = s_preview.row;
     // 放弃所有权：row 现在归正式渲染管，预览会话复位——不再是"预览"了，不能再被 Teardown 删掉。
     lv_obj_remove_event_cb(row, PreviewRowDeletedCb);

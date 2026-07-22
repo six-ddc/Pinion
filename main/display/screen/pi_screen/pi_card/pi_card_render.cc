@@ -98,6 +98,11 @@ bool ParseHex(const char* s, lv_color_t& out) {
     return true;
 }
 
+// 行内 label 的固定像素钳宽（坑F收口）：不能用 LV_PCT——嵌套内容宽 row 里百分比对
+// SIZE_CONTENT 父容器解析为 0，label 永久塌成 "..."（见 RenderNode/RenderPreviewNode 的
+// label 分支头注）。取 720 屏 6 成上下、留足卡片内边距的经验值。
+constexpr int32_t kRowLabelMaxWidthPx = 400;
+
 // LLM 下发的 label fmt 会原样喂给 newlib vsnprintf（本固件 CONFIG_LV_USE_CLIB_SPRINTF=y），
 // 且绑定 label 只带 1 个变参：数值(Int/Bool)路径传 int、字符串(String)路径传 char*。故合法
 // fmt 必须：至多 1 个转换占位符、其类型与路径匹配（数值→d/i/u/o/x/X/c，字符串→s）、禁 %n
@@ -1051,9 +1056,15 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
             if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
             // col_align 镜像 ApplySizing column：growable/label/divider 铺满列(STRETCH)，
             // 其余（icon/switch/qrcode…）及显式 w 靠列首(START)。row_align 竖向居中。
+            // 例外：带 bind/bind_data 的 label 保持 START（内容宽）——渲染时它的文本还是
+            // 空的，"auto" 列按空文本量出 ≈0 宽，STRETCH 会把它钉死在 0 宽上；数据到达后
+            // WRAP 模式在 0 宽里逐字竖排，列也永远涨不回来（牛市看板真机复现：值列一字一
+            // 行"看不见"）。START + SIZE_CONTENT 下文本更新即重量列宽，auto 列跟着涨。
             const char* ct = GetStr(ch, "type");
+            const bool dyn_label = ct != nullptr && std::strcmp(ct, "label") == 0 &&
+                                   (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
             lv_grid_align_t col_align = LV_GRID_ALIGN_START;
-            if (!HasKey(ch, "w") && ct != nullptr &&
+            if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
                 (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
                 col_align = LV_GRID_ALIGN_STRETCH;
             }
@@ -1061,15 +1072,27 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
-        if (const char* txt = GetStr(node, "text")) lv_label_set_text(obj, txt);
+        // 无 text 也要显式置空：没有 text/bind/bind_data 的 label 校验期放行（模型偶尔渲骨架
+        // 等后续 patch），不置空会裸奔 LVGL 默认 "Text"（预览端同口径，见 PreviewLabelText）。
+        lv_label_set_text(obj, GetStr(node, "text", ""));
         if (parent_flow == FLOW_ROW) {
             // 行内 label 天生自然宽、不设宽度上限——超长文本会把行撑宽到自动换行
             // （LV_FLEX_FLOW_ROW_WRAP），把 button 等兄弟挤到下一行竖排（坑F）。夹一个
-            // max_width（占行 60%，短文本不受影响，仍是内容宽）+ 单行省略号，超长文本在自己
-            // 槽位内截断，不再挤占兄弟的位置。列内 label（含顶层）保持原 WRAP 换行，不变——
-            // 那是段落文本的正确默认。
-            lv_obj_set_style_max_width(obj, LV_PCT(60), LV_PART_MAIN);
-            lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+            // max_width + 单行收口，超长文本在自己槽位内截断，不再挤占兄弟的位置。列内
+            // label（含顶层）保持原 WRAP 换行，不变——那是段落文本的正确默认。
+            // 两个坑（真机音量卡复现）：
+            //  1. max_width 不能用 LV_PCT——嵌套内容宽 row（父是 row 的 row）里百分比对
+            //     SIZE_CONTENT 父容器解析为 0，label 永久塌成 "..."；改固定像素钳宽。
+            //  2. 动态 label（bind/bind_data）不能用 LONG_DOT——LVGL 的
+            //     lv_label_set_text_fmt 不像 lv_label_set_text 那样先 revert dot 状态
+            //     （lv_label.c:175 无 lv_label_revert_dots），布局前打过点的 label 再走
+            //     set_text_fmt（ApplyBind 种子/num-anim 每帧）会让陈旧 dot 备份写回新文本
+            //     缓冲：默认 "Text" 备份盖掉 "70%"，杂串如 "%d%%P P"，且 1 字节堆越界。
+            //     改 LONG_CLIP（无破坏性变异，set_text_fmt 安全）；静态文本保留 DOT——
+            //     set_text 路径 revert 正确、尺寸事件后自愈，还能有省略号观感。
+            lv_obj_set_style_max_width(obj, kRowLabelMaxWidthPx, LV_PART_MAIN);
+            const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
         } else {
             lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
         }
@@ -1699,9 +1722,13 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
             // FLOW_GRID：子项跳过全部 flex 尺寸默认（同正式渲染），宽度语义归 set_grid_cell
             // 的 col_align 管；STRETCH/START 判据逐字镜像 RenderNode 的 grid 分支。
             lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count, FLOW_GRID);  // 失败即占位，永不 null
+            // 口径同 RenderNode 的 grid 分支：带 bind/bind_data 的 label 不 STRETCH，防
+            // "空文本量列 → 0 宽钉死 → 数据到了逐字竖排"的 auto 列塌缩（见那里的头注）。
             const char* ct = GetStr(ch, "type");
+            const bool dyn_label = ct != nullptr && std::strcmp(ct, "label") == 0 &&
+                                   (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
             lv_grid_align_t col_align = LV_GRID_ALIGN_START;
-            if (!HasKey(ch, "w") && ct != nullptr &&
+            if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
                 (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
                 col_align = LV_GRID_ALIGN_STRETCH;
             }
@@ -1709,11 +1736,15 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         }
     } else if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
-        // 口径同 RenderNode：行内 label 夹 max_width + 单行省略号，避免超长文本把 button 等
-        // 兄弟挤到下一行（坑F）；列内保持原 WRAP 换行。
+        // 口径同 RenderNode：行内 label 夹像素钳宽 + 单行收口，避免超长文本把 button 等
+        // 兄弟挤到下一行（坑F）；列内保持原 WRAP 换行。像素钳宽/动态 label 用 CLIP 的
+        // 原因见 RenderNode 的 label 分支头注（PCT 在内容宽 row 塌 0、LONG_DOT 与
+        // set_text_fmt 组合会让陈旧 dot 备份污染新文本——预览的 PreviewSeedBindLabel/
+        // 每帧原地更新同样走 set_text_fmt，一样中招）。
         if (parent_flow == FLOW_ROW) {
-            lv_obj_set_style_max_width(obj, LV_PCT(60), LV_PART_MAIN);
-            lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_max_width(obj, kRowLabelMaxWidthPx, LV_PART_MAIN);
+            const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
         } else {
             lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
         }

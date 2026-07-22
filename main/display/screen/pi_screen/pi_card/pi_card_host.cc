@@ -76,8 +76,13 @@ bool Enqueue(pi_ui_kind_t kind, char* s1, char* s2, char* s3, int i1, int i2) {
      * 卡片声明式 UI 会整体失效。工具在 worker 线程 run 内同步执行，用 run 代次与本轮
      * 文本事件保持一致过滤（barge-in 打断后旧 run 的迟到卡片据此被正确丢弃）。 */
     evt.gen = pi_agent_task_run_gen();
-    if (xQueueSend(pi_ui_queue(), &evt, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "pi_ui_queue full, dropping card evt kind=%d", static_cast<int>(kind));
+    // 短阻塞等待而非立即放弃：ui_render 流式期间 UI_TOOL_ARGS 会挤满队列（深 32），
+    // execute 紧随最后一个 delta 到来，0 等待几乎必撞满——渲染被拒、LLM 重试、重试的
+    // 流式又挤满队列……活锁（牛市看板真机复现）。drain tick 每 80ms 清 64 条，等待
+    // 500ms 必有空位；工具本就在 worker 线程同步执行，短阻塞无副作用。
+    if (xQueueSend(pi_ui_queue(), &evt, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "pi_ui_queue full after 500ms wait, dropping card evt kind=%d",
+                 static_cast<int>(kind));
         free(s1);
         free(s2);
         free(s3);
@@ -309,6 +314,10 @@ void ReflowOverlay(UiCard* card) {
 // 不因数据缺失让整卡渲染失败）。
 void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode, int ttl_ms,
                    const char* data_json) {
+    // 关键排障日志：卡片渲染的完整 spec/data 原文。每卡一次、量级 KB，115200 下可承受
+    // （对比流式 args 每 delta 一条的红线场景）；真机排"渲染不对"类问题全靠它对现场。
+    ESP_LOGI(TAG, "render spec: %s", spec_json ? spec_json : "(null)");
+    if (data_json && data_json[0]) ESP_LOGI(TAG, "render data: %s", data_json);
     cJSON* root = cJSON_Parse(spec_json ? spec_json : "");
     if (!cJSON_IsObject(root)) {
         ESP_LOGW(TAG, "render: bad root json");
@@ -730,6 +739,8 @@ void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
 }  // namespace
 
 void OnUpdateEvent(const char* card_id, const char* payload_json) {
+    ESP_LOGI(TAG, "update card=%s payload: %s", card_id && card_id[0] ? card_id : "(latest)",
+             payload_json ? payload_json : "(null)");
     UiCard* card = FindCard(card_id ? card_id : "");
     if (!card) {
         ESP_LOGW(TAG, "update: card not found");
@@ -809,6 +820,7 @@ void OnUpdateEvent(const char* card_id, const char* payload_json) {
 }
 
 void OnCloseEvent(const char* card_id) {
+    ESP_LOGI(TAG, "close card=%s", card_id && card_id[0] ? card_id : "(latest)");
     UiCard* card = FindCard(card_id ? card_id : "");
     if (!card) return;
     // ui_close card:'pin'：模型显式移除常驻组件——先擦 NVS 再异步删 root（OnRootDeleted
