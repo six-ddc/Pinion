@@ -14,6 +14,8 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"  // 播控图元画布显式 PSRAM 分配
+#include "esp_jpeg_common.h"  // 封面 JPEG 直解（esp_new_jpeg 要求 16B 对齐缓冲，见 DecodeJpegDirectEsp）
+#include "esp_jpeg_dec.h"
 #include "esp_pthread.h"  // 后台封面读盘 worker 的栈配置（仅真机路径）
 #include "freertos/FreeRTOS.h"  // worker 退出握手信号量（设备端不能 join，见 StopCoverWorker）
 #include "freertos/semphr.h"
@@ -580,12 +582,148 @@ struct CoverReady {
     size_t size;
 };
 
+#ifdef ESP_PLATFORM
+// 共享哈夫曼表 JPEG 重写：优化编码器（mozjpeg 等）常只发一套 DC0/AC0 表、三分量全部
+// 映射 0 号——完全合法但 esp_new_jpeg 按"色度用 1 号表"的常规假设写死，遇共享表报
+// JPEG_ERR_BAD_DATA(-5)（真机实测，周杰伦专辑封面即此形态）。重写为常规形态：DHT
+// 复制一份改 id=1、SOS 色度分量映射改 0x11。宿主已验：产物合法且像素级零差异。
+// 返回 malloc 新缓冲；无需重写（已有 1 号表/结构不匹配）返回 nullptr 用原字节。
+uint8_t* RewriteSharedHuffJpeg(const uint8_t* in, size_t sz, size_t* out_sz) {
+    if (in == nullptr || sz < 4 || in[0] != 0xFF || in[1] != 0xD8) return nullptr;
+    // 第一遍：定位 DC0/AC0 表与 SOS，确认没有 1 号表
+    size_t dc0_off = 0, dc0_len = 0, ac0_off = 0, ac0_len = 0, sos_off = 0, sos_len = 0;
+    bool has_id1 = false;
+    for (size_t i = 2; i + 4 <= sz && in[i] == 0xFF;) {
+        const uint8_t marker = in[i + 1];
+        const size_t seg = 2 + (((size_t)in[i + 2] << 8) | in[i + 3]);
+        if (i + seg > sz) return nullptr;
+        if (marker == 0xC4 && seg >= 5) {
+            const uint8_t tc_th = in[i + 4];
+            if (tc_th == 0x00) { dc0_off = i; dc0_len = seg; }
+            if (tc_th == 0x10) { ac0_off = i; ac0_len = seg; }
+            if ((tc_th & 0x0F) != 0) has_id1 = true;
+        } else if (marker == 0xDA) {
+            sos_off = i;
+            sos_len = seg;
+            break;
+        }
+        i += seg;
+    }
+    if (has_id1 || dc0_len == 0 || ac0_len == 0 || sos_off == 0 || sos_len < 8) return nullptr;
+    uint8_t* out = static_cast<uint8_t*>(malloc(sz + dc0_len + ac0_len));
+    if (out == nullptr) return nullptr;
+    size_t o = 0;
+    std::memcpy(out, in, sos_off);  // SOS 之前原样（含既有 DHT）
+    o = sos_off;
+    std::memcpy(out + o, in + dc0_off, dc0_len);  // 复制表改 id=1
+    out[o + 4] = 0x01;
+    o += dc0_len;
+    std::memcpy(out + o, in + ac0_off, ac0_len);
+    out[o + 4] = 0x11;
+    o += ac0_len;
+    std::memcpy(out + o, in + sos_off, sz - sos_off);  // SOS + 熵流
+    const size_t ns = out[o + 4];
+    for (size_t c = 0; c < ns && o + 6 + c * 2 < sz + dc0_len + ac0_len; c++) {
+        if (out[o + 5 + c * 2] != 1) out[o + 6 + c * 2] = 0x11;  // 色度分量 → DC1/AC1
+    }
+    *out_sz = o + (sz - sos_off);
+    return out;
+}
+
+// 真机 JPEG 封面直解（esp_new_jpeg 官方姿势）：esp_lv_decoder 的软解包装把输出缓冲交给
+// LVGL 分配器，不满足 esp_new_jpeg "outbuf 必须 16 字节对齐" 的硬性要求（头文件明示、
+// FAQ 专条）；且 LVGL9 解码器链头插无回退（esp_lv_decoder 永远独家认领 JPEG、失败即整链
+// 失败，内建 tjpgd 从无机会）——封面在设备端从未走通过。这里输入/输出都走
+// jpeg_calloc_align，解出 RGB888 后拷进普通 malloc 位图（CoverBitmap 由 free 释放，
+// 不能持有 jpeg_free_align 专属内存）。失败返回 false（外层回落 LVGL 解码器路径）。
+bool DecodeJpegDirectEsp(const uint8_t* raw_bytes, size_t raw_len, int w, int h, CoverBitmap* out) {
+    // 共享哈夫曼表先重写成常规形态（见上）
+    size_t rw_len = 0;
+    uint8_t* rewritten = RewriteSharedHuffJpeg(raw_bytes, raw_len, &rw_len);
+    const uint8_t* bytes = rewritten != nullptr ? rewritten : raw_bytes;
+    const size_t len = rewritten != nullptr ? rw_len : raw_len;
+    if (rewritten != nullptr) {
+        ESP_LOGI(TAG, "cover: shared-huff jpeg rewritten %uB -> %uB", (unsigned)raw_len, (unsigned)len);
+    }
+    jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
+    cfg.output_type = JPEG_PIXEL_FORMAT_RGB888;
+    jpeg_dec_handle_t dec = nullptr;
+    if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK || dec == nullptr) {
+        if (rewritten != nullptr) free(rewritten);
+        return false;
+    }
+    uint8_t* in_aligned = static_cast<uint8_t*>(jpeg_calloc_align(len, 16));
+    uint8_t* out_aligned = nullptr;
+    uint8_t* bitmap = nullptr;
+    int outbuf_len = 0;
+    do {
+        if (in_aligned == nullptr) break;
+        std::memcpy(in_aligned, bytes, len);
+        jpeg_dec_io_t io = {};
+        jpeg_dec_header_info_t hi = {};
+        io.inbuf = in_aligned;
+        io.inbuf_len = static_cast<int>(len);
+        jpeg_error_t err = jpeg_dec_parse_header(dec, &io, &hi);
+        if (err != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "cover: jpeg parse_header err=%d", (int)err);
+            break;
+        }
+        if (jpeg_dec_get_outbuf_len(dec, &outbuf_len) != JPEG_ERR_OK || outbuf_len <= 0) break;
+        out_aligned = static_cast<uint8_t*>(jpeg_calloc_align((size_t)outbuf_len, 16));
+        if (out_aligned == nullptr) break;
+        io.outbuf = out_aligned;
+        err = jpeg_dec_process(dec, &io);
+        if (err != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "cover: jpeg_dec_process err=%d (w=%d h=%d)", (int)err, (int)hi.width, (int)hi.height);
+            break;
+        }
+        const size_t bitmap_size = (size_t)w * h * 3;
+        if ((size_t)outbuf_len != bitmap_size) {
+            // 解码器若按 MCU 补齐输出（如 180→192），行距假设不成立——先记录，见到再适配
+            ESP_LOGW(TAG, "cover: outbuf_len=%d != w*h*3=%u", outbuf_len, (unsigned)bitmap_size);
+        }
+        bitmap = static_cast<uint8_t*>(malloc(bitmap_size));
+        if (bitmap == nullptr) break;
+        std::memcpy(bitmap, out_aligned, std::min((size_t)outbuf_len, bitmap_size));
+        // esp_new_jpeg 输出 R,G,B 字节序；LVGL 的 LV_COLOR_FORMAT_RGB888 按小端 B,G,R
+        // 存放——须交换 R/B（esp_lv_decoder 的软解路径同款处理；漏掉=整图偏蓝）。
+        for (size_t p = 0; p + 2 < bitmap_size; p += 3) {
+            const uint8_t r = bitmap[p];
+            bitmap[p] = bitmap[p + 2];
+            bitmap[p + 2] = r;
+        }
+        s_cover_alloc_count++;
+        ESP_LOGI(TAG, "cover bitmap (direct) %uB, alloc_count=%d", (unsigned)bitmap_size, s_cover_alloc_count);
+        out->data = bitmap;
+        out->dsc.header.cf = LV_COLOR_FORMAT_RGB888;
+        out->dsc.header.w = static_cast<uint32_t>(w);
+        out->dsc.header.h = static_cast<uint32_t>(h);
+        out->dsc.header.stride = static_cast<uint32_t>(w) * 3;
+        out->dsc.data_size = static_cast<uint32_t>(bitmap_size);
+        out->dsc.data = bitmap;
+    } while (false);
+    if (rewritten != nullptr) free(rewritten);
+    if (in_aligned != nullptr) jpeg_free_align(in_aligned);
+    if (out_aligned != nullptr) jpeg_free_align(out_aligned);
+    jpeg_dec_close(dec);
+    return bitmap != nullptr;
+}
+#endif
+
 // bytes/len：APIC 原始编码字节（调用方持有，本函数只读不释放）。成功时 out
 // 持有一份自己 malloc 的位图（cf/w/h/stride 取自解码器实际结果）。
 bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
     int w = 0, h = 0;
     if (!media_id3::PeekImageSize(bytes, len, &w, &h)) return false;
     if (w <= 0 || h <= 0 || w > 800 || h > 800) return false;  // 防御性尺寸门控
+
+#ifdef ESP_PLATFORM
+    // JPEG（FFD8 魔数）优先走 esp_new_jpeg 直解（对齐要求见 DecodeJpegDirectEsp 注释）；
+    // 失败或 PNG 再走 LVGL 解码器注册链。
+    if (len >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 && DecodeJpegDirectEsp(bytes, len, w, h, out)) {
+        return true;
+    }
+#endif
 
     // EXIF/非标 APP0 的 baseline JPEG：底层 tjpgd 能解，但 LVGL 包装层 is_jpg() 只
     // 认精确 JFIF 签名。喂解码器前做 JFIF 归一化（插入标准 APP0）。尺寸/progressive
@@ -697,6 +835,37 @@ bool DecodeCoverBytes(const uint8_t* bytes, size_t len, CoverBitmap* out) {
 // LVGL 线程（lv_async_call 回调）：解码 worker 读回的封面字节，成功则在 s_art_host
 // 内叠一张 LV_IMAGE_ALIGN_COVER 图（裁切铺满 330×330，圆角由 s_art_host 的
 // clip_corner 兜底）。全程复核 generation + 页面状态：过期（用户又换了曲）或页面
+// 剥离 JPEG 元数据段：只保留解码必需段（DQT/SOF/DHT/DRI），SOS 起熵编码流原样拷到尾；
+// 丢弃 APP0-15（EXIF/JFIF/ICC…）与 COM。动机见调用点注释（esp_new_jpeg 拒解 EXIF 开头
+// 的 baseline 图）。返回 malloc 的新缓冲（调用方 free），结构异常（非 JPEG/没走到 SOS）
+// 返回 nullptr 表示"不处理，用原字节"。
+uint8_t* StripJpegMeta(const uint8_t* in, size_t sz, size_t* out_sz) {
+    if (in == nullptr || sz < 4 || in[0] != 0xFF || in[1] != 0xD8) return nullptr;
+    uint8_t* out = static_cast<uint8_t*>(malloc(sz));
+    if (out == nullptr) return nullptr;
+    size_t o = 2, i = 2;
+    out[0] = 0xFF;
+    out[1] = 0xD8;
+    while (i + 4 <= sz && in[i] == 0xFF) {
+        const uint8_t marker = in[i + 1];
+        const size_t seg = 2 + (((size_t)in[i + 2] << 8) | in[i + 3]);
+        if (i + seg > sz) break;  // 段长越界：结构坏
+        if (marker == 0xDA) {     // SOS：其后为熵编码流，原样拷到结尾
+            std::memcpy(out + o, in + i, sz - i);
+            *out_sz = o + (sz - i);
+            return out;
+        }
+        const bool drop = (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
+        if (!drop) {
+            std::memcpy(out + o, in + i, seg);
+            o += seg;
+        }
+        i += seg;
+    }
+    free(out);
+    return nullptr;
+}
+
 // 已关则释放不上屏。失败（超尺寸/progressive/解码失败）静默保留生成式母题。
 void OnCoverReady(void* p) {
     CoverReady* cr = static_cast<CoverReady*>(p);
@@ -763,6 +932,20 @@ void CoverWorkerRun() {
         // 指针 strlen → Load access fault（真机实测：播带封面 MP3 开全屏必崩）。
         ESP_LOGI(TAG, "cover: read %uB in %ums mime=%s -> decode on LVGL thread", (unsigned)sz,
                  static_cast<unsigned>(t1 - t0), mime.c_str());
+        // JPEG 元数据剥离：设备端 esp_new_jpeg 对 EXIF(APP1) 开头的 baseline 图实测拒解
+        //（周杰伦专辑封面 180x180 SOF0 带 EXIF，jpeg_dec_process 直接失败；剥掉 APP/COM
+        // 段只留解码必需段后可解）。progressive(SOF2) 仍无解（解码器只支持 baseline），
+        // 剥离过程顺带告警。PNG 不经此路径。
+        if (mime == "image/jpeg" || mime == "image/jpg") {
+            size_t stripped_sz = 0;
+            uint8_t* stripped = StripJpegMeta(bytes, sz, &stripped_sz);
+            if (stripped != nullptr) {
+                free(bytes);
+                bytes = stripped;
+                sz = stripped_sz;
+                ESP_LOGI(TAG, "cover: jpeg meta stripped -> %uB", (unsigned)sz);
+            }
+        }
         // lv_async_call 操作 LVGL 内部链表，非线程安全：设备端持 esp_lv_adapter 锁，
         // sim 端（LV_USE_OS=PTHREAD）持 lv_lock，与各自的 lv_timer_handler 泵互斥。
 #ifdef ESP_PLATFORM
