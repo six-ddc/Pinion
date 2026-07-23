@@ -1,0 +1,12 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "控件混排" } ] },
+    { "rows": [
+        [ { "type": "icon", "icon": "volume" }, { "type": "slider", "value": 60 } ],
+        [ { "type": "icon", "icon": "sun" }, { "type": "slider", "value": 40 } ],
+        [ { "type": "label", "role": "label", "text": "开关" }, { "type": "switch", "checked": true } ]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "STOCK" },
+        { "type": "label", "role": "title", "text": "自选行情" }
+      ]
+    },
+    {
+      "cols": [ { "title": "标的" }, { "title": "现价", "num": true }, { "title": "涨跌", "num": true } ],
+      "rows": [
+        [ { "type": "label", "text": "贵州茅台" },
+          { "type": "label", "role": "value", "bind": "stock.sh600519.price" },
+          { "type": "label", "role": "value", "bind": "stock.sh600519.pct" } ],
+        [ { "type": "label", "text": "腾讯控股" },
+          { "type": "label", "role": "value", "bind": "stock.hk00700.price" },
+          { "type": "label", "role": "value", "bind": "stock.hk00700.pct" } ]
+      ]
+    },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "cols": [ { "title": "项" }, { "title": "值", "num": true }, { "title": "值", "num": true } ],
+      "rows": [
+        [ { "type": "label", "text": "茅台 PE/PB" },
+          { "type": "label", "bind": "stock.sh600519.pe" },
+          { "type": "label", "bind": "stock.sh600519.pb" } ],
+        [ { "type": "label", "text": "茅台 市值/换手" },
+          { "type": "label", "bind": "stock.sh600519.market_cap" },
+          { "type": "label", "bind": "stock.sh600519.turnover" } ],
+        [ { "type": "label", "text": "腾讯 市值/PB" },
+          { "type": "label", "bind": "stock.hk00700.market_cap" },
+          { "type": "label", "bind": "stock.hk00700.pb" } ]
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "caption", "tone": "dim", "bind": "stock.sh600519.time", "side": "end" }
+      ]
+    }
+  ]
+}

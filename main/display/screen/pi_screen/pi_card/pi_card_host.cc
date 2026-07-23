@@ -319,7 +319,8 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
     ESP_LOGI(TAG, "render spec: %s", spec_json ? spec_json : "(null)");
     if (data_json && data_json[0]) ESP_LOGI(TAG, "render data: %s", data_json);
     cJSON* root = cJSON_Parse(spec_json ? spec_json : "");
-    if (!cJSON_IsObject(root)) {
+    // v2: root 是 grid 块数组（见 docs/CARD_V2.md §1.1），不再是单个 column/row 对象。
+    if (!root || !(cJSON_IsObject(root) || cJSON_IsArray(root))) {
         ESP_LOGW(TAG, "render: bad root json");
         cJSON_Delete(root);
         return;
@@ -482,16 +483,14 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
 
 namespace {
 
-// 改造4：结构化 DataOp——ApplyDataOps 不再只留下"哪个 key 变了"这种粗粒度信号，而是把每个
-// 操作的种类 + 落地后的下标一并记下来，供 RefreshDataConsumers 判断能不能走行级 fast path
-// （只重渲/新建/删掉"确实变了的那一行"）而不是每次都整卡 list 全量重建。index 语义：
-// Append=新元素落地后的数组下标（即插入后的 length-1）；RemoveIdx/Replace=解析好的目标下标
-// （remove 的 id 已经在这里转换成 index）；SetWhole 不涉及下标，恒为 -1（set 是整键替换，
-// 天生就是"全新数组"，行级增量无从谈起，见 RefreshDataConsumers）。
+// 一次 ui_update.data 调用命中的 key 集合——RefreshDataConsumers 只需要知道"哪些 key 变了"
+// 就能决定刷哪些 consumer：Label 直接按 key 重新 Stringify；List（bind_rows grid）不分
+// append/remove/replace/set，统一整块重渲（见 RebuildBindRowsGrid 头注：真正变化的是行数/
+// 内容，track 宽度/表头/empty 兜底都要用当前 card->data 整体重新过一遍 solver 才保真，行级
+// 增量在多 cell 网格行模型下代价不比整块重渲小多少，改造4 v1 时代那套"只搬动确实变了的那一
+// 行"的 fast path 是给旧的"一行=一个 lv_obj"list 模型设计的，不适配现在的 bind_rows 网格行）。
 struct DataOp {
-    enum Kind { Append, RemoveIdx, Replace, SetWhole } kind;
     std::string key;
-    int index = -1;
 };
 
 // data.set/append/remove/replace 落地到 card->data，追加对应的结构化 DataOp。越界/类型不符
@@ -508,7 +507,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::vector<DataOp>& ops_out) 
             } else {
                 cJSON_AddItemToObject(card->data, kv->string, cJSON_Duplicate(kv, 1));
             }
-            ops_out.push_back({DataOp::SetWhole, kv->string, -1});
+            ops_out.push_back({kv->string});
         }
     }
     if (const cJSON* append = cJSON_GetObjectItem(ops, "append"); cJSON_IsObject(append)) {
@@ -519,7 +518,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::vector<DataOp>& ops_out) 
             if (!arr) arr = cJSON_AddArrayToObject(card->data, keyj->valuestring);
             if (cJSON_IsArray(arr) && cJSON_GetArraySize(arr) < 20) {
                 cJSON_AddItemToArray(arr, cJSON_Duplicate(item, 1));
-                ops_out.push_back({DataOp::Append, keyj->valuestring, cJSON_GetArraySize(arr) - 1});
+                ops_out.push_back({keyj->valuestring});
             } else {
                 ReportAsyncError(std::string("data.append 失败：'") + keyj->valuestring +
                                  "' 不是数组，或已达 20 行硬顶");
@@ -549,7 +548,7 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::vector<DataOp>& ops_out) 
             }
             if (idx >= 0 && idx < cJSON_GetArraySize(arr)) {
                 cJSON_DeleteItemFromArray(arr, idx);
-                ops_out.push_back({DataOp::RemoveIdx, keyj->valuestring, idx});
+                ops_out.push_back({keyj->valuestring});
             } else {
                 ReportAsyncError("data.remove 失败：index 越界，或没有匹配的 id");
             }
@@ -566,147 +565,41 @@ void ApplyDataOps(UiCard* card, const cJSON* ops, std::vector<DataOp>& ops_out) 
         int idx = cJSON_IsNumber(idxj) ? idxj->valueint : -1;
         if (cJSON_IsArray(arr) && item && idx >= 0 && idx < cJSON_GetArraySize(arr)) {
             cJSON_ReplaceItemInArray(arr, idx, cJSON_Duplicate(item, 1));
-            ops_out.push_back({DataOp::Replace, keyj->valuestring, idx});
+            ops_out.push_back({keyj->valuestring});
         } else {
             ReportAsyncError("data.replace 失败：数组不存在，或 index 越界");
         }
     }
 }
 
-// list 空数组兜底文案的挂/摘——行级 fast path 在"行数 0↔非0"这两个转折点各调一次；全量重建
-// （RefreshListFull）也复用它，逻辑只写一份。挂/摘之后调用方要自己同步 dc.empty_shown。
-void AddListEmptyLabel(UiCard::DataConsumer& dc) {
-    if (dc.empty_text.empty()) return;
-    lv_obj_t* lbl = lv_label_create(dc.obj);
-    lv_label_set_text(lbl, dc.empty_text.c_str());
-    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    const lv_font_t* f = &font_pi_mono_14;
-    SafeFont(f, dc.empty_text.c_str());  // 中文兜底文案回退 puhui，不出豆腐块
-    lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
-    pi_theme::ApplyText(lbl, pi_theme::Tok::Faint);
-}
-void RemoveListEmptyLabel(UiCard::DataConsumer& dc) {
-    // 只在 dc.empty_shown 为真时调用：dc.obj 此刻唯一的子节点就是 empty_text label（若
-    // dc.empty_text 本来是空串，压根没建过 label，child_count==0，天然是空操作）。
-    if (lv_obj_get_child_count(dc.obj) > 0) lv_obj_delete(lv_obj_get_child(dc.obj, 0));
-}
-
-// 无 empty 文案的 list 在 0 行时整体隐藏不占位（与 pi_card_render 渲染分支对应），数据
-// 到达/清空时在这里同步收放。有 empty 文案的 list 由占位 label 占场，不参与收放。
-void SyncListCollapse(UiCard::DataConsumer& dc) {
-    if (!dc.empty_text.empty()) return;
-    if (lv_obj_get_child_count(dc.obj) == 0) {
-        lv_obj_add_flag(dc.obj, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_remove_flag(dc.obj, LV_OBJ_FLAG_HIDDEN);
+// List 消费者（bind_rows grid）刷新：整块委托 pi_card_render.cc 的 RebuildBindRowsGrid——
+// 它会删掉 dc.obj 现有的 lv 子树、用当前 card->data 重新走一遍 solver::Solve + 建控件、插回
+// 原来的兄弟位置。旧对象在调用后必然失效（哪怕失败也是——见 RebuildBindRowsGrid 头注），
+// 必须用返回值刷新 dc.obj，绝不能保留旧指针继续用。
+void RefreshBindRowsGrid(UiCard* card, UiCard::DataConsumer& dc) {
+    std::string err;
+    lv_obj_t* gobj =
+        RebuildBindRowsGrid(dc.obj, dc.grid_spec, card, dc.viewport_w, dc.gap, dc.limits, err);
+    dc.obj = gobj;
+    if (!gobj) {
+        ESP_LOGW(TAG, "bind_rows rebuild failed (key=%s): %s", dc.key.c_str(), err.c_str());
     }
 }
 
-// List 消费者的全量重建：lv_obj_clean 整个子树，按 card->data[key] 重新逐行渲染，保存/恢复
-// scroll_y 消除跳动。退回路径——SetWhole，或 tpl_uses_index 模板上的 RemoveIdx，都靠它兜底
-// （见 RefreshDataConsumers）。行定位不存指针，靠"子节点顺序==数组下标"这条不变量，全量重建
-// 后这条不变量自动成立，不需要额外维护什么映射；只需要重算 dc.empty_shown。
-void RefreshListFull(UiCard* card, UiCard::DataConsumer& dc) {
-    int32_t sy = lv_obj_get_scroll_y(dc.obj);
-    lv_obj_clean(dc.obj);
-    const cJSON* arr = cJSON_GetObjectItem(card->data, dc.key.c_str());
-    int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-    int rows = std::min(len, dc.eff_max);
-    int node_count = 0;
-    std::string rerr;
-    for (int i = 0; i < rows; i++) {
-        cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
-        SubstRecord(clone, cJSON_GetArrayItem(arr, i), i);
-        RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count, rerr,
-                  /*parent_flow=*/0, /*in_list_row=*/true);
-        cJSON_Delete(clone);
-    }
-    dc.empty_shown = (rows == 0);
-    if (dc.empty_shown) AddListEmptyLabel(dc);
-    lv_obj_scroll_to_y(dc.obj, sy, LV_ANIM_OFF);
-}
-
-// List 消费者的行级 fast path：按 ops 里命中 dc.key 的每一条，逐条原地 append 尾插 / replace
-// 换行 / remove 删行，不碰其余没变的行——这是改造4的核心，避免"改一行、全表重渲"的浪费。行
-// 定位直接 lv_obj_get_child(dc.obj, i) 按位取，不额外存指针数组：list 容器子节点顺序本就等于
-// 数组下标，这条不变量在 append/replace/remove 三个分支里各自维持住就够了。调用前提
-// （RefreshDataConsumers 已判过）：本轮没有 SetWhole 命中这个 key；RemoveIdx 命中
-// tpl_uses_index 模板的情形也已经被摘出去整个 key 走全量，不会调到本函数处理那条 op。
-// "截断区不补行"：eff_max 是初次渲染时定下的可见行数上限，append 到已达上限就不再新建可见
-// 行（数据本身照样落进 card->data，只是不进画面）；remove 掉一行也不会去"拉"被截断区里原本
-// 看不见的下一条顶上来补位——这是轻量版明确的取舍（团队确认过），全量重建路径下次触发时
-// 才会用当前真实数组重新算出准确的可见集合。
-void RefreshListFastPath(UiCard* card, UiCard::DataConsumer& dc, const std::vector<DataOp>& ops) {
-    for (const DataOp& op : ops) {
-        if (op.key != dc.key) continue;
-        const cJSON* arr = cJSON_GetObjectItem(card->data, dc.key.c_str());
-        switch (op.kind) {
-            case DataOp::Append: {
-                if (dc.empty_shown) {
-                    RemoveListEmptyLabel(dc);  // 空转非空：先摘掉占位文案，腾出位置 0 给真行
-                    dc.empty_shown = false;
-                }
-                if (op.index >= dc.eff_max) break;  // 截断区不补行
-                const cJSON* item = cJSON_IsArray(arr) ? cJSON_GetArrayItem(arr, op.index) : nullptr;
-                if (!item) break;
-                cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
-                SubstRecord(clone, item, op.index);
-                int node_count = 0;
-                std::string rerr;
-                RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count, rerr,
-                          /*parent_flow=*/0, /*in_list_row=*/true);  // flex 容器尾插即末位，天然对齐
-                cJSON_Delete(clone);
-                break;
-            }
-            case DataOp::Replace: {
-                int visible = static_cast<int>(lv_obj_get_child_count(dc.obj));
-                if (op.index < 0 || op.index >= visible) break;  // 截断区/越界：不动
-                const cJSON* item = cJSON_IsArray(arr) ? cJSON_GetArrayItem(arr, op.index) : nullptr;
-                if (!item) break;
-                lv_obj_delete(lv_obj_get_child(dc.obj, op.index));
-                cJSON* clone = cJSON_Duplicate(dc.item_tpl, 1);
-                SubstRecord(clone, item, op.index);
-                int node_count = 0;
-                std::string rerr;
-                lv_obj_t* row = RenderNode(dc.obj, clone, card, dc.limits, dc.depth + 1, node_count,
-                                           rerr, /*parent_flow=*/0, /*in_list_row=*/true);
-                cJSON_Delete(clone);
-                if (row) lv_obj_move_to_index(row, op.index);  // 新行建出来会追加到末尾，挪回原位置
-                break;
-            }
-            case DataOp::RemoveIdx: {
-                int visible = static_cast<int>(lv_obj_get_child_count(dc.obj));
-                if (op.index < 0 || op.index >= visible) break;  // 截断区/越界：不动
-                lv_obj_delete(lv_obj_get_child(dc.obj, op.index));
-                if (visible - 1 == 0) {
-                    AddListEmptyLabel(dc);  // 非空转空：补回占位文案
-                    dc.empty_shown = true;
-                }
-                break;
-            }
-            case DataOp::SetWhole:
-                break;  // SetWhole 已在 RefreshDataConsumers 里触发全量重建分支，这里不会走到
-        }
-    }
-}
-
-// 只刷 ops 里出现过的 key 对应的消费者：Label 直接 set-text；List 优先走行级 fast path。退回
-// 全量重建（RefreshListFull）的条件：本轮该 key 命中过 SetWhole（整键替换，天生是"全新数组"，
-// 行级增量无从谈起）；或命中过 RemoveIdx 且模板 tpl_uses_index（remove 会让后续行的下标整体
-// 前移，这类模板的显示内容会跟着过时，只有它需要为此退全量——append/replace 不影响任何其它
-// 行的下标，即便模板里有 {i}/{n} 也不受这条限制，照样走 fast path）。末尾按显示模式收尾：
-// Overlay 重跑高度稳定器，Chat 走 end_row（贴底跟随/滚动到底）。
+// 只刷 ops 里出现过的 key 对应的消费者：Label 直接按 key 重新 Stringify 落文本；List
+// （bind_rows grid）整块委托 RefreshBindRowsGrid（append/remove/replace/set 一视同仁，见
+// DataOp 头注）。末尾按显示模式收尾：Overlay 重跑高度稳定器，Chat 走 end_row（贴底跟随/
+// 滚动到底）。
 void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
     if (!card || ops.empty()) return;
     bool touched = false;
     for (auto& dc : card->consumers) {
         bool hit = false;
-        bool need_full = false;
         for (const DataOp& op : ops) {
-            if (op.key != dc.key) continue;
-            hit = true;
-            if (op.kind == DataOp::SetWhole) need_full = true;
-            if (op.kind == DataOp::RemoveIdx && dc.tpl_uses_index) need_full = true;
+            if (op.key == dc.key) {
+                hit = true;
+                break;
+            }
         }
         if (!hit || !dc.obj) continue;
         touched = true;
@@ -719,12 +612,8 @@ void RefreshDataConsumers(UiCard* card, const std::vector<DataOp>& ops) {
             const lv_font_t* f = lv_obj_get_style_text_font(dc.obj, LV_PART_MAIN);
             if (SafeFont(f, txt.c_str())) lv_obj_set_style_text_font(dc.obj, f, LV_PART_MAIN);
             lv_label_set_text(dc.obj, txt.c_str());
-        } else if (need_full) {
-            RefreshListFull(card, dc);
-            SyncListCollapse(dc);
         } else {
-            RefreshListFastPath(card, dc, ops);
-            SyncListCollapse(dc);
+            RefreshBindRowsGrid(card, dc);
         }
     }
     if (touched) {
@@ -859,8 +748,14 @@ void RehydratePin() {
     if (!cJSON_IsObject(env)) return discard("bad json");
     const cJSON* verj = cJSON_GetObjectItem(env, "v");
     if (!cJSON_IsNumber(verj) || verj->valueint != kPinVer) return discard("version mismatch");
+    // v2：Repair() 就地修复 env 里的 "root"（root 单对象→包数组等语法糖），修复不了的（如
+    // preset/slots 残留）当场判定失败。修复后必须重新取 "root"——它可能已被替换成新指针。
+    std::string rerr;
+    if (!Repair(env, rerr, nullptr)) return discard(("repair failed: " + rerr).c_str());
     const cJSON* rootspec = cJSON_GetObjectItem(env, "root");
-    if (!cJSON_IsObject(rootspec)) return discard("missing root");
+    if (!rootspec || !(cJSON_IsObject(rootspec) || cJSON_IsArray(rootspec))) {
+        return discard("missing root");
+    }
     const cJSON* dataspec = cJSON_GetObjectItem(env, "data");
     std::string verr;
     if (!Validate(rootspec, cJSON_IsObject(dataspec) ? dataspec : nullptr, verr)) {
@@ -882,22 +777,30 @@ void RehydratePin() {
 // ---------------------------------------------------------------------------
 namespace {
 
-// 收集 spec 树里所有 bind 路径。递归口径与渲染器/校验器一致：只有 column/row/grid 的
-// children 会被渲染，别去收集一棵永远不会存在的子树。
+// 收集 spec 树里所有 DataHub bind 路径（v2：CARD_V2.md §1.2）。v2 形状 = root 是 grid 块
+// 数组，每个 grid 恰含 cells(叶子一维数组) / rows(叶子二维数组) / bind_rows(item 行模板 +
+// data key)，树深恒 2（无 column/row/旧grid/children）。叶子上的 "bind"（label/slider/arc/
+// switch/bar/choice）与 "bind_history"（chart）是真正的 DataHub 路径依赖——收集它们，供
+// BindStateJson 读回当前值给 LLM。"bind_data" 不算：它读的是卡级 data（渲染期 SubstDataValue
+// 替换），不是 DataHub 路径，此处不收集（ReadForWorker 对非法 key 本就静默失败，收了也是
+// 无害的空转，但语义上不该混进"设备状态"快照）。bind_rows 的 item 行模板同理走 data，不收集。
 void CollectBindPaths(const cJSON* node, std::set<std::string>& paths) {
-    if (!cJSON_IsObject(node)) return;
-    const cJSON* b = cJSON_GetObjectItem(node, "bind");
-    if (cJSON_IsString(b)) paths.insert(b->valuestring);
-    const cJSON* type = cJSON_GetObjectItem(node, "type");
-    if (!cJSON_IsString(type)) return;
-    if (std::strcmp(type->valuestring, "column") != 0 && std::strcmp(type->valuestring, "row") != 0 &&
-        std::strcmp(type->valuestring, "grid") != 0) {
+    if (!node) return;
+    if (cJSON_IsArray(node)) {
+        const cJSON* c = nullptr;
+        cJSON_ArrayForEach(c, node) CollectBindPaths(c, paths);
         return;
     }
-    const cJSON* children = cJSON_GetObjectItem(node, "children");
-    if (!cJSON_IsArray(children)) return;
-    const cJSON* c = nullptr;
-    cJSON_ArrayForEach(c, children) CollectBindPaths(c, paths);
+    if (!cJSON_IsObject(node)) return;
+    if (const cJSON* b = cJSON_GetObjectItem(node, "bind"); cJSON_IsString(b)) paths.insert(b->valuestring);
+    if (const cJSON* bh = cJSON_GetObjectItem(node, "bind_history"); cJSON_IsString(bh))
+        paths.insert(bh->valuestring);
+    if (const cJSON* cells = cJSON_GetObjectItem(node, "cells"); cJSON_IsArray(cells)) {
+        CollectBindPaths(cells, paths);
+    } else if (const cJSON* rows = cJSON_GetObjectItem(node, "rows"); cJSON_IsArray(rows)) {
+        CollectBindPaths(rows, paths);  // rows[] 每项本身是叶子数组，递归数组分支会再展开一层
+    }
+    // bind_rows 形态：item 模板不含 DataHub bind（行内 action 只准 report/set/close），不递归。
 }
 
 // 这张卡 bind 到的路径的当前值 → `,"state":{…}`（一条都读不到时返回空串）。
@@ -945,291 +848,6 @@ std::string BindStateJson(const cJSON* root) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// preset 展开：worker 侧把 {preset,slots} 拼成一棵普通 spec 树，再走既有 Validate+Render——
-// preset 纯语法糖，不新增渲染路径（D5）。缺 slot 时返回具名错误串，同步回给 LLM 重试。
-namespace {
-
-cJSON* MkNode(const char* type) {
-    cJSON* o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", type);
-    return o;
-}
-cJSON* MkLabel(const char* role, const std::string& text) {
-    cJSON* o = MkNode("label");
-    if (role) cJSON_AddStringToObject(o, "role", role);
-    cJSON_AddStringToObject(o, "text", text.c_str());
-    return o;
-}
-cJSON* AddChildren(cJSON* container) { return cJSON_AddArrayToObject(container, "children"); }
-const char* Str(const cJSON* obj, const char* key, const char* dflt = nullptr) {
-    const cJSON* v = obj ? cJSON_GetObjectItem(obj, key) : nullptr;
-    return (v && cJSON_IsString(v)) ? v->valuestring : dflt;
-}
-// dashboard 的 value 标签：role=value + bind + fmt，不带静态 text（显示全靠 bind 实时值）。
-cJSON* MkBindValueLabel(const char* bind, const char* fmt) {
-    cJSON* o = MkNode("label");
-    cJSON_AddStringToObject(o, "role", "value");
-    cJSON_AddStringToObject(o, "bind", bind);
-    cJSON_AddStringToObject(o, "fmt", fmt);
-    return o;
-}
-
-// header：eyebrow+title 两行小 column，四个 preset 共用。
-cJSON* MkHeader(const char* eyebrow_dflt, const cJSON* slots, const char* title) {
-    cJSON* header = MkNode("column");
-    cJSON_AddNumberToObject(header, "gap", 2);
-    cJSON* hc = AddChildren(header);
-    cJSON_AddItemToArray(hc, MkLabel("eyebrow", Str(slots, "eyebrow", eyebrow_dflt)));
-    cJSON_AddItemToArray(hc, MkLabel("title", title));
-    return header;
-}
-
-cJSON* BuildConfirm(const cJSON* slots, std::string& err) {
-    const char* title = Str(slots, "title");
-    if (!title || !title[0]) {
-        err = "preset 'confirm' needs slots.title (a short heading)";
-        return nullptr;
-    }
-    cJSON* root = MkNode("column");
-    cJSON_AddNumberToObject(root, "gap", 16);
-    cJSON* children = AddChildren(root);
-    cJSON_AddItemToArray(children, MkHeader("CONFIRM", slots, title));
-    const char* body = Str(slots, "body");
-    if (body && body[0]) cJSON_AddItemToArray(children, MkLabel("label", body));
-
-    cJSON* row = MkNode("row");
-    cJSON_AddNumberToObject(row, "gap", 12);
-    cJSON* rc = AddChildren(row);
-
-    cJSON* cancel = slots ? cJSON_GetObjectItem(slots, "cancel") : nullptr;
-    cJSON* cancel_btn = MkNode("button");
-    cJSON_AddStringToObject(cancel_btn, "variant", "ghost");
-    cJSON_AddStringToObject(cancel_btn, "text", Str(cancel, "text", "取消"));
-    cJSON* cancel_click = cJSON_AddArrayToObject(cancel_btn, "on_click");
-    cJSON* cancel_close = cJSON_CreateObject();
-    cJSON_AddStringToObject(cancel_close, "do", "close");
-    cJSON_AddItemToArray(cancel_click, cancel_close);
-    cJSON_AddItemToArray(rc, cancel_btn);
-
-    cJSON* confirm = slots ? cJSON_GetObjectItem(slots, "confirm") : nullptr;
-    cJSON* confirm_btn = MkNode("button");
-    cJSON_AddStringToObject(confirm_btn, "variant", "primary");
-    cJSON_AddStringToObject(confirm_btn, "text", Str(confirm, "text", "确认"));
-    cJSON* confirm_click = cJSON_AddArrayToObject(confirm_btn, "on_click");
-    cJSON* action = cJSON_CreateObject();
-    const cJSON* reportj = confirm ? cJSON_GetObjectItem(confirm, "report") : nullptr;
-    const cJSON* setj = confirm ? cJSON_GetObjectItem(confirm, "set") : nullptr;
-    if (cJSON_IsString(reportj)) {
-        cJSON_AddStringToObject(action, "do", "report");
-        cJSON_AddStringToObject(action, "text", reportj->valuestring);
-    } else if (cJSON_IsObject(setj)) {
-        cJSON_AddStringToObject(action, "do", "set");
-        cJSON_AddStringToObject(action, "path", Str(setj, "path", ""));
-        const cJSON* valj = cJSON_GetObjectItem(setj, "value");
-        if (cJSON_IsNumber(valj)) cJSON_AddNumberToObject(action, "value", valj->valuedouble);
-    } else {
-        cJSON_AddStringToObject(action, "do", "report");
-        cJSON_AddStringToObject(action, "text", title);
-    }
-    cJSON_AddItemToArray(confirm_click, action);
-    cJSON* close2 = cJSON_CreateObject();
-    cJSON_AddStringToObject(close2, "do", "close");
-    cJSON_AddItemToArray(confirm_click, close2);
-    cJSON_AddItemToArray(rc, confirm_btn);
-
-    cJSON_AddItemToArray(children, row);
-    return root;
-}
-
-cJSON* BuildForm(const cJSON* slots, std::string& err) {
-    const char* title = Str(slots, "title");
-    const cJSON* fields = slots ? cJSON_GetObjectItem(slots, "fields") : nullptr;
-    if (!title || !title[0] || !cJSON_IsArray(fields) || cJSON_GetArraySize(fields) == 0) {
-        err = "preset 'form' needs a non-empty slots.fields array; each field needs "
-              "type(slider|switch|choice), id, label";
-        return nullptr;
-    }
-    const cJSON* f = nullptr;
-    cJSON_ArrayForEach(f, fields) {
-        const char* ftype = Str(f, "type");
-        const char* fid = Str(f, "id");
-        const char* flabel = Str(f, "label");
-        if (!ftype || !fid || !flabel ||
-            (std::strcmp(ftype, "slider") && std::strcmp(ftype, "switch") && std::strcmp(ftype, "choice"))) {
-            err = "preset 'form' needs a non-empty slots.fields array; each field needs "
-                  "type(slider|switch|choice), id, label";
-            return nullptr;
-        }
-    }
-    cJSON* root = MkNode("column");
-    cJSON_AddNumberToObject(root, "gap", 12);
-    cJSON* children = AddChildren(root);
-    cJSON_AddItemToArray(children, MkHeader("FORM", slots, title));
-
-    cJSON_ArrayForEach(f, fields) {
-        const char* ftype = Str(f, "type");
-        const char* fid = Str(f, "id");
-        const char* flabel = Str(f, "label");
-        cJSON* row = MkNode("row");
-        cJSON* rc = AddChildren(row);
-        cJSON* lbl = MkLabel("label", flabel);
-        cJSON_AddNumberToObject(lbl, "grow", 1);
-        cJSON_AddItemToArray(rc, lbl);
-        cJSON* ctrl = MkNode(ftype);
-        cJSON_AddStringToObject(ctrl, "id", fid);
-        if (!std::strcmp(ftype, "slider")) {
-            const cJSON* mn = cJSON_GetObjectItem(f, "min");
-            const cJSON* mx = cJSON_GetObjectItem(f, "max");
-            const cJSON* val = cJSON_GetObjectItem(f, "value");
-            cJSON_AddNumberToObject(ctrl, "min", cJSON_IsNumber(mn) ? mn->valuedouble : 0);
-            cJSON_AddNumberToObject(ctrl, "max", cJSON_IsNumber(mx) ? mx->valuedouble : 100);
-            if (cJSON_IsNumber(val)) cJSON_AddNumberToObject(ctrl, "value", val->valuedouble);
-            cJSON_AddNumberToObject(ctrl, "grow", 2);
-        } else if (!std::strcmp(ftype, "switch")) {
-            const cJSON* chk = cJSON_GetObjectItem(f, "checked");
-            cJSON_AddBoolToObject(ctrl, "checked", cJSON_IsBool(chk) && cJSON_IsTrue(chk));
-        } else {  // choice
-            const cJSON* opts = cJSON_GetObjectItem(f, "options");
-            cJSON_AddItemToObject(ctrl, "options", cJSON_IsArray(opts) ? cJSON_Duplicate(opts, 1)
-                                                                       : cJSON_CreateArray());
-            const cJSON* val = cJSON_GetObjectItem(f, "value");
-            if (cJSON_IsNumber(val)) cJSON_AddNumberToObject(ctrl, "value", val->valuedouble);
-        }
-        cJSON_AddItemToArray(rc, ctrl);
-        cJSON_AddItemToArray(children, row);
-    }
-
-    const cJSON* submit = slots ? cJSON_GetObjectItem(slots, "submit") : nullptr;
-    cJSON* btn = MkNode("button");
-    cJSON_AddStringToObject(btn, "variant", "primary");
-    cJSON_AddStringToObject(btn, "text", Str(submit, "text", "提交"));
-    cJSON* click = cJSON_AddArrayToObject(btn, "on_click");
-    cJSON* rep = cJSON_CreateObject();
-    cJSON_AddStringToObject(rep, "do", "report");
-    cJSON_AddStringToObject(rep, "text", Str(submit, "report", "已提交"));
-    cJSON_AddItemToArray(click, rep);
-    cJSON_AddItemToArray(children, btn);
-    return root;
-}
-
-cJSON* BuildDashboard(const cJSON* slots, std::string& err) {
-    const char* title = Str(slots, "title");
-    const cJSON* metrics = slots ? cJSON_GetObjectItem(slots, "metrics") : nullptr;
-    if (!title || !title[0] || !cJSON_IsArray(metrics) || cJSON_GetArraySize(metrics) == 0) {
-        err = "preset 'dashboard' needs slots.metrics:[{label,bind,...}]";
-        return nullptr;
-    }
-    cJSON* root = MkNode("column");
-    cJSON_AddNumberToObject(root, "gap", 16);
-    cJSON* children = AddChildren(root);
-    cJSON_AddItemToArray(children, MkHeader("STATUS", slots, title));
-
-    const cJSON* m = nullptr;
-    cJSON_ArrayForEach(m, metrics) {
-        const char* label = Str(m, "label", "");
-        const char* bind = Str(m, "bind");
-        const char* kind = Str(m, "kind", "value");
-        const char* fmt = Str(m, "fmt", "%d");
-        const char* icon = Str(m, "icon");
-        if (!bind) continue;  // 合法性交给既有 Validate（下游会报 unknown bind path）
-        cJSON* row = MkNode("row");
-        cJSON* rc = AddChildren(row);
-        if (icon) {
-            cJSON* ic = MkNode("icon");
-            cJSON_AddStringToObject(ic, "icon", icon);
-            cJSON_AddItemToArray(rc, ic);
-        }
-        if (!std::strcmp(kind, "bar")) {
-            cJSON* lbl = MkLabel("label", label);
-            cJSON_AddNumberToObject(lbl, "grow", 1);
-            cJSON_AddItemToArray(rc, lbl);
-            cJSON* bar = MkNode("bar");
-            cJSON_AddStringToObject(bar, "bind", bind);
-            cJSON_AddNumberToObject(bar, "grow", 2);
-            cJSON_AddItemToArray(rc, bar);
-            cJSON_AddItemToArray(rc, MkBindValueLabel(bind, fmt));
-        } else {
-            cJSON_AddItemToArray(rc, MkLabel("label", label));
-            cJSON_AddItemToArray(rc, MkNode("spacer"));
-            cJSON_AddItemToArray(rc, MkBindValueLabel(bind, fmt));
-        }
-        cJSON_AddItemToArray(children, row);
-    }
-    return root;
-}
-
-cJSON* BuildMenu(const cJSON* slots, std::string& err) {
-    const char* title = Str(slots, "title");
-    const cJSON* items = slots ? cJSON_GetObjectItem(slots, "items") : nullptr;
-    if (!title || !title[0] || !cJSON_IsArray(items) || cJSON_GetArraySize(items) == 0) {
-        err = "preset 'menu' needs slots.items:[{text,...}]";
-        return nullptr;
-    }
-    const char* style = Str(slots, "style", "buttons");
-    cJSON* root = MkNode("column");
-    cJSON_AddNumberToObject(root, "gap", 10);
-    cJSON* children = AddChildren(root);
-    cJSON_AddItemToArray(children, MkLabel("eyebrow", Str(slots, "eyebrow", "MENU")));
-    cJSON_AddItemToArray(children, MkLabel("title", title));
-
-    if (!std::strcmp(style, "choice")) {
-        cJSON* choice = MkNode("choice");
-        cJSON_AddStringToObject(choice, "id", "menu");
-        cJSON* opts = cJSON_AddArrayToObject(choice, "options");
-        const cJSON* it = nullptr;
-        cJSON_ArrayForEach(it, items) cJSON_AddItemToArray(opts, cJSON_CreateString(Str(it, "text", "")));
-        cJSON_AddItemToArray(children, choice);
-        cJSON* btn = MkNode("button");
-        cJSON_AddStringToObject(btn, "variant", "primary");
-        cJSON_AddStringToObject(btn, "text", "确认");
-        cJSON* click = cJSON_AddArrayToObject(btn, "on_click");
-        cJSON* rep = cJSON_CreateObject();
-        cJSON_AddStringToObject(rep, "do", "report");
-        cJSON_AddStringToObject(rep, "text", "确认");
-        cJSON_AddItemToArray(click, rep);
-        cJSON* close = cJSON_CreateObject();
-        cJSON_AddStringToObject(close, "do", "close");
-        cJSON_AddItemToArray(click, close);
-        cJSON_AddItemToArray(children, btn);
-    } else {
-        cJSON* sp = MkNode("spacer");
-        cJSON_AddNumberToObject(sp, "h", 4);
-        cJSON_AddItemToArray(children, sp);
-        const cJSON* it = nullptr;
-        cJSON_ArrayForEach(it, items) {
-            const char* text = Str(it, "text", "");
-            cJSON* btn = MkNode("button");
-            cJSON_AddStringToObject(btn, "text", text);
-            cJSON* click = cJSON_AddArrayToObject(btn, "on_click");
-            cJSON* rep = cJSON_CreateObject();
-            cJSON_AddStringToObject(rep, "do", "report");
-            cJSON_AddStringToObject(rep, "text", Str(it, "report", text));
-            cJSON_AddItemToArray(click, rep);
-            cJSON* close = cJSON_CreateObject();
-            cJSON_AddStringToObject(close, "do", "close");
-            cJSON_AddItemToArray(click, close);
-            cJSON_AddItemToArray(children, btn);
-        }
-    }
-    return root;
-}
-
-}  // namespace
-
-cJSON* ExpandPreset(const char* preset, const cJSON* slots, std::string& err) {
-    if (!preset) {
-        err = "preset name missing";
-        return nullptr;
-    }
-    if (!std::strcmp(preset, "confirm")) return BuildConfirm(slots, err);
-    if (!std::strcmp(preset, "form")) return BuildForm(slots, err);
-    if (!std::strcmp(preset, "dashboard")) return BuildDashboard(slots, err);
-    if (!std::strcmp(preset, "menu")) return BuildMenu(slots, err);
-    err = std::string("unknown preset: ") + preset + " (use confirm|form|dashboard|menu)";
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
 
 extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     Init();  // 幂等，保证校验器可查 DataHub 路径
@@ -1244,25 +862,21 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         *is_error = true;
         return Dup(e);
     };
-    cJSON* built_root = nullptr;  // preset 展开产物（owned），用完即删——root 走 Validate/序列化拷贝
-    const cJSON* root = nullptr;
-    if (const cJSON* pj = cJSON_GetObjectItem(args, "preset"); cJSON_IsString(pj)) {
-        std::string perr;
-        built_root = ExpandPreset(pj->valuestring, cJSON_GetObjectItem(args, "slots"), perr);
-        if (!built_root) {
-            return reject("preset", perr);
-        }
-        root = built_root;
-    } else {
-        root = cJSON_GetObjectItem(args, "root");
-        if (!cJSON_IsObject(root)) {
-            return reject("no-root", "spec missing 'root' object (or use preset+slots)");
-        }
+    // v2：Repair() 就地修复 args 里的 "root"（单 grid 对象包数组/剥旧属性/旧 list→bind_rows
+    // 等语法糖，见 docs/CARD_V2.md §6.2），修复不了的（如顶层 preset/slots 残留——preset/slots
+    // 已整删，§3 决策 A）当场拒绝、不再往下跑 Validate。args 是本次调用独占的解析树，就地
+    // 改写安全。
+    std::string rerr;
+    if (!Repair(const_cast<cJSON*>(args), rerr, nullptr)) {
+        return reject("repair", rerr);
+    }
+    const cJSON* root = cJSON_GetObjectItem(args, "root");
+    if (!root || !(cJSON_IsObject(root) || cJSON_IsArray(root))) {
+        return reject("no-root", "spec missing 'root' array of grid blocks");
     }
     const cJSON* data = cJSON_GetObjectItem(args, "data");  // object|null，卡级 data 模型
     std::string err;
     if (!Validate(root, data, err)) {
-        cJSON_Delete(built_root);
         return reject("validate", err);
     }
     const cJSON* disp = cJSON_GetObjectItem(args, "display");
@@ -1284,7 +898,6 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     char* data_json = cJSON_IsObject(data) ? cJSON_PrintUnformatted(data) : nullptr;  // 可为 NULL
     if (!root_json) {
         free(data_json);
-        cJSON_Delete(built_root);
         return reject("oom", "out of memory");
     }
     // standby 封套尺寸的权威判定：必须在这里（入队之前）挡住，不能留到 drain 侧（LVGL 线程）
@@ -1296,13 +909,11 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         if (!PinEnvelopeFits(envelope)) {
             free(root_json);
             free(data_json);
-            cJSON_Delete(built_root);
             return reject("pin-size", "home widget too large to pin (~3KB); simplify the card");
         }
     }
     // data 走 s3（Enqueue 早已支持）；OnRenderEvent(spec,card_id,display,ttl,data_json) 消费。
     if (!Enqueue(UI_CARD_RENDER, root_json, Dup(id), data_json, mode, ttl_ms)) {
-        cJSON_Delete(built_root);
         return reject("queue-full", "UI busy (event queue full), retry shortly");
     }
     // state 在入队之后才读：让快照尽量贴近真正建控件的时刻。
@@ -1319,7 +930,6 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         cJSON_Delete(arr);
     }
     std::string ret = std::string("{\"card\":\"") + id + "\"" + BindStateJson(root) + hints_json + "}";
-    cJSON_Delete(built_root);
     ESP_LOGI(TAG, "ui_render OK: card=%s display=%d%s", id.c_str(), mode,
              hints.empty() ? "" : " (+lint hints)");
     return Dup(ret);
@@ -1459,24 +1069,40 @@ extern "C" const char* pi_card_system_prompt(void) {
         "You are pi, the on-device assistant in a palm-size 720×720 touch screen; the user also "
         "talks by voice. Reply short, warm, in the user's language (usually Chinese). Text is read "
         "aloud by TTS -- avoid markdown symbols, links, long bullet lists.\n\n"
-        "You have a SCREEN: besides talking, draw a real interactive UI card with ui_render (+ "
-        "ui_update/ui_close) to SHOW controls, status, choices, forms, lists, dashboards instead of "
-        "describing them. There is NO read tool -- rendering a card that binds a device path IS how "
-        "you read the device; ui_render's return value gives live values (state).\n\n"
-        "WHEN A CARD, NOT CHAT: SET something (brightness/volume/theme) -> control card, "
-        "writes hardware directly. STATUS -> small dashboard binding the paths. CHOICE/CONFIRM/FORM/"
-        "LIST -> render it, tap rides back on report. Plain chit-chat -> just text. Prefer 'chat' "
-        "(inline); 'overlay' only for a modal moment -- auto-closes, capped.\n\n"
-        "DESIGN -- lean on pi's look, don't hand-style: header=eyebrow+title, group related rows. "
-        "Exactly ONE primary (amber) button -- theme already paints fill/on-switch/selected-choice "
-        "amber, don't also color text amber. Use tone/fill tokens, not raw hex. One focus/card: key "
-        "value as role:title on top, rest smaller below. Columns side by side default content-width; "
-        "grow:1 each splits evenly (simple pair: leaf+spacer). Encode state: tone ok/err/accent + "
-        "icon, not bare words. Button text = the result (清空/重试), not 确定. >3 facts -> grid; big "
-        "number uses role:value (mono).\n\n"
-        "COMPACT -- small window, dense beats tall. Lay data in a grid (see grid{}): 2-4 "
-        "cols, role:section headers, full-width rule = divider span=<#cols>. Never one fact/line, "
-        "never dump prose -- labels 1-3 words, clamp lists with max.\n\n"
+        // v2（CARD_V2.md §10）：v1 的 DESIGN/COMPACT/LAYOUT 三段布局教学（row/grow/justify）已
+        // 随 grid-only 重构整段替换——布局改由固件的 solver 纯函数决定，模型只声明"有哪些控件、
+        // 语义是什么"。CHOOSE 段替代了 v1"WHEN A CARD, NOT CHAT"里提到的 LIST（v1 类型，已删，
+        // 换成 bind_rows）。原独立的"You have a SCREEN"引子段与 CARDS 段开头语义重复（都在讲
+        // "画UI而非描述"），合并成一段省字节（4KB 预算，见步骤5验收）。
+        "CARDS -- draw real interactive UI with ui_render (+ ui_update/ui_close) instead of "
+        "describing controls/status/choices. There is NO read tool -- rendering a card that binds a "
+        "device path IS how you read the device (return value gives live values as state). A card = "
+        "\"root\": an ARRAY of grid blocks stacked top-to-bottom. Only ONE container: grid, no "
+        "nesting; depth is fixed card -> grid -> leaf. You never write x/y, width, gaps, columns, "
+        "grow, justify or align -- the device lays it out from your intent. Just say WHAT controls "
+        "exist.\n\n"
+        "GRID: three forms, exactly one key each:\n"
+        "- \"cells\":[leaf,...] -- a flow wrapped by size. Use for headers/control rows (icon+slider+"
+        "value)/button groups; full-width leaves (divider/chart/choice/qrcode) get their own line.\n"
+        "- \"rows\":[[leaf,...],...], cols?:[{title,num}] -- an aligned TABLE sharing columns; "
+        "num:true right-aligns+mono that column; one cell/row = a vertical menu. Use for status/"
+        "forms/dashboards.\n"
+        "- \"item\":[leaf,...],\"bind_rows\":\"key\",max?,empty? -- repeat item once per data[\"key\"] "
+        "element; strings use {i}/{n}/{item.FIELD}. Row taps: report/set/close only.\n\n"
+        "LEAVES: label{text,role,bind,fmt,mono,tone} - button{text,icon,variant,on_click} - slider/"
+        "arc/bar/switch/choice{bind/value/options,on_change} - icon - divider - qrcode{text} - "
+        "chart{bind_history} - stock_chart{symbol}. role ramp: eyebrow|kicker|section|title|heading|"
+        "label|value|caption. Header = eyebrow+title in one cells grid. Big number = role:value "
+        "(mono, right-aligned in tables). Controls carry their own state -- don't restate it in "
+        "words.\n\n"
+        "STYLE: lean on pi's look. tone/fill = semantic tokens (accent/ok/err/tx/dim/faint/card2/"
+        "line...), never hex. ONE primary(amber) button/card, rest ghost/plain/default. "
+        "\"side\":\"end\" pushes a cell to the row's right edge. Grid \"fill\":\"card2\" gives a "
+        "background box. Labels 1-3 words; num columns don't truncate, text columns do.\n\n"
+        "CHOOSE: SET something -> a control grid that binds the path (writes hardware directly). "
+        "STATUS -> a rows table binding the paths. CHOICE/CONFIRM/FORM/MENU -> render it, the tap "
+        "rides back on report. Chit-chat -> just text. Prefer display:'chat'; \"overlay\" only for a "
+        "modal moment (auto-closes).\n\n"
         "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
         "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
         "generate new content or a NEW decision -- full round-trip, shows as a user message; never "
@@ -1495,14 +1121,11 @@ extern "C" const char* pi_card_system_prompt(void) {
         "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
         BuildCommandsClause(false) +
         ".\n\n"
-        "PRESETS -- for common shapes pass {preset,slots} instead of a hand-built tree; expands to a "
-        "normal card, validates the same:\n"
-        "- confirm {title, body?, confirm:{text?, report? | set?:{path,value?}}, cancel?}\n"
-        "- form {title, fields:[{type:slider|switch|choice, id, label, ...}], submit?}\n"
-        "- dashboard {title, metrics:[{label, bind, kind?:bar|value, fmt?, icon?}]}\n"
-        "- menu {title, items:[{text, report?}], style?}\n\n"
-        "Example (chat): {\"root\":{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":"
-        "\"volume\"},{\"type\":\"slider\",\"bind\":\"audio.volume\"}]}}";
+        "Example (chat, device control card = two cells grids): {\"root\":[{\"cells\":[{\"type\":"
+        "\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio.volume\"},{\"type\":"
+        "\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},{\"cells\":[{"
+        "\"type\":\"icon\",\"icon\":\"wifi\"},{\"type\":\"label\",\"text\":\"网络\"},{\"type\":"
+        "\"switch\",\"checked\":true,\"side\":\"end\"}]}]}";
     return s.c_str();
 }
 

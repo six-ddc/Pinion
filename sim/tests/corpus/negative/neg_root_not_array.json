@@ -1,0 +1,7 @@
+{
+  "display": "overlay",
+  "root": {
+    "cells": [ { "type": "label", "text": "x" } ],
+    "children": [ { "type": "label", "text": "y" } ]
+  }
+}

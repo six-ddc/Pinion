@@ -27,7 +27,18 @@ namespace pi_card {
 
 // 干跑校验整棵树（含 bind 路径存在性、action 合法性、节点/深度限额）。data：卡级 data
 // 模型（object|nullptr），list 节点的 bind_data 用它算实际长度、预留节点数。
+// v2：root_node 必须是 grid 块数组（见 docs/CARD_V2.md §6.1）；建议先调 Repair() 静默自愈
+// 掉常见语法糖错误，再调本函数——Repair 修不了的错误由本函数给出可读 err。
 bool Validate(const cJSON* root_node, const cJSON* data, std::string& err);
+
+// v2 自动修复（docs/CARD_V2.md §6.2）：就地修改 envelope（顶层信封对象，含 "root" 键，
+// 可能含 "data"），把模型常见的语法糖错误静默修掉（剥除已删属性/root 单对象包数组/cols 长度
+// 纠偏/旧 list→bind_rows/旧 spacer→side:end）。notes（可为 nullptr）追加人类可读的修复摘要，
+// 一条一行，供日志观察做了哪些静默修复。返回 false 时是「repair 表也判定必须拒绝重试」的
+// 情形（如顶层 preset/slots 键），err 写清楚原因——调用方应把它当 Validate 失败处理，不必
+// 再跑 Validate；返回 true 时调用方应接着跑 Validate（envelope 里的 "root" 可能已被替换成
+// 新分配的 cJSON，调用方须重新 cJSON_GetObjectItem(envelope, "root") 取最新指针）。
+bool Repair(cJSON* envelope, std::string& err, std::vector<std::string>* notes);
 
 // 非阻断设计建议（worker 线程、纯 cJSON、不碰 LVGL）：primary 按钮超一个、无文本 label、
 // on_change 挂 report、死控件、choice 无回流出口、节点/深度逼近上限等。Validate 通过后跑，
@@ -58,6 +69,17 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
 // update：把 props（cJSON 对象）套到已有控件上。未知字段忽略。
 bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err);
 
+// bind_rows 数据变化后的整 grid 重渲（F1 修复：UiCard::DataConsumer::List 消费者的落地
+// 函数，见 pi_card_host.cc RefreshDataConsumers）。old_gobj 是首次渲染或上一轮重渲建出的
+// grid 容器——本函数整体删除它、用当前 card->data 重新走一遍 solver::Solve + 建控件，
+// 在原来的兄弟节点位置插回一个新对象并返回；调用方必须用返回值刷新自己持有的指针（旧的
+// old_gobj 已失效，即使返回 nullptr 也一样——失败时该 grid 从此空着，不做整卡回滚，同
+// v1 rollback 代价过高的判断）。grid_spec 是 card->json_pool 里持久化的完整 grid 块 JSON
+// （cells/rows/bind_rows 三形态皆可，实际只会传 bind_rows）；viewport_w/gap 是首次渲染定下
+// 的几何（同一张卡运行期不会变宽，不必每次重算）。
+lv_obj_t* RebuildBindRowsGrid(lv_obj_t* old_gobj, const cJSON* grid_spec, UiCard* card,
+                              int viewport_w, int gap, const RenderLimits& limits, std::string& err);
+
 // 卡片入场动效：opa 0→255（220ms ease_out）+（非 adopted 时）translate_y 12→0（同 220ms，
 // LV_STYLE_TRANSLATE_Y 风格属性，不直接改 y——卡片在 flex 布局里，直改 y 会被布局吃掉）。调用
 // 方须在卡片最终布局定型之后调用（chat: s_feed.end_row() 之后；overlay: ReflowOverlay +
@@ -69,71 +91,42 @@ bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err);
 void PlayCardEntrance(lv_obj_t* tree, bool adopted);
 
 // ---------------------------------------------------------------------------
-// 流式生长卡片（改造1）专用的"预览渲染"——只画外观，零 bind/零事件/零 id 注册进
-// card->nodes/零 DataConsumer 登记，因为流式阶段既没有 UiCard 也没有校验过的合法 bind 路径。
-// 与 RenderNode 共用同一套 type 分派/样式助手，但 list/chart/stock_chart 三种数据驱动或自管
-// 生命周期的类型直接跳过不建。限额沿用 64 节点/8 层，用独立计数（不占用正式渲染的
-// RenderLimits/node_count），超限只是静默停止生长，不报错——预览允许"半棵树"。
+// 流式生长卡片 v2（docs/CARD_V2.md §4，改造4）专用的"预览渲染"——只画外观，零 bind/零事件/
+// 零 id 注册进 card->nodes/零 DataConsumer 登记，因为流式阶段既没有 UiCard 也没有校验过的
+// 合法 bind 路径。v1 的"生长边状态机"（RenderPreviewNode/SyncPreviewNode/
+// PreviewSyncContainer/USER_2 标记/s_leaf_sig/RefreshPreviewDataLabels，靠叶子级/容器级增量
+// 对齐维持前缀不变量）已整体删除：v2 树深恒为 2（card→grid→leaf），grid 是原子渲染单位，
+// 每帧靠 pi_card_preview_sig::GridSignature 判定"这个 grid 变没变"，变了就整块删旧重建、
+// 没变就原样不动（见 pi_card_preview.cc 的 s_grid_sig[]）——不再需要按位置对齐的增量同步。
 
-// 一次性整棵渲染 node（及其全部子树，若是 column/row/grid）：用于 (a) 流式会话第一次出现可
-// 渲染内容时的初始建树，(b) 位置游标推进时把"已确定不再变"的兄弟节点渲染成最终形。会给自己
-// 建出的每个 column/row 打 LV_OBJ_FLAG_USER_2（内部惯用记号，标记"这是一个预览容器，可以被
-// PreviewSyncContainer 继续增量同步"）+ user_data 记一个 committed 游标（= 已建子节点数-1，
-// 即认定最后一个子节点仍是"生长边"，留给下一次调用去继续对齐）。grid 不打 USER_2：它整块
-// 渲染、整块重建（见 SyncPreviewNode），cols 还没吐出第一列前占位等待。
-// parent_flow：父容器主轴（0=column 含 root、1=row、2=grid，与 render.cc 内部 FLOW_* 枚举
-// 一致），决定子控件的自适应尺寸默认（column 里 label/growable 铺满全宽、row 里保持自然宽/
-// 按比例分配、grid 里交给 set_grid_cell）。曾经预览统一按 column 近似，row 里的 icon+标题
-// 被铺满宽的 label 挤成两行、adopt 后又并回一行——真机抓到的跳变，故改为全程如实传递。
-// row_all_growable：仅在 parent_flow==FLOW_ROW 时有意义，口径同 RenderNode（见上）——本节点
-// 所在这一行的 JSON children 是否清一色都是 IsGrowable 类型，决定 button/choice 均分整行还是
-// 内容自适应宽。默认 true（不关心时/容器自身场景）。
-lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
-                            int parent_flow = 0, bool row_all_growable = true);
+// 预览卡片外观容器：镜像 RenderNode 顶层 card_root 的建法（圆角/边框/pad/竖排间距，见
+// pi_card_render.cc 的 RenderNode），供 preview.cc 首次建会话时调用一次；此后各 grid 块作为
+// 它的子节点整块进/整块出。
+lv_obj_t* MakePreviewCardRoot(lv_obj_t* parent, int viewport_w);
 
-// 位置游标增量对齐：lv_container 是先前调用建出的、打了 USER_2 标记的容器；json_container 是
-// 它这次收到的最新 partial 节点（读它的 "children" 数组，N 个孩子）。[0, N-2]（如果还没被上
-// 一轮标成 committed）逐个渲成最终形；第 N-1 个（生长边）走 SyncPreviewNode 原地更新/递归/
-// 删旧重建。已定稿区间的 lv_obj 指针跨调用不变——只有生长边那一个位置会被反复替换或原地更新。
-void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
-                          int& node_count, int parent_flow = 0);
+// v2 预览：单个 grid 块整块渲染——复用正式 RenderNode 路径同一套"solver::Solve + 按 layout
+// 落位"哑翻译逻辑（RenderGridBlock 的表头/divider 合成行、bind_rows 展开与本函数共享，见
+// pi_card_render.cc 的 RenderColsHeaderRow/RenderColsDividerRow/BuildBindRowsForRender），
+// 但叶子零 bind/零事件/零 DataConsumer——数值控件/label 的当前值用 DataHub 快照直读
+// （PreviewPeekInt/PreviewSeedBindLabel），不订阅、不随后续更新联动，安全路径流式期即显真实
+// 值，读不到的维持 "--"/JSON 静态值/控件默认。chart/stock_chart（数据驱动或有网络副作用）
+// 预览期跳过不建，只占位不占用真实资源。返回新建的 grid 容器（挂在 card_root 下）；调用方
+// （preview.cc 的 s_grid_sig[]）负责在签名变化时先 lv_obj_delete 旧容器再调用本函数重建。
+lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, const cJSON* data,
+                                 int viewport_w, int gap);
 
-// 单个位置的"生长边"同步：existing 是当前挂在这个位置的 lv 对象（可为 nullptr，表示这个位置
-// 之前还没能渲出东西）；node_spec 是这个位置最新的 partial 节点。返回这个位置最终对应的 lv
-// 对象（可能与 existing 相同——原地更新；也可能是新建的——删旧重建）。column/row 类型且
-// existing 已带 USER_2 标记时递归调 PreviewSyncContainer 继续往深处生长（保住已定稿的孙子）；
-// 类型不符/首次出现则整棵重建。grid 类型不做逐子生长：整节点签名（含 cols/children），变了
-// 删旧整块重建（行主序落位使任何变化都可能整体重排，逐位对齐得不偿失）。label 类型原地
-// lv_label_set_text（不重建，长文本不闪烁）；其它叶子类型无状态可原地更新，签名（含 text——
-// 它们没有原地文本通道）变了删旧重渲（成本低，也是团队定稿点名的做法）。这是
-// PreviewSyncContainer 的生长边分支与流式会话顶层 tree 同步共用的唯一入口。
-// row_all_growable：仅在 parent_flow==FLOW_ROW 时有意义（口径同 RenderNode），本节点若在删旧
-// 重建时落到 RenderPreviewNode，原样转发给它；existing 原地复用（same_sig/文本更新）分支不需要
-// 它——row 组成不变时（同一位置一直是"生长边"）旧对象的 grow 状态本就是最后一次用正确的
-// row_all_growable 算出来的，不必重算。
-lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count, int parent_flow = 0, bool row_all_growable = true);
-
-// 预算重算：删除节点时不精确回补 node_count（子树带走几个节点不值得追踪），调用方
-// （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后用这个函数按**当前快照的 JSON 树**重新
-// 计数，作为下一帧的准确起点。口径必须是 JSON 节点（与 RenderPreviewNode 每个 JSON 节点
-// ++node_count 一致、也与正式渲染的 64 上限同源）——曾按 lv 对象树计数，button 内嵌
-// label/icon、choice 的分段按钮等复合控件的内部对象全被算进预算，58 个 JSON 节点的大卡
-// 在 lv 树里是 70+ 对象，流到后段假性爆预算：该位置若已进定稿区就永远不会重试，正式渲染
-// 正常而预览永久缺一块（控制中心卡的媒体按钮行，真实复现）。
+// 预算重算：调用方（PreviewOnArgs）按**当前快照的 JSON 树**统计节点数，用于夹住预览的
+// grid/节点上限（§6.1 的 kMaxGrids/64 节点，预览期超限静默不再新建，不报错——预览允许
+// "半棵树"）。口径必须是 JSON 节点，不能数 lv 对象——复合控件（choice 的分段按钮等）内部
+// 对象会把预算数爆。
 int CountSpecNodes(const cJSON* node);
 
-// 流式预览的 partial data 上下文：PreviewOnArgs 每帧在 SyncPreviewNode 前把快照顶层的
-// "data" 对象借给渲染器（非 object/缺失传 nullptr 等效清空），bind_data 标签据此直显模板
-// 替换值；帧处理完必须再调一次传 nullptr 清空——指针指向即将被 cJSON_Delete 的快照树，
-// 绝不允许跨帧存活。
+// 流式预览的 partial data 上下文：PreviewOnArgs 每帧把快照顶层的 "data" 对象借给
+// RenderGridBlockPreview（非 object/缺失传 nullptr 等效清空）；GridSignature 已经把 data 折进
+// 每个 grid 的签名，data 迟到/变化会让相关 grid 的签名变化、整块重渲，不再需要额外的全树回刷
+// 通道。帧处理完必须再调一次传 nullptr 清空——指针指向即将被 cJSON_Delete 的快照树，绝不允许
+// 跨帧存活。
 void PreviewSetData(const cJSON* data);
-
-// bind_data 数据标签全树回刷：data 在顶层 schema 里排在 root 之后，root 流完时数据标签
-// 已定稿渲成 "--"，data 到达后靠这趟回刷补真值（USER_4 标记 + user_data ctx 定位，文本
-// 没变的跳过 set_text）。PreviewOnArgs 每帧在 SyncPreviewNode 之后、PreviewSetData(nullptr)
-// 之前调用。
-void RefreshPreviewDataLabels(lv_obj_t* tree);
 
 // ---- data 值格式化 / list 行模板替换（RenderNode 的 list/data-label 分支与
 // pi_card_host.cc 的 RefreshDataConsumers 共用，故跨 TU 可见而非 render.cc 内部静态）----

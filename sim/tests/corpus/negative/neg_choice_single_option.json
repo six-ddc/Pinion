@@ -1,0 +1,6 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "choice", "options": [ "仅一项" ] } ] }
+  ]
+}

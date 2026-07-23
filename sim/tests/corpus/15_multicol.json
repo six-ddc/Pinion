@@ -1,0 +1,14 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "多列对齐" } ] },
+    {
+      "cols": [ { "title": "城市" }, { "title": "温度", "num": true }, { "title": "天气" } ],
+      "rows": [
+        [ { "type": "label", "text": "北京" }, { "type": "label", "text": "32C" }, { "type": "label", "text": "晴" } ],
+        [ { "type": "label", "text": "乌鲁木齐" }, { "type": "label", "text": "28C" }, { "type": "label", "text": "多云" } ],
+        [ { "type": "label", "text": "上海" }, { "type": "label", "mono": true, "text": "30C" }, { "type": "label", "tone": "ok", "text": "小雨" } ]
+      ]
+    }
+  ]
+}

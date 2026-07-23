@@ -1,0 +1,12 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "音量旋钮" } ] },
+    {
+      "cells": [
+        { "type": "arc", "bind": "audio.volume" },
+        { "type": "label", "role": "value", "bind": "audio.volume", "fmt": "%d%%" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "display": "overlay",
+  "data": { "tracks": [ { "title": "曲目 1" }, { "title": "曲目 2" }, { "title": "曲目 3" } ] },
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "MEDIA" },
+        { "type": "label", "role": "title", "bind": "media.title" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "caption", "bind": "media.state" },
+        { "type": "label", "role": "caption", "bind": "media.position_s", "fmt": "%ds", "mono": true, "side": "end" }
+      ]
+    },
+    { "cells": [ { "type": "bar", "min": 0, "max": 100, "bind": "media.progress_pct" } ] },
+    {
+      "cells": [
+        { "type": "button", "text": "上一", "on_click": [ { "do": "invoke", "cmd": "media.prev" } ] },
+        { "type": "button", "variant": "primary", "text": "播放/暂停", "on_click": [ { "do": "invoke", "cmd": "media.toggle" } ] },
+        { "type": "button", "text": "下一", "on_click": [ { "do": "invoke", "cmd": "media.next" } ] }
+      ]
+    },
+    {
+      "item": [
+        { "type": "button", "text": "{item.title}", "on_click": [ { "do": "set", "path": "media.play_index", "value": "{i}" } ] }
+      ],
+      "bind_rows": "tracks",
+      "max": 8
+    }
+  ]
+}

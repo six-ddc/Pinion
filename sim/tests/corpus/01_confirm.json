@@ -1,0 +1,23 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "CONFIRM" },
+        { "type": "label", "role": "title", "text": "切换到 4G?" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "label", "text": "当前使用 WiFi。切换到蜂窝网络会断开连接并重启设备,大约需要 30 秒,期间无法使用。确定继续吗?" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "button", "variant": "ghost", "text": "取消", "on_click": [ { "do": "close" } ] },
+        { "type": "button", "variant": "primary", "text": "切换并重启",
+          "on_click": [ { "do": "report", "text": "切换到4G" }, { "do": "close" } ] }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "难度" } ] },
+    { "cells": [ { "type": "choice", "id": "level", "options": [ "低", "中", "高" ], "value": 1 } ] },
+    {
+      "cells": [
+        { "type": "button", "variant": "primary", "text": "确认",
+          "on_click": [ { "do": "report", "text": "确认 {v} 档" }, { "do": "close" } ] }
+      ]
+    }
+  ]
+}

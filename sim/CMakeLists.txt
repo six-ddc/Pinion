@@ -76,8 +76,10 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_icons.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_actions.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_solver.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview_sig.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_cmd.cc
     # 股票行情（腾讯财经数据层 + stock tool + stock_chart 控件；HTTP 用 libcurl shim）
     ${CLAW_ROOT}/main/stock/stock_api.cc
@@ -206,3 +208,38 @@ target_include_directories(media_stress PRIVATE
 target_compile_options(media_stress PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(media_stress PRIVATE -fsanitize=address,undefined)
 target_link_libraries(media_stress PRIVATE curl "-framework AudioToolbox" "-framework CoreFoundation")
+
+# ---- card_solver_test: CARD V2 布局求解器（纯 C++、无 LVGL 依赖）单测 ----
+# solver = 零 LVGL / 零 ESP 依赖的纯函数，复用 pi-c 里同一份 cJSON 源码，ASan/UBSan 全程开。
+add_executable(card_solver_test
+    tests/card_solver_test.cc
+    tests/card_archetype_test.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_solver.cc
+    ${PI_C_DIR}/third_party/cJSON/cJSON.c
+)
+target_include_directories(card_solver_test PRIVATE
+    tests
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
+    ${PI_C_DIR}/third_party/cJSON
+)
+target_compile_options(card_solver_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+target_link_options(card_solver_test PRIVATE -fsanitize=address,undefined)
+
+# ---- preview_prefix_test: CARD V2 流式预览签名机制(§4)+ 前缀不变量(P1-P3，§7.1) 宿主单测 ----
+# 用 pi-c 真实的 partial JSON 解析器（pi_partial_json_parse_streaming，与 sim 主程序、真机
+# pi_agent_task.c 走同一份实现）对语料逐字节/加步长切分喂流，验证 preview_sig 的签名判定 +
+# solver::Solve 组合起来的"grid 整块重建"管线满足前缀不变量。链 `pi`（已含 cJSON + partial
+# JSON，见 pi-c/CMakeLists.txt 的 add_library(pi ...)），不再单独编译 cJSON.c 以免重复符号。
+add_executable(preview_prefix_test
+    tests/preview_prefix_test.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_solver.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview_sig.cc
+)
+target_include_directories(preview_prefix_test PRIVATE
+    tests
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
+)
+target_compile_options(preview_prefix_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+target_link_options(preview_prefix_test PRIVATE -fsanitize=address,undefined)
+target_link_libraries(preview_prefix_test PRIVATE pi)
+

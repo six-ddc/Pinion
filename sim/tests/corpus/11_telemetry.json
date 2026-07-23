@@ -1,0 +1,29 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "TELEMETRY" },
+        { "type": "label", "role": "title", "text": "系统遥测" }
+      ]
+    },
+    {
+      "cols": [ { "title": "项" }, { "title": "值", "num": true } ],
+      "rows": [
+        [ { "type": "label", "text": "温度" }, { "type": "label", "bind": "battery.temp_c10", "fmt": "%d x0.1C" } ],
+        [ { "type": "label", "text": "健康" }, { "type": "label", "tone": "ok", "bind": "battery.soh_pct", "fmt": "%d%%" } ],
+        [ { "type": "label", "text": "续航" }, { "type": "label", "bind": "battery.tte_min", "fmt": "%d min" } ],
+        [ { "type": "label", "text": "循环" }, { "type": "label", "tone": "dim", "bind": "battery.cycles", "fmt": "%d" } ]
+      ]
+    },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "cols": [ { "title": "项" }, { "title": "值" } ],
+      "rows": [
+        [ { "type": "label", "text": "运营商" }, { "type": "label", "icon": "wifi", "tone": "ok", "bind": "net.operator" } ],
+        [ { "type": "label", "text": "IP" }, { "type": "label", "tone": "dim", "bind": "net.ip" } ],
+        [ { "type": "label", "text": "SD剩余" }, { "type": "label", "bind": "storage.free_mb", "fmt": "%d MB" } ]
+      ]
+    }
+  ]
+}

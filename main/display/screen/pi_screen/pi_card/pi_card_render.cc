@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "pi_card_cmd.h"  // CommandRegistry（invoke 的 Lint 提示）
 #include "pi_card_data.h"
 #include "pi_card_icons.h"
+#include "pi_card_solver.h"  // CARD V2：grid-only 布局求解器（docs/CARD_V2.md §2）
 #include "pi_card_stock.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
@@ -64,44 +66,12 @@ bool ToneTok(const char* name, Tok& out) {
     return false;
 }
 
-// column/row 的 justify(主轴)/align(交叉轴) CSS 惯用词 → lv_flex_align_t（表驱动，仿 ToneTok）。
-// 未知名返回 false，调用方保留今日默认值 + Lint 回落提示（依既有「修饰性枚举未知值静默回落」
-// 约定，不拒绝整卡）。justify 全 6 值；align(交叉轴) 语义只取 start|center|end。
-bool FlexJustifyOf(const char* name, lv_flex_align_t& out) {
-    if (!name) return false;
-    struct M { const char* k; lv_flex_align_t v; };
-    static const M kMap[] = {
-        {"start", LV_FLEX_ALIGN_START},         {"center", LV_FLEX_ALIGN_CENTER},
-        {"end", LV_FLEX_ALIGN_END},             {"between", LV_FLEX_ALIGN_SPACE_BETWEEN},
-        {"around", LV_FLEX_ALIGN_SPACE_AROUND}, {"evenly", LV_FLEX_ALIGN_SPACE_EVENLY},
-    };
-    for (auto& m : kMap) {
-        if (std::strcmp(m.k, name) == 0) {
-            out = m.v;
-            return true;
-        }
-    }
-    return false;
-}
-bool FlexCrossOf(const char* name, lv_flex_align_t& out) {
-    if (!name) return false;
-    if (!std::strcmp(name, "start")) { out = LV_FLEX_ALIGN_START; return true; }
-    if (!std::strcmp(name, "center")) { out = LV_FLEX_ALIGN_CENTER; return true; }
-    if (!std::strcmp(name, "end")) { out = LV_FLEX_ALIGN_END; return true; }
-    return false;
-}
-
 // "#RRGGBB" → lv_color_t。
 bool ParseHex(const char* s, lv_color_t& out) {
     if (!s || s[0] != '#' || std::strlen(s) < 7) return false;
     out = lv_color_hex(static_cast<uint32_t>(std::strtoul(s + 1, nullptr, 16)));
     return true;
 }
-
-// 行内 label 的固定像素钳宽（坑F收口）：不能用 LV_PCT——嵌套内容宽 row 里百分比对
-// SIZE_CONTENT 父容器解析为 0，label 永久塌成 "..."（见 RenderNode/RenderPreviewNode 的
-// label 分支头注）。取 720 屏 6 成上下、留足卡片内边距的经验值。
-constexpr int32_t kRowLabelMaxWidthPx = 400;
 
 // LLM 下发的 label fmt 会原样喂给 newlib vsnprintf（本固件 CONFIG_LV_USE_CLIB_SPRINTF=y），
 // 且绑定 label 只带 1 个变参：数值(Int/Bool)路径传 int、字符串(String)路径传 char*。故合法
@@ -335,156 +305,6 @@ Tok ApplyButtonStyle(lv_obj_t* btn, lv_obj_t* lbl, const cJSON* node) {
     SetTextTone(lbl, node, text_tone);
     ToneTok(GetStr(node, "tone"), text_tone);  // 覆写后的最终前景令牌回给调用方
     return text_tone;
-}
-
-bool IsGrowable(const char* type) {
-    return std::strcmp(type, "button") == 0 || std::strcmp(type, "slider") == 0 ||
-           std::strcmp(type, "bar") == 0 || std::strcmp(type, "spacer") == 0 ||
-           std::strcmp(type, "arc") == 0 || std::strcmp(type, "choice") == 0 ||
-           std::strcmp(type, "chart") == 0;
-}
-bool IsInteractive(const char* type) {
-    return std::strcmp(type, "button") == 0 || std::strcmp(type, "slider") == 0 ||
-           std::strcmp(type, "switch") == 0 || std::strcmp(type, "arc") == 0 ||
-           std::strcmp(type, "choice") == 0;
-}
-
-// button/choice 是"内容可能很短也可能很长"的交互控件：在纯控件行（IsGrowable 全员，如一排
-// 按钮）里均分整行观感最好；一旦行里混了任何非 growable 兄弟（label/icon/switch/嵌套容器等），
-// 均分会把兄弟挤没（如「温度 23°C」+「刷新」按钮，按钮吃掉大半行）——这类混排应退回内容自适应
-// 宽。slider/bar/arc/chart/spacer 不受此收窄限制（数值/进度类控件本就该撑满剩余空间），
-// 由 ApplySizing 单独判定，见调用处。
-bool IsRowGrowConditional(const char* type) {
-    return std::strcmp(type, "button") == 0 || std::strcmp(type, "choice") == 0;
-}
-
-// grid cell 类判定：这两个只在 grid 分支（正式渲染与预览镜像）落位子节点时用。
-// IsContainerType：默认宽是 PCT(100) 的容器类节点——它们做 FR 轨 cell 时必须 STRETCH（否则
-// START + PCT(100) 解析成整个 grid 内容宽，横穿所有轨道，压住邻列）。
-bool IsContainerType(const char* t) {
-    return std::strcmp(t, "column") == 0 || std::strcmp(t, "row") == 0 ||
-           std::strcmp(t, "grid") == 0 || std::strcmp(t, "list") == 0;
-}
-// GridCellOnAutoTrack：本 cell 落位覆盖的轨道里有没有 "auto"(CONTENT) 轨——见 FLOW_GRID_AUTO
-// 枚举头注。cols 元素是字符串即 auto（与建 dsc 时 IsString→LV_GRID_CONTENT 同口径，预览的
-// 半吐字符串也一致按 auto 对待，收敛帧自然纠正）。
-bool GridCellOnAutoTrack(const cJSON* cols, int col_out, int span) {
-    for (int i = 0; i < span; i++) {
-        const cJSON* c = cJSON_GetArrayItem(cols, col_out + i);
-        if (c != nullptr && cJSON_IsString(c)) return true;
-    }
-    return false;
-}
-// GridHasFrCols：grid 节点的 cols 里有没有数值（fr）列——Lint 用来点名"内容宽位置嵌 fr 列
-// grid"的退化组合（fr 分的是剩余空间，内容宽容器没有剩余空间，fr 轨塌 0）。
-bool GridHasFrCols(const cJSON* grid_node) {
-    const cJSON* cols = GetItem(grid_node, "cols");
-    if (cols == nullptr || !cJSON_IsArray(cols)) return false;
-    const cJSON* c = nullptr;
-    cJSON_ArrayForEach(c, cols) {
-        if (cJSON_IsNumber(c)) return true;
-    }
-    return false;
-}
-
-// ------------------------------ 自适应尺寸 ---------------------------------
-// parent_flow: 0=column（含 root）, 1=row, 2=grid, 3=内容宽列（FLOW_COL_CONTENT）。growable/
-// label 在普通 column 里默认全宽、在 row 里默认按比例分配（flex-grow 1），使「一排按钮均分」
-// 「一列控件铺满」这类最简 JSON 也有好布局。显式 w/grow 永远优先。grid 子项尺寸由
-// lv_obj_set_grid_cell 的 col_align 接管（见 grid 分支），故 ApplySizing 对 grid 子项跳过全部
-// flex 默认。FLOW_COL_CONTENT：嵌套在 row（或另一个内容宽列）里、自己也没显式 w/grow 的列——
-// 它自己是 LV_SIZE_CONTENT（内容宽，见 RenderNode 的建容器段落），子节点若还按普通 FLOW_COL
-// 默认 100% 宽，就是「父等子内容、子等父 100%」的循环引用，LVGL 实测直接塌陷成 0 宽、整卡
-// 空白——FLOW_COL_CONTENT 下子节点一律退回自然宽，打破循环。
-// FLOW_GRID_AUTO：grid cell 落在 "auto"(LV_GRID_CONTENT) 轨上。CONTENT 轨量尺用的是子项
-// **已解析**的 coords 宽（lv_grid.c calc_cols 的 lv_obj_get_width），PCT(100) 容器子项会被
-// 解析成整个 grid 内容宽、把 auto 轨直接撑爆成整卡宽——这类 cell 的容器子项必须退内容宽
-// （并向下传 FLOW_COL_CONTENT 打破循环引用），落位用 START。FR 轨没有这个问题（纯剩余
-// 空间分配、不看内容），容器子项走 STRETCH 由 item_repos 把 coords 钉成轨道宽。
-enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2, FLOW_COL_CONTENT = 3, FLOW_GRID_AUTO = 4 };
-
-// row_all_growable：本节点所在这一整行的子节点是否**清一色**都是 IsGrowable 类型——由调用方
-// （RenderNode/RenderPreviewNode/PreviewSyncContainer 的 row 子节点遍历处）扫一遍该行的 JSON
-// children 算出，只在 parent_flow==FLOW_ROW 且 type 是 IsRowGrowConditional（button/choice）
-// 时被读取；其它类型/其它 parent_flow 下这个参数是死值，调用方不关心时传默认 true 即可
-// （容器自身、grid 单元等场景）。
-void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_flow,
-                 bool row_all_growable = true) {
-    if (parent_flow == FLOW_GRID || parent_flow == FLOW_GRID_AUTO) {
-        // grid 单元的 growable/STRETCH 由 set_grid_cell 决定，这里只落显式 w/h（无则不动）。
-        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
-        if (HasKey(node, "h")) lv_obj_set_height(obj, GetInt(node, "h", 0));
-        return;
-    }
-    const bool spacer = std::strcmp(type, "spacer") == 0;
-    if (HasKey(node, "w")) {
-        lv_obj_set_width(obj, GetInt(node, "w", 0));
-    } else if (HasKey(node, "grow")) {
-        lv_obj_set_flex_grow(obj, static_cast<uint8_t>(GetInt(node, "grow", 0)));
-    } else if (spacer) {
-        // 行内 spacer = 横向弹性填充（把两侧顶开）；列内 spacer 绝不 grow —— 否则会
-        // 吃掉竖向空间把卡片撑高。列内当固定小间隔（见下方默认高）。
-        if (parent_flow == FLOW_ROW) lv_obj_set_flex_grow(obj, 1);
-    } else if (std::strcmp(type, "divider") == 0) {
-        // 行内竖分隔：定宽 2px，不参与均分/自适应，高度交给下方"显式 h 优先，否则跟随交叉轴"
-        // 的兜底段落；普通 column/顶层维持横线全宽不变；FLOW_COL_CONTENT（内容宽列）里同 R-1
-        // 的循环引用问题，不强推 PCT(100)，退自然宽（罕见用法：分隔线极少配在窄内容列里）。
-        if (parent_flow == FLOW_ROW) lv_obj_set_width(obj, 2);
-        else if (parent_flow != FLOW_COL_CONTENT) lv_obj_set_width(obj, LV_PCT(100));
-    } else if (parent_flow == FLOW_ROW) {
-        if (IsGrowable(type)) {
-            // button/choice 只在整行都是 growable 类型时才均分；混了 label/icon/switch/嵌套
-            // 容器等非 growable 兄弟时保持内容自适应宽（不设 flex_grow，即 LVGL 默认行为）。
-            if (!IsRowGrowConditional(type) || row_all_growable) lv_obj_set_flex_grow(obj, 1);
-        }
-        // row 里的 label/icon/switch（以及行内有非 growable 兄弟时的 button/choice）保持自然宽
-    } else if (parent_flow == FLOW_COL_CONTENT) {
-        // 内容宽列：子节点一律自然宽，不做 100% 默认（见枚举头注的循环引用说明）。显式 w/grow
-        // 已在链首两个分支处理过，这里什么都不用做。
-    } else {  // column（含顶层 root）
-        if (IsGrowable(type) || std::strcmp(type, "label") == 0) lv_obj_set_width(obj, LV_PCT(100));
-    }
-    if (HasKey(node, "h")) lv_obj_set_height(obj, GetInt(node, "h", 0));
-    else if (spacer && parent_flow != FLOW_ROW) lv_obj_set_height(obj, 8);
-    else if (std::strcmp(type, "divider") == 0 && parent_flow == FLOW_ROW) {
-        // 撑满行交叉轴：实测 LV_PCT(100) 在"行自身是 LV_SIZE_CONTENT"时不解析（塌成 0 高、
-        // 线不可见）——LVGL 这里没有做"先量内容定容器高、再解析百分比子项"的二次布局，百分比
-        // 高度子项按当时容器高求值，容器还没定型就是 0。改用固定像素高（20px，贴近单行正文
-        // 字高），实测可见、跨常见字号不突兀。create 分支的默认 1px 到此被覆盖。
-        lv_obj_set_height(obj, 20);
-    }
-}
-
-// 供 RenderNode（正式渲染）与 RenderPreviewNode/PreviewSyncContainer（流式预览）在各自的 row
-// 子节点遍历入口调用一次：该行的 JSON children 是否清一色都是 IsGrowable 类型。非数组/缺失
-// 按"清一色"处理（回落旧行为，反正没有子节点可判）。
-bool RowChildrenAllGrowable(const cJSON* children) {
-    if (!children || !cJSON_IsArray(children)) return true;
-    const cJSON* c = nullptr;
-    cJSON_ArrayForEach(c, children) {
-        const char* ct = GetStr(c, "type");
-        if (!ct || !IsGrowable(ct)) return false;
-    }
-    return true;
-}
-
-// column 声明了非默认交叉轴对齐（align:center/end）时，label 的"列内默认全宽"（ApplySizing
-// 列分支的 PCT(100)）会让对齐彻底失效——全宽盒子里文本照样靠左，"三列统计牌数值居中"这类
-// 常见诉求（sim case4 复现）看起来就是没居中。这类列里无显式 w/grow 的 label 退自然宽，
-// 交叉轴对齐才有的放矢；max_width 兜底超长文本（FLOW_COL 列必为确定宽，PCT 可解析——
-// 内容宽列走 FLOW_COL_CONTENT，本就自然宽，不经此函数）。幂等 setter，预览生长期可每帧
-// 重打。container_flow 传容器自身的 this_flow/child_flow。
-void ApplyColCrossLabelSizing(lv_obj_t* cobj, const cJSON* child, const cJSON* container,
-                              int container_flow) {
-    if (container_flow != FLOW_COL || cobj == nullptr) return;
-    lv_flex_align_t cross = LV_FLEX_ALIGN_START;
-    FlexCrossOf(GetStr(container, "align"), cross);
-    if (cross == LV_FLEX_ALIGN_START) return;
-    const char* ct = GetStr(child, "type");
-    if (ct == nullptr || std::strcmp(ct, "label") != 0) return;
-    if (HasKey(child, "w") || HasKey(child, "grow")) return;
-    lv_obj_set_width(cobj, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_width(cobj, LV_PCT(100), LV_PART_MAIN);
 }
 
 // ------------------------------ 默认精致样式 -------------------------------
@@ -957,219 +777,121 @@ void SubstRecord(cJSON* node, const cJSON* rec, int i) {
     }
 }
 
-// grid 轨道模板堆载体：lv_obj_set_grid_dsc_array 只存指针、不拷贝数组，故 col/row 轨道
-// 数组必须与 grid 对象同寿命——堆分配、逐对象挂 LV_EVENT_DELETE 释放（照抄 chart
-// handle_box 模式）。绝不存进 card：list 行重渲 lv_obj_clean 会删旧 grid，若把 dsc 存进
-// card 就悬垂 + 每次重渲无界增长。
-struct GridDsc {
-    std::vector<int32_t> cols;  // 末尾 LV_GRID_TEMPLATE_LAST
-    std::vector<int32_t> rows;  // 末尾 LV_GRID_TEMPLATE_LAST
-};
-void GridDscFreeCb(lv_event_t* e) { delete static_cast<GridDsc*>(lv_event_get_user_data(e)); }
+// ---------------------------------------------------------------------------
+// v2 哑翻译器（docs/CARD_V2.md §8 步骤3）：RenderNode 不再自己做任何几何推断——布局决策
+// 全部交给 pi_card::solver::Solve（纯函数、零 LVGL），这里只把它吐出的像素几何（x/w/align/
+// truncate）翻译成 lv_obj_set_pos/set_size + 12 种叶子 builder（builder 本身照抄 v1，未改）。
+// 旧的 column/row/spacer/list/旧grid 分派 + FLOW_*/ApplySizing 几何推断已随改造4（流式预览
+// v2）一并清空：RowChildrenAllGrowable/IsRowGrowConditional/FlexJustifyOf/FlexCrossOf/
+// GridCellOnAutoTrack/GridHasFrCols 连同它们唯一的调用方（v1 树形 Lint()）已在步骤5一并删除
+// （Lint() 已重写为 v2 grid 数组遍历，见文件末尾）。
+// ApplySizing/ApplyColCrossLabelSizing/IsContainerType/GridDsc/GridDscFreeCb/FLOW_* 枚举/
+// kRowLabelMaxWidthPx 已随 RenderPreviewNode/SyncPreviewNode/PreviewSyncContainer 一起删除
+// （它们的唯一调用方就是这套 v1 生长边机器）。
+namespace {
 
-// 改造4：行模板里有没有出现过 {i}/{n}——这类模板拿"下标"当内容的一部分，remove 会让它后面
-// 的每一行下标整体前移（比如删掉第2行，原第3行变成第2行），但行级增量只重渲"确实被删的那
-// 一行"，不会连带刷新它后面的邻居们——remove 命中这种模板必须退回全量重建（append/replace
-// 不影响任何其它行的下标，不受此限，见 RefreshDataConsumers）。粗扫：整个模板序列化成一段
-// JSON 文本后找 "{i}"/"{n}" 子串，宁可误判 true（代价只是多退一次全量，安全）也不做逐字段精扫。
-// RenderNode 渲染 list 节点时调一次，结果存进 DataConsumer::tpl_uses_index，不必每次 update
-// 都重扫模板。
-bool TemplateUsesIndex(const cJSON* item_tpl) {
-    char* s = cJSON_PrintUnformatted(item_tpl);
-    if (!s) return false;
-    bool found = std::strstr(s, "{i}") != nullptr || std::strstr(s, "{n}") != nullptr;
-    cJSON_free(s);
-    return found;
+// grid 内容宽（不含卡片自身 pad）：chat/overlay 走 solver 设计常量；standby/pin 没有固定常量，
+// 用宿主父容器实测宽扣个近似 pad 兜底（§2.1：视口宽由调用方按 display 传入）。
+int ViewportWidthFor(UiCard* card, lv_obj_t* parent) {
+    if (card->display == Display::Chat) return solver::kCardWChat;
+    if (card->display == Display::Overlay) return solver::kCardWOverlay;
+    int w = lv_obj_get_width(parent);
+    return w > 200 ? w - 48 : solver::kCardWOverlay;
 }
 
-lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
-                     int depth, int& node_count, std::string& err, int parent_flow,
-                     bool in_list_row, bool row_all_growable) {
-    EnsureCardStyles();  // 惰性初始化共享几何样式（首次进入即建，覆盖全部下游入口）
-    if (!cJSON_IsObject(node)) {
-        err = "node is not an object";
-        return nullptr;
+// role code → 实际渲染字体（镜像 ApplyLabelStyle 的字号阶梯），R3：过 SafeFont 回退后再测量，
+// 不对着不存在字形的字体假测宽度。sim 直链真 LVGL（managed_components/lvgl__lvgl），真机同一份
+// LVGL，故一份实现两边都对。
+const lv_font_t* SolverFontFor(int role, bool mono) {
+    switch (role) {
+        case solver::kRoleEyebrow:
+        case solver::kRoleKicker:
+        case solver::kRoleSection:
+        case solver::kRoleCaption:
+            return &font_pi_mono_14;
+        case solver::kRoleTitle:
+            return &font_puhui_30_4;
+        case solver::kRoleHeading:
+            return &font_puhui_24_4;
+        case solver::kRoleLabel:
+            return &font_puhui_20_4;
+        case solver::kRoleValue:
+            // 必须跟 ApplyLabelStyle 严格一致：role:"value" 恒渲染 font_pi_mono_20，不看
+            // JSON 的 mono 属性（那是 ApplyLabelStyle 自己的既定设计，非本函数决定）。曾经这里
+            // 用 `mono?mono_20:puhui_20_4` 三元——当一个 role:"value" 的 cell 没显式声明
+            // mono:true 且契约判定不是"数值"（比如 25_grid_tall.json 的 "v01".."v22"：无
+            // mono、无 bind、TextLooksNumeric 判否）时，量出来的是 puhui_20_4 的窄宽度，但
+            // 实际渲染永远是更宽的 mono_20——量出来的轨道装不下真实渲染的字形，断词多行。
+            (void)mono;
+            return &font_pi_mono_20;
+        default:
+            return mono ? &font_pi_mono_20 : &font_puhui_20_4;
     }
-    if (depth > limits.max_depth) {
-        err = "nesting too deep (max " + std::to_string(limits.max_depth) + ")";
-        return nullptr;
+}
+
+int SolverMeasureCb(const char* utf8, int role, bool mono, void* /*ctx*/) {
+    if (!utf8 || !*utf8) return 0;
+    const lv_font_t* font = SolverFontFor(role, mono);
+    SafeFont(font, utf8);  // 拿到真正会被渲染出来的字体再量
+    lv_point_t sz{0, 0};
+    lv_text_get_size(&sz, utf8, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    return sz.x;
+}
+
+// bind_rows 展开（渲染器侧，复用 SubstRecord 语义；镜像 solver.cc 内部 BuildRows 的
+// 计数/empty 行为，保证 ci = r*100+c 的 r 与本数组下标一一对应，不产生逻辑漂移——见任务
+// 说明「渲染器自己需要维护 cell → 实际叶子 JSON 的映射」）。返回值 caller 用 cJSON_Delete 释放。
+cJSON* BuildBindRowsForRender(const cJSON* grid, const cJSON* data) {
+    cJSON* out = cJSON_CreateArray();
+    const char* key = GetStr(grid, "bind_rows");
+    const cJSON* item = GetItem(grid, "item");
+    const cJSON* arr = (data && key) ? GetItem(data, key) : nullptr;
+    int max = HasKey(grid, "max") ? GetInt(grid, "max", 20) : 20;
+    if (max < 1) max = 1;
+    if (max > 20) max = 20;
+    int count = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    if (count > max) count = max;
+    if (count == 0) {
+        const char* empty = GetStr(grid, "empty");
+        cJSON* row = cJSON_CreateArray();
+        cJSON* lbl = cJSON_CreateObject();
+        cJSON_AddStringToObject(lbl, "type", "label");
+        cJSON_AddStringToObject(lbl, "text", empty ? empty : "");
+        cJSON_AddItemToArray(row, lbl);
+        cJSON_AddItemToArray(out, row);
+        return out;
     }
-    if (++node_count > limits.max_nodes) {
-        err = "too many nodes (max " + std::to_string(limits.max_nodes) + ")";
-        return nullptr;
-    }
-    const char* type = GetStr(node, "type");
-    if (!type) {
-        err = "node missing type";
-        return nullptr;
-    }
-
-    lv_obj_t* obj = nullptr;
-    int this_flow = FLOW_COL;
-
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
-        const bool is_row = std::strcmp(type, "row") == 0;
-        // col_content_width：本容器是不是"列、且自己会被判定为内容宽"（父是 row 或父本身也是
-        // 内容宽列、且自己无显式 w/grow——有 grow 会被 flex_grow 撑成确定宽，不算）。是的话，
-        // this_flow 用 FLOW_COL_CONTENT 而非普通 FLOW_COL 往下传：ApplySizing 的列分支默认给
-        // growable/label 打 100% 宽，但"父是内容宽（未定）、子又要 100%"是循环引用——LVGL 实测
-        // 直接塌陷成 0 宽、整卡空白（不是理论推测，是本轮踩出来的真实 bug）。FLOW_COL_CONTENT
-        // 让子节点也退回自然宽，打破循环；FLOW_ROW 不受影响（row 子节点从不用百分比宽，只用
-        // flex_grow 或自然宽，没有这个循环）。
-        const bool col_content_width = !is_row &&
-                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                                        parent_flow == FLOW_GRID_AUTO) &&
-                                       !HasKey(node, "w") && !HasKey(node, "grow");
-        this_flow = is_row ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        // 嵌套容器默认宽：父是 row（或父是内容宽列，链式传递）或 auto 轨 grid cell 时用内容宽
-        // （LV_SIZE_CONTENT），让并排的两个 column/row 各自窄到自己内容、不再互相挤到下一行；
-        // 父是 column/顶层时维持 PCT(100)——列内容器满宽本就是正确默认。父是 FR 轨 grid cell
-        // （FLOW_GRID）时 PCT(100) 只是无害初值：落位走 STRETCH，item_repos 会把 coords 钉成
-        // 轨道宽（w_layout=1 后 style 宽不再参与自量）——曾经容器不在 STRETCH 名单里、又吃
-        // PCT(100)（= 整个 grid 内容宽），左列滑块横穿整卡压住右列（真机控制中心卡复现）。
-        // 显式 grow 仍优先：
-        // ApplySizing 随后若见到 grow 键会用 flex_grow 撑开，不受这里初始宽度影响（LVGL
-        // flex_grow>0 时按主轴权重分配，不看 width 属性——这也是 grow 转义舱不受循环引用影响
-        // 的原因：flex_grow 撑出的是确定宽，不是内容宽）。
-        if (HasKey(node, "w")) {
-            lv_obj_set_width(obj, GetInt(node, "w", 0));
-        } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                   parent_flow == FLOW_GRID_AUTO) {
-            lv_obj_set_width(obj, LV_SIZE_CONTENT);
-        } else {
-            lv_obj_set_width(obj, LV_PCT(100));
-        }
-        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-        // row 支持自动换行，超宽不裁剪 —— 自适应关键。
-        lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
-        int gap = GetInt(node, "gap", is_row ? 12 : 12);
-        lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
-        lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-        // justify(主轴)/align(交叉轴)：不传 = 今日写死值（column START/START/START、
-        // row START/CENTER/CENTER），完全向后兼容。cross 与 track 同设一个值。未知枚举
-        // 值静默回落到默认（Lint 出提示）。
-        lv_flex_align_t main_align = LV_FLEX_ALIGN_START;
-        lv_flex_align_t cross_align = is_row ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START;
-        FlexJustifyOf(GetStr(node, "justify"), main_align);
-        FlexCrossOf(GetStr(node, "align"), cross_align);
-        lv_obj_set_flex_align(obj, main_align, cross_align, cross_align);
-    } else if (std::strcmp(type, "grid") == 0) {
-        // 行主序自动放置的网格：cols 声明列 fr 权重（或 "auto"=按内容），子节点可选 span
-        // 跨列，无需写行列坐标。轨道 dsc 堆分配、随对象 DELETE 释放（GridDscFreeCb）。
-        // 子节点在本分支内直接渲染 + set_grid_cell 放置（同 list：不走底部通用 children 循环）。
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        // 默认宽口径同 column/row 分支：父是 row/内容宽列/auto 轨 cell 时 PCT 解析不出正确值
-        // （content 父下 PCT 塌 0 / auto 轨下 PCT 撑爆），退内容宽；注意内容宽 grid 里 FR 轨
-        // 没有"剩余空间"可分（全 auto 列才有意义），Lint 侧另有提示。
-        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
-        else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                 parent_flow == FLOW_GRID_AUTO)
-            lv_obj_set_width(obj, LV_SIZE_CONTENT);
-        else
-            lv_obj_set_width(obj, LV_PCT(100));
-        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-        int gap = GetInt(node, "gap", 12);
-        lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
-        lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-
-        const cJSON* cols = GetItem(node, "cols");  // Validate 已保证 array 长 1..6、元素合法
-        const int ncol = cJSON_GetArraySize(cols);
-        auto* dsc = new GridDsc();
-        dsc->cols.reserve(ncol + 1);
-        const cJSON* cel = nullptr;
-        cJSON_ArrayForEach(cel, cols) {
-            if (cJSON_IsString(cel)) dsc->cols.push_back(LV_GRID_CONTENT);  // "auto"：按内容宽
-            else dsc->cols.push_back(LV_GRID_FR(cel->valueint));           // 正整数：fr 权重
-        }
-        dsc->cols.push_back(LV_GRID_TEMPLATE_LAST);
-
-        const cJSON* children = GetItem(node, "children");
-        // 行主序自动放置：cur=当前行已占列数，row=当前行号。span 放不下则换行；填满一行
-        // 后 cur 归零、row 进位。place_next 回吐本 cell 的 (col_out,row_out) 落位并推进游标。
-        auto place_next = [ncol](int span, int& cur, int& row, int& col_out, int& row_out) {
-            if (span < 1) span = 1;
-            if (span > ncol) span = ncol;
-            if (cur + span > ncol) { ++row; cur = 0; }  // 本行放不下 → 换到下一行
-            col_out = cur;
-            row_out = row;  // 本 cell 的落位行（在推进游标之前取）
-            cur += span;
-            if (cur >= ncol) { ++row; cur = 0; }  // 填满 → 为下一 cell 进位
-            return span;
-        };
-        int cursor = 0, row = 0, col_out = 0, row_out = 0;
-        const cJSON* ch = nullptr;
-        cJSON_ArrayForEach(ch, children) place_next(GetInt(ch, "span", 1), cursor, row, col_out, row_out);
-        int nrow = (cursor > 0) ? row + 1 : row;  // 末行未满也计一行
-        if (nrow < 1) nrow = 1;
-        dsc->rows.assign(nrow, LV_GRID_CONTENT);
-        dsc->rows.push_back(LV_GRID_TEMPLATE_LAST);
-
-        lv_obj_set_grid_dsc_array(obj, dsc->cols.data(), dsc->rows.data());
-        lv_obj_add_event_cb(obj, GridDscFreeCb, LV_EVENT_DELETE, dsc);
-
-        cursor = 0;
-        row = 0;
-        cJSON_ArrayForEach(ch, children) {
-            int span = place_next(GetInt(ch, "span", 1), cursor, row, col_out, row_out);
-            const bool cell_auto = GridCellOnAutoTrack(cols, col_out, span);
-            lv_obj_t* cobj = RenderNode(obj, ch, card, limits, depth + 1, node_count, err,
-                                        cell_auto ? FLOW_GRID_AUTO : FLOW_GRID, in_list_row);
-            if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
-            // col_align 镜像 ApplySizing column：growable/label/divider 铺满列(STRETCH)，
-            // 容器（column/row/grid/list）在 FR 轨同样 STRETCH（钉成轨道宽；auto 轨则 START+
-            // 内容宽，见 FLOW_GRID_AUTO 头注——STRETCH 在 CONTENT 轨会跟量尺互相喂大），
-            // 其余（icon/switch/qrcode…）及显式 w 靠列首(START)。row_align 竖向居中。
-            // 例外：带 bind/bind_data 的 label 保持 START（内容宽）——渲染时它的文本还是
-            // 空的，"auto" 列按空文本量出 ≈0 宽，STRETCH 会把它钉死在 0 宽上；数据到达后
-            // WRAP 模式在 0 宽里逐字竖排，列也永远涨不回来（牛市看板真机复现：值列一字一
-            // 行"看不见"）。START + SIZE_CONTENT 下文本更新即重量列宽，auto 列跟着涨。
-            const char* ct = GetStr(ch, "type");
-            const bool dyn_label = ct != nullptr && std::strcmp(ct, "label") == 0 &&
-                                   (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
-            lv_grid_align_t col_align = LV_GRID_ALIGN_START;
-            if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
-                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0 ||
-                 (IsContainerType(ct) && !cell_auto))) {
-                col_align = LV_GRID_ALIGN_STRETCH;
+    for (int i = 0; i < count; ++i) {
+        const cJSON* el = cJSON_GetArrayItem(arr, i);
+        cJSON* row = cJSON_CreateArray();
+        if (cJSON_IsArray(item)) {
+            const cJSON* leaf = nullptr;
+            cJSON_ArrayForEach(leaf, item) {
+                cJSON* clone = cJSON_Duplicate(leaf, 1);
+                SubstRecord(clone, el, i);
+                cJSON_AddItemToArray(row, clone);
             }
-            lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
+        } else if (item) {
+            cJSON* clone = cJSON_Duplicate(item, 1);
+            SubstRecord(clone, el, i);
+            cJSON_AddItemToArray(row, clone);
         }
-    } else if (std::strcmp(type, "label") == 0) {
+        cJSON_AddItemToArray(out, row);
+    }
+    return out;
+}
+
+// 12 种叶子 builder：逐类型建 lv_obj，不做任何位置/宽度决策（那是调用方按 solver layout 做的
+// 事）。函数体逐字照抄 v1 RenderNode 对应分支，只是去掉了不会再作为叶子出现的容器类型。
+lv_obj_t* BuildLeafWidget(lv_obj_t* parent, const cJSON* node, std::string& err) {
+    const char* type = GetStr(node, "type");
+    lv_obj_t* obj = nullptr;
+    if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
-        // 无 text 也要显式置空：没有 text/bind/bind_data 的 label 校验期放行（模型偶尔渲骨架
-        // 等后续 patch），不置空会裸奔 LVGL 默认 "Text"（预览端同口径，见 PreviewLabelText）。
         lv_label_set_text(obj, GetStr(node, "text", ""));
-        if (parent_flow == FLOW_ROW) {
-            // 行内 label 天生自然宽、不设宽度上限——超长文本会把行撑宽到自动换行
-            // （LV_FLEX_FLOW_ROW_WRAP），把 button 等兄弟挤到下一行竖排（坑F）。夹一个
-            // max_width + 单行收口，超长文本在自己槽位内截断，不再挤占兄弟的位置。列内
-            // label（含顶层）保持原 WRAP 换行，不变——那是段落文本的正确默认。
-            // 两个坑（真机音量卡复现）：
-            //  1. max_width 不能用 LV_PCT——嵌套内容宽 row（父是 row 的 row）里百分比对
-            //     SIZE_CONTENT 父容器解析为 0，label 永久塌成 "..."；改固定像素钳宽。
-            //  2. 动态 label（bind/bind_data）不能用 LONG_DOT——LVGL 的
-            //     lv_label_set_text_fmt 不像 lv_label_set_text 那样先 revert dot 状态
-            //     （lv_label.c:175 无 lv_label_revert_dots），布局前打过点的 label 再走
-            //     set_text_fmt（ApplyBind 种子/num-anim 每帧）会让陈旧 dot 备份写回新文本
-            //     缓冲：默认 "Text" 备份盖掉 "70%"，杂串如 "%d%%P P"，且 1 字节堆越界。
-            //     改 LONG_CLIP（无破坏性变异，set_text_fmt 安全）；静态文本保留 DOT——
-            //     set_text 路径 revert 正确、尺寸事件后自愈，还能有省略号观感。
-            lv_obj_set_style_max_width(obj, kRowLabelMaxWidthPx, LV_PART_MAIN);
-            const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
-            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
-        } else {
-            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
-        }
-        ApplyLabelStyle(obj, node);  // role/size 排版 + 颜色
+        ApplyLabelStyle(obj, node);
     } else if (std::strcmp(type, "icon") == 0) {
-        Tok tok = Tok::Dim;  // 图标默认次要（Dim）；重点图标可 tone:tx/accent
+        Tok tok = Tok::Dim;
         ToneTok(GetStr(node, "tone", "dim"), tok);
         obj = MakeIcon(parent, GetStr(node, "icon", GetStr(node, "name", "dot")),
                        GetInt(node, "size", 22), tok);
@@ -1177,17 +899,15 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         obj = lv_button_create(parent);
         lv_obj_t* lbl = lv_label_create(obj);
         const char* text = GetStr(node, "text", "");
-        lv_label_set_text(lbl, text);  // 无文字置空，避免 LVGL "Text" 占位
-        Tok fg = ApplyButtonStyle(obj, lbl, node);  // 变体 + 字体 + 颜色
+        lv_label_set_text(lbl, text);
+        Tok fg = ApplyButtonStyle(obj, lbl, node);
         if (const char* icon_name = GetStr(node, "icon")) {
-            // 图标按钮：icon 可单用或与 text 并存（图标居左），与文字同前景令牌。
             lv_obj_t* ic = MakeIcon(obj, icon_name, GetInt(node, "size", 20), fg);
             lv_obj_move_to_index(ic, 0);
             lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_ROW);
             lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                                   LV_FLEX_ALIGN_CENTER);
             lv_obj_set_style_pad_column(obj, 8, LV_PART_MAIN);
-            // 仅图标时藏掉空 label，免得 pad_column 让图标偏心。
             if (text[0] == '\0') lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_center(lbl);
@@ -1195,13 +915,13 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     } else if (std::strcmp(type, "slider") == 0) {
         obj = lv_slider_create(parent);
         int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
-        if (mx <= mn) mx = mn + 1;  // 退化区间兜底
+        if (mx <= mn) mx = mn + 1;
         lv_slider_set_range(obj, mn, mx);
         if (HasKey(node, "value")) lv_slider_set_value(obj, GetInt(node, "value", 0), LV_ANIM_OFF);
     } else if (std::strcmp(type, "arc") == 0) {
         obj = lv_arc_create(parent);
         int mn = GetInt(node, "min", 0), mx = GetInt(node, "max", 100);
-        if (mx <= mn) mx = mn + 1;  // 退化区间兜底
+        if (mx <= mn) mx = mn + 1;
         lv_arc_set_range(obj, mn, mx);
         if (HasKey(node, "value")) lv_arc_set_value(obj, GetInt(node, "value", 0));
     } else if (std::strcmp(type, "bar") == 0) {
@@ -1219,8 +939,6 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         if (sz < 96) sz = 96;
         else if (sz > 320) sz = 320;
         lv_qrcode_set_size(obj, sz);
-        // 固定"纸面"配色：深浅主题都深码浅底，保证可扫描、不随主题反色（深主题下是一张亮色
-        // 小卡，刻意取舍：可扫描优先）。
         lv_qrcode_set_dark_color(obj, pi_theme::PaletteOf(true).tx);
         lv_qrcode_set_light_color(obj, pi_theme::PaletteOf(true).bg);
         const char* txt = GetStr(node, "text", "");
@@ -1228,19 +946,17 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     } else if (std::strcmp(type, "choice") == 0) {
         obj = MakeChoice(parent, node);
     } else if (std::strcmp(type, "chart") == 0) {
-        // 只读历史折线：不走 ApplyBind（无 lv_subject），直接种子 HistorySnapshot + 订阅
-        // AddHistorySink 增量追加；LV_EVENT_DELETE 时摘除 sink（D17，无悬垂回调）。
         obj = lv_chart_create(parent);
         lv_chart_set_type(obj, LV_CHART_TYPE_LINE);
         lv_chart_set_update_mode(obj, LV_CHART_UPDATE_MODE_SHIFT);
         int points = GetInt(node, "points", 60);
         points = std::min(120, std::max(8, points));
         lv_chart_set_point_count(obj, static_cast<uint16_t>(points));
-        lv_chart_set_div_line_count(obj, 3, 0);  // 少量水平网格线；不设纵向/轴刻度=无轴无图例
+        lv_chart_set_div_line_count(obj, 3, 0);
         pi_theme::ApplyBg(obj, Tok::Card2);
         lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
         lv_obj_set_style_line_color(obj, pi_theme::Color(Tok::Line2), LV_PART_MAIN);
-        lv_obj_set_height(obj, GetInt(node, "h", 120));  // 默认 120px（ApplySizing 若给了显式 h 会再套一遍同值）
+        lv_obj_set_height(obj, 120);  // §3 决策C：chart 高度固定档 120px（h 属性已删）
         const char* path = GetStr(node, "bind_history");
         if (path) {
             auto& hub = DataHub::Instance();
@@ -1273,77 +989,10 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
                 LV_EVENT_DELETE, handle_box);
         }
     } else if (std::strcmp(type, "stock_chart") == 0) {
-        // 行情卡叶子控件（pi_card_stock）：symbol 声明式，行情数据设备侧直取直画、
-        // 自适应刷新、分段按钮切周期、按住图面看数值；生命周期（注册表/canvas
-        // 缓冲/timer）全部自管。
         obj = pi_card_stock::Create(parent, node);
         if (obj == nullptr) {
             err = "stock_chart alloc failed";
             return nullptr;
-        }
-    } else if (std::strcmp(type, "list") == 0) {
-        // data 驱动的行模板重复器：item 是一个节点模板，按 card->data[bind_data] 数组的每个
-        // 元素克隆+替换{i}/{n}/{item.*}后各渲一份。行数计入 64 节点预算（Validate 已按
-        // eff_max×模板节点数预留，故这里怎么渲都不会超预算）。
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        // 与 column/row 分支一致：显式给 SIZE_CONTENT，否则落回 lv_obj_create 的默认固定高度，
-        // 撑不满全部行、把最后几行裁在盒子外（bug 曾在此复现：obj 高度停在第 4 行，第 5 行
-        // 虽已正确布局到 y460-484 却被父容器裁掉，因为父容器自身高度从没被设过）。
-        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
-        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(obj, GetInt(node, "gap", 10), LV_PART_MAIN);
-        const cJSON* item = GetItem(node, "item");
-        const cJSON* arr = card->data ? GetItem(card->data, GetStr(node, "bind_data", "")) : nullptr;
-        int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-        int eff = EffMax(node, len);
-        int rows = std::min(len, eff);
-        for (int i = 0; i < rows; i++) {
-            cJSON* clone = cJSON_Duplicate(item, 1);
-            SubstRecord(clone, cJSON_GetArrayItem(arr, i), i);
-            bool ok = RenderNode(obj, clone, card, limits, depth + 1, node_count, err, FLOW_COL, true) !=
-                      nullptr;
-            cJSON_Delete(clone);
-            if (!ok) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
-        }
-        const char* empty_txt = GetStr(node, "empty");
-        // 0 行且没有 empty 兜底文案：整个 list 容器隐藏，不留占位白（容器 pad/显式 h 会占出
-        // 一块空区）。后续 ui_update 数据到达时 RefreshDataConsumers 侧恢复显示。
-        if (rows == 0 && empty_txt == nullptr) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        if (rows == 0 && empty_txt) {
-            lv_obj_t* lbl = lv_label_create(obj);
-            lv_label_set_text(lbl, empty_txt);
-            lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-            const lv_font_t* f = &font_pi_mono_14;
-            SafeFont(f, empty_txt);  // 中文兜底文案回退 puhui，不出豆腐块
-            lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
-            pi_theme::ApplyText(lbl, Tok::Faint);
-            ++node_count;
-        }
-        // 模板 clone 一份存进 card 的 json_pool（card 存活期常驻），供 ui_update 数据变更时
-        // RefreshDataConsumers 全量重渲这个 list 子树用；item 本身随本轮渲染完的 cJSON_Delete
-        // 一起释放，不能直接借它的指针。
-        // 双保险：嵌套 list 已在 ValidateNode 拒绝，这里 !in_list_row 是渲染器侧的防御性
-        // 守卫——万一校验被绕过，外层 list 重渲时 lv_obj_clean 会先删掉这个 obj，若仍注册了
-        // consumer/json_pool 就是悬垂指针 + 每次重渲无界增长；in_list_row 下干脆不登记。
-        if (!in_list_row) {
-            cJSON* tpl = cJSON_Duplicate(item, 1);
-            card->json_pool.push_back(tpl);
-            UiCard::DataConsumer dc;
-            dc.obj = obj;
-            dc.kind = UiCard::DataConsumer::List;
-            dc.key = GetStr(node, "bind_data", "");
-            dc.item_tpl = tpl;
-            dc.empty_text = empty_txt ? empty_txt : "";
-            dc.eff_max = eff;
-            dc.depth = depth;
-            dc.limits = limits;
-            dc.empty_shown = (rows == 0 && empty_txt != nullptr);
-            dc.tpl_uses_index = TemplateUsesIndex(item);
-            card->consumers.push_back(std::move(dc));
         }
     } else if (std::strcmp(type, "divider") == 0) {
         obj = lv_obj_create(parent);
@@ -1353,36 +1002,62 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         lv_obj_set_height(obj, 1);
         pi_theme::ApplyBg(obj, Tok::Line);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
-    } else if (std::strcmp(type, "spacer") == 0) {
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        lv_obj_set_size(obj, 0, 0);  // 本体不占尺寸；由 ApplySizing 给弹性/间隔
     } else {
-        err = std::string("unknown type: ") + type;
+        err = std::string("unknown type: ") + (type ? type : "(null)");
         return nullptr;
     }
-
-    // OOM 兜底：当前 LVGL 配置下 lv_*_create 分配失败会先 while(1) 卡死、极少真返回
-    // null，此为廉价的前向防护——失败经既有通路向上冒泡 → host 删 root 整卡回滚。
     if (!obj) {
         err = std::string("widget create failed: ") + type;
         return nullptr;
     }
+    return obj;
+}
 
-    ApplyDefaultStyle(obj, type, depth);
-    // label/button/icon 的字体与颜色已在各自分支处理。
-    ApplyCommonProps(obj, type, node, card, in_list_row);
-    ApplySizing(obj, type, node, parent_flow, row_all_growable);  // 自适应尺寸：按父容器主轴定默认
+// 落位 + 通用属性 + bind + 事件 + 死控件兜底：一个真实叶子建好之后的收尾，逐字照抄 v1
+// RenderNode 尾段（去掉 parent_flow 相关的 ApplySizing——尺寸现在由 solver 的 x/w 决定）。
+// wrap_mode 是 solver 输出的三态字段（"wrap"|"ellipsis"|"nowrap"，见 pi_card_solver.h 头注）：
+// 只有 ELLIPSIS 需要渲染器钳单行高——WRAP（独占整行的正文，允许自然长高折行）和 NOWRAP
+// （数值列/非文本控件，solver 已保证轨道宽≥真实测量宽，天然单行）都不钳，交给 LVGL 按内容自适应。
+void FinishLeafWidget(lv_obj_t* obj, const cJSON* node, UiCard* card, int x, int w,
+                     const char* align, const char* wrap_mode) {
+    const char* type = GetStr(node, "type");
+    lv_obj_set_pos(obj, x, 0);
+    if (!std::strcmp(type, "arc") || !std::strcmp(type, "qrcode")) {
+        if (w > 0) lv_obj_set_size(obj, w, w);
+    } else if (!std::strcmp(type, "divider")) {
+        if (w > 0) lv_obj_set_width(obj, w);
+    } else if (std::strcmp(type, "icon") != 0 && w > 0) {
+        lv_obj_set_width(obj, w);
+    }
+    if (!std::strcmp(type, "label")) {
+        const bool right = align && !std::strcmp(align, "end");
+        if (right) lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
+        const bool ellipsis = wrap_mode && !std::strcmp(wrap_mode, "ellipsis");
+        if (ellipsis) {
+            // 动态 label 不能用 DOT：set_text_fmt 不像 set_text 那样先 revert dot 状态，陈旧 dot
+            // 备份会写回新文本缓冲（见 v1 坑F/坑2 头注，同一套地雷在 v2 依旧成立）。
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
+            // F4 配套修复：CLIP/DOT 都是靠"对象高度 < 换行后的自然高度"才会真正生效
+            // （lv_label.c 的 get_label_flags 不区分 long_mode，只要宽度是定值就总按多行量算
+            // 自然高度；DOT 的截断判定 size.y>obj 内容区高度 在 LV_SIZE_CONTENT 高度下永远为
+            // false）——不显式钳一行高，宽度即使超出也只会自动长高换行，看起来跟 WRAP 一样，
+            // ELLIPSIS 形同虚设。这里把高度钉死成当前字体一行高，才能让二者真正单行截断。
+            // 钳高对 WRAP/NOWRAP 是误伤：WRAP 独占整行本意就是允许多行撑高，NOWRAP 数值列轨道
+            // 宽已够、天然一行——钳了反而在极端场景下裁掉本该完整显示的内容（本轮修复的两个
+            // 回归正是"单行钳制对所有 truncate=true 场景一视同仁"误伤了 WRAP 场景）。
+            const lv_font_t* tf = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+            if (tf) lv_obj_set_height(obj, lv_font_get_line_height(tf));
+        } else {
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_WRAP);
+        }
+    }
 
-    // bind（放在 value/checked 之后覆盖静态初值）
+    ApplyDefaultStyle(obj, type, /*depth=*/1);
+    ApplyCommonProps(obj, type, node, card, /*in_list_row=*/false);
+
     if (const char* path = GetStr(node, "bind")) ApplyBind(obj, type, path, node, card);
-
-    // data-label：label 若声明 bind_data 且没有 bind（bind 优先，二者都给以 bind 为准），
-    // 从 card->data 取值直显/套模板；登记 DataConsumer 供 ui_update 的 data 变更定向刷新。
-    if (std::strcmp(type, "label") == 0) {
+    if (!std::strcmp(type, "label")) {
         if (const char* dk = GetStr(node, "bind_data"); dk && !GetStr(node, "bind")) {
             const cJSON* v = card->data ? GetItem(card->data, dk) : nullptr;
             std::string tpl = GetStr(node, "text") ? GetStr(node, "text") : "";
@@ -1397,22 +1072,10 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         }
     }
 
-    // 事件
     AttachEvent(obj, LV_EVENT_CLICKED, card, GetItem(node, "on_click"));
     AttachEvent(obj, LV_EVENT_VALUE_CHANGED, card, GetItem(node, "on_change"));
     AttachEvent(obj, LV_EVENT_RELEASED, card, GetItem(node, "on_release"));
 
-    // 死控件兜底：switch/slider 若拨/拖了不会有任何效果——做成只读展示（去交互 + 视觉降级），
-    // 杜绝「看着能设其实是摆设」的假开关/假滑条（如演示卡里那个装饰性网络开关）。
-    //
-    // 「有效果」共四种，缺一不可：
-    //   1. 绑到可写路径 → 直接控硬件
-    //   2/3. 挂了 on_change / on_release → 有动作
-    //   4. 没 bind 但有 id → **纯本地表单控件**：它的值会被下一次 report 自动带回 LLM
-    //      （见 pi_card_actions.cc 的 CollectState）。拨它当场没动静，但提交时算数——这正是
-    //      「选数量 + 加急开关 + 确认按钮」这类表单的用法，绝不能 DIM 掉。
-    // 注意第 4 条特意要求「没 bind」：绑到**只读**路径的控件（如 bind battery.level）即便给了
-    // id（多半是留给 ui_update 用的）也仍是纯展示，拖它写不回任何地方 → 该 DIM 还得 DIM。
     if (std::strcmp(type, "switch") == 0 || std::strcmp(type, "slider") == 0 ||
         std::strcmp(type, "arc") == 0) {
         const char* bind = GetStr(node, "bind");
@@ -1421,168 +1084,292 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
                           GetItem(node, "on_release") != nullptr ||
                           (!bind && GetStr(node, "id") != nullptr);
         if (!live) {
-            lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);       // 不可交互
-            lv_obj_set_style_opa(obj, LV_OPA_60, LV_PART_MAIN);   // 视觉降级 = 只读态
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_opa(obj, LV_OPA_60, LV_PART_MAIN);
+        }
+    }
+}
+
+// solver 内建的合成表头行（cols[].title 触发）：与真实渲染/预览渲染共用，避免两处各写一份
+// 产生行为漂移（正式渲染见 RenderGridBlock，预览见 RenderGridBlockPreview）。
+void RenderColsHeaderRow(lv_obj_t* rowobj, const std::vector<const cJSON*>& row_cells,
+                         const cJSON* cols_meta) {
+    for (const cJSON* cellj : row_cells) {
+        int col = GetInt(cellj, "col", 0);
+        int x = GetInt(cellj, "x", 0);
+        int w = GetInt(cellj, "w", 0);
+        const char* align_s = GetStr(cellj, "align", "start");
+        const cJSON* cd = (cols_meta && col < cJSON_GetArraySize(cols_meta))
+                              ? cJSON_GetArrayItem(cols_meta, col)
+                              : nullptr;
+        const char* title = cd ? GetStr(cd, "title") : nullptr;
+        lv_obj_t* lbl = lv_label_create(rowobj);
+        lv_label_set_text(lbl, title ? title : "");
+        const lv_font_t* f = &font_pi_mono_14;
+        SafeFont(f, title);
+        lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+        lv_obj_set_style_text_letter_space(lbl, 2, LV_PART_MAIN);
+        pi_theme::ApplyText(lbl, Tok::Dim);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        if (align_s && !std::strcmp(align_s, "end")) {
+            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        }
+        lv_obj_set_pos(lbl, x, 0);
+        if (w > 0) lv_obj_set_width(lbl, w);
+    }
+}
+
+// solver 内建的合成 divider 行（紧随表头行）：同上，正式/预览共用。
+void RenderColsDividerRow(lv_obj_t* rowobj, const std::vector<const cJSON*>& row_cells,
+                          int viewport_w) {
+    const cJSON* cellj = row_cells.empty() ? nullptr : row_cells.front();
+    int w = cellj ? GetInt(cellj, "w", viewport_w) : viewport_w;
+    lv_obj_t* d = lv_obj_create(rowobj);
+    screen_strip_obj_chrome(d);
+    lv_obj_remove_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(d, 0, 0);
+    lv_obj_set_size(d, w, 1);
+    pi_theme::ApplyBg(d, Tok::Line);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
+}
+
+// 一个 grid 块（cells/rows/bind_rows 三形态之一）：拿 solver 已经算好的 layout_grid，按行
+// 竖排（flex COLUMN，行高交给 LVGL 用实际内容自适应）、行内按 x 绝对落位（数量已知的定像素
+// 几何，不需要 LVGL 参与横向决策）。ci>=0 回指真实叶子 JSON；ci==-1 是 solver 内建的合成
+// 表头/divider（cols[].title 触发），按位置（表头恒是这个 grid 输出里的第 1 行、divider 恒
+// 紧随其后，见 solver.cc SolveRows 的 out_row 分配顺序）识别，不靠猜 span。
+lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJSON* layout_grid,
+                          UiCard* card, int viewport_w, int gap, int& node_count,
+                          const RenderLimits& limits, std::string& err) {
+    lv_obj_t* gobj = lv_obj_create(card_root);
+    screen_strip_obj_chrome(gobj);
+    lv_obj_remove_flag(gobj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_style(gobj, &s_transp_bg, LV_PART_MAIN);
+    lv_obj_set_width(gobj, viewport_w);
+    lv_obj_set_height(gobj, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
+    ApplyFill(gobj, grid_json);
+
+    const cJSON* cells_json = GetItem(grid_json, "cells");
+    const cJSON* rows_json = GetItem(grid_json, "rows");
+    cJSON* owned_rows = nullptr;
+    const cJSON* effective_rows = nullptr;
+    if (cJSON_IsArray(rows_json)) {
+        effective_rows = rows_json;
+    } else if (HasKey(grid_json, "bind_rows")) {
+        owned_rows = BuildBindRowsForRender(grid_json, card->data);
+        effective_rows = owned_rows;
+    }
+    const cJSON* cols_meta = GetItem(grid_json, "cols");
+    bool has_title = false;
+    if (cJSON_IsArray(cols_meta)) {
+        const cJSON* cd = nullptr;
+        cJSON_ArrayForEach(cd, cols_meta)
+            if (GetStr(cd, "title")) has_title = true;
+    }
+
+    std::map<int, std::vector<const cJSON*>> by_row;
+    const cJSON* lc = nullptr;
+    cJSON_ArrayForEach(lc, GetItem(layout_grid, "cells")) { by_row[GetInt(lc, "row", 0)].push_back(lc); }
+
+    int seq = 0;
+    for (auto& kv : by_row) {
+        std::vector<const cJSON*>& row_cells = kv.second;
+        lv_obj_t* rowobj = lv_obj_create(gobj);
+        screen_strip_obj_chrome(rowobj);
+        lv_obj_remove_flag(rowobj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_style(rowobj, &s_transp_bg, LV_PART_MAIN);
+        lv_obj_set_width(rowobj, viewport_w);
+        lv_obj_set_height(rowobj, LV_SIZE_CONTENT);
+
+        const bool is_header_row = has_title && seq == 0;
+        const bool is_divider_row = has_title && seq == 1;
+        ++seq;
+
+        if (is_header_row) {
+            RenderColsHeaderRow(rowobj, row_cells, cols_meta);
+            continue;
+        }
+        if (is_divider_row) {
+            RenderColsDividerRow(rowobj, row_cells, viewport_w);
+            continue;
+        }
+
+        for (const cJSON* cellj : row_cells) {
+            int ci = GetInt(cellj, "ci", -2);
+            int x = GetInt(cellj, "x", 0);
+            int w = GetInt(cellj, "w", 0);
+            const char* align_s = GetStr(cellj, "align", "start");
+            const char* wrap_mode = GetStr(cellj, "wrap", "nowrap");
+            if (ci < 0) continue;  // 理论上不会出现在非 header/divider 行；防御性跳过
+
+            const cJSON* leaf = nullptr;
+            if (cells_json) {
+                leaf = cJSON_GetArrayItem(cells_json, ci);
+            } else if (effective_rows) {
+                int r = ci / 100, c = ci % 100;
+                const cJSON* rowarr = cJSON_GetArrayItem(effective_rows, r);
+                leaf = rowarr ? cJSON_GetArrayItem(rowarr, c) : nullptr;
+            }
+            if (!leaf) continue;  // 防御：Validate 已过，理论上不会发生
+
+            if (++node_count > limits.max_nodes) {
+                err = "too many nodes (max " + std::to_string(limits.max_nodes) + ")";
+                if (owned_rows) cJSON_Delete(owned_rows);
+                return nullptr;
+            }
+            lv_obj_t* leafobj = BuildLeafWidget(rowobj, leaf, err);
+            if (!leafobj) {
+                if (owned_rows) cJSON_Delete(owned_rows);
+                return nullptr;
+            }
+            FinishLeafWidget(leafobj, leaf, card, x, w, align_s, wrap_mode);
         }
     }
 
-    // 递归子节点（把本容器的 flow 传给子级做自适应尺寸）
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
-        const cJSON* children = GetItem(node, "children");
-        // row 里 button/choice 是否均分整行取决于这一整行的兄弟构成，扫一遍算一次，传给每个
-        // 孩子（column 场景下这个值是死值，不影响什么）。见 ApplySizing/IsRowGrowConditional。
-        const bool child_row_all_growable =
-            this_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
-        if (children && cJSON_IsArray(children)) {
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) {
-                lv_obj_t* cobj = RenderNode(obj, child, card, limits, depth + 1, node_count, err,
-                                            this_flow, in_list_row, child_row_all_growable);
-                if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
-                ApplyColCrossLabelSizing(cobj, child, node, this_flow);
-            }
-        }
+    if (owned_rows) cJSON_Delete(owned_rows);
+    return gobj;
+}
+
+}  // namespace
+
+// F1 修复：见 pi_card_render.h 头注。单独把 grid_spec 包成一个一元 root 数组喂 solver::Solve
+// （与正式 RenderNode 同一套 Input 参数，只是 root 只有这一个 grid），复用 RenderGridBlock
+// 建控件——保证 rebuild 出来的几何跟"这张卡从头整个重渲一遍"逐位一致，不会因为抄了另一条
+// 路径而在 track 宽度/截断/对齐上跟首次渲染打架。
+lv_obj_t* RebuildBindRowsGrid(lv_obj_t* old_gobj, const cJSON* grid_spec, UiCard* card,
+                              int viewport_w, int gap, const RenderLimits& limits, std::string& err) {
+    lv_obj_t* parent = lv_obj_get_parent(old_gobj);
+    uint32_t idx = lv_obj_get_index(old_gobj);
+    lv_obj_delete(old_gobj);  // 递归删子树；子控件的 DELETE 回调（如有）随之触发，无需手动清理
+
+    cJSON* wrap = cJSON_CreateArray();
+    cJSON_AddItemToArray(wrap, cJSON_Duplicate(grid_spec, 1));
+    solver::Input in;
+    in.root = wrap;
+    in.data = card->data;
+    in.viewport_w = viewport_w;
+    in.gap = gap > 0 ? gap : solver::kStackGap;
+    in.measure = SolverMeasureCb;
+    in.measure_ctx = nullptr;
+    cJSON* layout = solver::Solve(in);
+    const cJSON* layout_grids = GetItem(layout, "grids");
+    const cJSON* layout_grid = layout_grids ? cJSON_GetArrayItem(layout_grids, 0) : nullptr;
+    const cJSON* wrapped_grid = cJSON_GetArrayItem(wrap, 0);
+
+    lv_obj_t* gobj = nullptr;
+    if (layout_grid) {
+        int node_count = 0;
+        gobj = RenderGridBlock(parent, wrapped_grid, layout_grid, card, viewport_w, in.gap,
+                               node_count, limits, err);
+    } else {
+        err = "internal: solver produced no grid for bind_rows rebuild";
     }
-    return obj;
+    cJSON_Delete(layout);
+    cJSON_Delete(wrap);
+    if (gobj) lv_obj_move_to_index(gobj, idx);  // 挪回原来的兄弟顺序位置（delete+create 天然追加到末尾）
+    return gobj;
+}
+
+lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const RenderLimits& limits,
+                     int depth, int& node_count, std::string& err, int parent_flow,
+                     bool in_list_row, bool row_all_growable) {
+    EnsureCardStyles();  // 惰性初始化共享几何样式（首次进入即建，覆盖全部下游入口）
+    (void)depth;
+    (void)parent_flow;
+    (void)in_list_row;
+    (void)row_all_growable;  // v2：树深恒为 2（card -> grid -> leaf），这些旧参数不再有意义，
+                             // 仅为保留签名兼容其余调用点（见任务报告 e/f）。
+    if (!cJSON_IsArray(node)) {
+        err = "root must be an array of grid blocks (v2 schema; run Repair()+Validate() first)";
+        return nullptr;
+    }
+    const int ngrid = cJSON_GetArraySize(node);
+    if (ngrid < 1) {
+        err = "root has no grid blocks";
+        return nullptr;
+    }
+
+    const int viewport_w = ViewportWidthFor(card, parent);
+
+    solver::Input in;
+    in.root = node;
+    in.data = card->data;
+    in.viewport_w = viewport_w;
+    in.gap = solver::kStackGap;
+    in.measure = SolverMeasureCb;
+    in.measure_ctx = nullptr;
+    cJSON* layout = solver::Solve(in);
+    const cJSON* layout_grids = GetItem(layout, "grids");
+
+    lv_obj_t* card_root = lv_obj_create(parent);
+    screen_strip_obj_chrome(card_root);
+    lv_obj_remove_flag(card_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_style(card_root, &s_transp_bg, LV_PART_MAIN);
+    lv_obj_set_width(card_root, viewport_w + 48);  // 48 = 2×24 卡片内边距，呼应旧 depth==0 pad
+    lv_obj_set_height(card_root, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(card_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card_root, solver::kStackGap, LV_PART_MAIN);
+    pi_theme::ApplyBg(card_root, Tok::Card);
+    lv_obj_set_style_bg_opa(card_root, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card_root, 18, LV_PART_MAIN);
+    pi_theme::ApplyBorder(card_root, Tok::Line);
+    lv_obj_set_style_border_width(card_root, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card_root, 24, LV_PART_MAIN);
+
+    int gi = 0;
+    const cJSON* grid_json = nullptr;
+    cJSON_ArrayForEach(grid_json, node) {
+        const cJSON* layout_grid = layout_grids ? cJSON_GetArrayItem(layout_grids, gi) : nullptr;
+        if (!layout_grid) {
+            err = "internal: solver layout/grid count mismatch";
+            cJSON_Delete(layout);
+            return nullptr;
+        }
+        lv_obj_t* gobj = RenderGridBlock(card_root, grid_json, layout_grid, card, viewport_w,
+                                         solver::kStackGap, node_count, limits, err);
+        if (!gobj) {
+            cJSON_Delete(layout);
+            return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
+        }
+        // F1 修复：bind_rows grid 登记一个 List 型 DataConsumer——没有它 ui_update 的
+        // data.append/remove/replace/set 写了 card->data 之后没人触发这个 grid 重渲，工具调用
+        // 却仍回 "(ok)"，LLM 以为生效了、画面纹丝不动（见任务报告根因）。grid_spec 存一份
+        // card-owned 的完整 grid 块 JSON 进 json_pool——原始 spec 树在 OnRenderEvent 里
+        // RenderNode 返回后就地 cJSON_Delete 了，consumer 活得比它长，必须自己持有一份。
+        if (HasKey(grid_json, "bind_rows")) {
+            UiCard::DataConsumer dc;
+            dc.obj = gobj;
+            dc.kind = UiCard::DataConsumer::List;
+            dc.key = GetStr(grid_json, "bind_rows", "");
+            cJSON* spec_dup = cJSON_Duplicate(grid_json, 1);
+            card->json_pool.push_back(spec_dup);
+            dc.grid_spec = spec_dup;
+            dc.viewport_w = viewport_w;
+            dc.gap = solver::kStackGap;
+            dc.limits = limits;
+            card->consumers.push_back(std::move(dc));
+        }
+        ++gi;
+    }
+    cJSON_Delete(layout);
+    return card_root;
 }
 
 // ---------------------------------------------------------------------------
-// 流式生长卡片（改造1）：预览渲染。见 pi_card_render.h 的详细头注。
-// LV_OBJ_FLAG_USER_2：内部惯用记号，标记"这是一个预览容器（column/row），已建成，其
-// user_data 存着一个 committed 游标"——USER_1 已被 choice 占用（pi_card_render.cc:501），
-// 这里换一位不冲突。user_data 的取值语义：这个容器已建出的子节点里，前 committed 个已经
-// 认定不会再变（"定稿"），第 committed 个（若存在）仍是"生长边"，随时可能被继续同步。
-// LV_OBJ_FLAG_USER_3：占位标记（见 MakePreviewPlaceholder）。
-constexpr int kPreviewMaxNodes = 64;
-constexpr int kPreviewMaxDepth = 8;
+// 流式生长卡片 v2（docs/CARD_V2.md §4，改造4）：预览渲染。见 pi_card_render.h 的详细头注。
+// v1 的生长边状态机（RenderPreviewNode/SyncPreviewNode/PreviewSyncContainer/USER_2 标记/
+// s_leaf_sig/RefreshPreviewDataLabels，靠叶子级/容器级增量对齐维持前缀不变量）已整体删除。
+// v2 树深恒为 2（card→grid→leaf），grid 是原子渲染单位：pi_card_preview.cc 按
+// pi_card_preview_sig::GridSignature 判定"这个 grid 变没变"，变了就整块 lv_obj_delete 旧
+// 容器、调用这里的 RenderGridBlockPreview 整块重建；没变就原样不动——不再需要按位置对齐的
+// 逐节点同步，也不再需要 RefreshPreviewDataLabels 那样的全树回刷通道（data 已经折进签名，
+// 迟到时相关 grid 的签名自然变化）。
+namespace {
 
-// 位置占位：list/chart/stock_chart（数据驱动/自管生命周期，预览跳过不建实体）、未知 type、
-// 还没吐出 type 字段、超预算/超深度——这些位置本该"什么都不建"，但那样会打破
-// "LVGL 子节点下标 == JSON 子节点下标"的对齐关系（一旦某个 JSON 孩子没有对应的 lv 孩子，
-// PreviewSyncContainer/SyncPreviewNode 后续按下标定位全错位，可能把别的节点当成这个位置
-// 重渲/误判为已存在）——verify-m2 抓到的真实 bug。改成建一个 0×0、隐藏、不占预算的占位对象
-// 补上这个位置，下一帧只要类型可识别了，SyncPreviewNode 的"existing 类型不符 → 删旧重建"
-// 分支会自然把占位换成真身，无需额外分支。
-lv_obj_t* MakePreviewPlaceholder(lv_obj_t* parent) {
-    lv_obj_t* obj = lv_obj_create(parent);
-    screen_strip_obj_chrome(obj);
-    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_size(obj, 0, 0);
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_USER_3);
-    return obj;
-}
-
-// 预算重算：node_count 在单次 PreviewOnArgs 调用内靠 ++node_count 实时计数（防止一帧里连续
-// 新建/晋升多个节点时超预算），但删除节点时不精确回补（子树到底带走了几个节点不值得追踪，
-// 容易算错——verify-m2 抓到的第二个真实 bug：只减 1，删掉的若是带孙子的子树就会少减）。
-// 每次 PreviewOnArgs 处理完一帧后按当前快照的 JSON 树全量重算一次，作为下一帧的准确起点——
-// 树本就不大（≤64），重算成本可忽略。计数口径见 pi_card_render.h 的声明头注（必须数 JSON
-// 节点，不能数 lv 对象——复合控件的内部对象会把预算数爆）。list 的 item 模板不展开、不递归
-// （预览端 list 本就渲成占位，1 个 JSON 节点对应 1 个占位对象，计 1 是诚实口径）。
-int CountSpecNodes(const cJSON* node) {
-    if (!cJSON_IsObject(node)) return 0;
-    int count = 1;
-    const cJSON* children = GetItem(node, "children");
-    if (children != nullptr && cJSON_IsArray(children)) {
-        const cJSON* c = nullptr;
-        cJSON_ArrayForEach(c, children) count += CountSpecNodes(c);
-    }
-    return count;
-}
-
-
-// 预览容器（column/row）几何：初建（RenderPreviewNode）和生长期每帧幂等重打（见
-// PreviewSyncContainer）共用同一份代码，避免两处各写一份产生行为漂移。宽高/flex flow/gap/
-// justify(主轴)/align(交叉轴) 全是幂等 style setter，不新建/不删除对象、不碰子节点指针——
-// 生长路径上的容器每帧重调完全安全。缺省值与 RenderNode 的缺省一致（column START/START/
-// START、row START/CENTER/CENTER），未知枚举值静默回落（同 RenderNode；预览不做 Lint
-// 提示——那是校验期的事，见 pi_card_render.cc 顶部 Lint 分支）。
-void ApplyPreviewContainerGeom(lv_obj_t* obj, bool is_row, const cJSON* node, int parent_flow) {
-    // 宽度默认口径与 RenderNode 的 column/row 分支一致（见那里、以及 FLOW_COL_CONTENT 枚举头
-    // 注的循环引用说明）：父是 row 或父是内容宽列时内容宽，否则（含顶层）PCT(100)；显式 w 优先。
-    if (HasKey(node, "w")) {
-        lv_obj_set_width(obj, GetInt(node, "w", 0));
-    } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-               parent_flow == FLOW_GRID_AUTO) {
-        lv_obj_set_width(obj, LV_SIZE_CONTENT);
-    } else {
-        lv_obj_set_width(obj, LV_PCT(100));
-    }
-    lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(obj, is_row ? LV_FLEX_FLOW_ROW_WRAP : LV_FLEX_FLOW_COLUMN);
-    int gap = GetInt(node, "gap", 12);
-    lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
-    lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-    lv_flex_align_t main_align = LV_FLEX_ALIGN_START;
-    lv_flex_align_t cross_align = is_row ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START;
-    FlexJustifyOf(GetStr(node, "justify"), main_align);
-    FlexCrossOf(GetStr(node, "align"), cross_align);
-    lv_obj_set_flex_align(obj, main_align, cross_align, cross_align);
-}
-
-// 生长边叶子属性签名缓存，按深度索引——生长边任意时刻只有一条从根到当前生长叶子的路径
-// （PreviewSyncContainer 每层只递归"最后一个孩子"），故 depth 足以唯一定位，不需要按对象
-// 存（叶子对象本身可能因签名变化被删旧重渲，指针不稳定；而且 choice 类型已经借
-// lv_obj_user_data 存 ChoiceCtx，不能再借它塞签名）。新会话的头一帧该深度上 existing 必为
-// nullptr（见 PreviewOnArgs：s_preview.tree 显式清空），天然不会读到上一次会话的陈旧值，故
-// 不需要在会话边界显式清零这个数组。
-uint32_t s_leaf_sig[kPreviewMaxDepth + 1] = {};
-
-// 节点 JSON 紧凑序列化做 FNV-1a 哈希，按调用方需要可选剔除 children/text。label 剔 text
-// （它有原地更新通道，混进签名只会让每帧都判"变了"白白重建）+ 剔 children；button/qrcode 等
-// 其它叶子**必须**把 text 算进签名——它们没有原地文本通道，text 迟到/生长只能靠签名变化触发
-// 删旧重渲（否则按钮文字永远停在建行那一帧，previewfeed 复现过的真实 bug）；grid 整节点全算
-// （children/cols 任一变化都可能整体重排，见 SyncPreviewNode 的 grid 分支）。不用哈希强度换
-// 正确性：碰撞后果只是漏判一次"没变"，晚一帧刷新，无正确性风险（同 TemplateUsesIndex 的
-// "宁可误判、代价可接受"取舍）。
-uint32_t PreviewNodeSignature(const cJSON* node, bool strip_children, bool strip_text) {
-    cJSON* clone = cJSON_Duplicate(node, true);
-    if (!clone) return 0;
-    if (strip_children) cJSON_DeleteItemFromObject(clone, "children");
-    if (strip_text) cJSON_DeleteItemFromObject(clone, "text");
-    char* s = cJSON_PrintUnformatted(clone);
-    cJSON_Delete(clone);
-    if (!s) return 0;
-    uint32_t h = 2166136261u;
-    for (const char* p = s; *p; ++p) {
-        h ^= static_cast<unsigned char>(*p);
-        h *= 16777619u;
-    }
-    cJSON_free(s);
-    return h;
-}
-
-// 尾部不完整 UTF-8 序列剪除后落 label：partial parser 补全未闭合字符串时按字节截断，快照
-// 可能停在多字节字符中间（"三城�"），LVGL 会渲出替换乱码一闪而过。渲进预览 label 前把结尾
-// 那半个字符剪掉（最多回看 3 字节找 lead byte，纯 ASCII 尾部零开销）。只影响预览观感；正式
-// 渲染拿到的是校验过的完整 JSON，不经过这里。
-// heading（puhui_24_4 静态子集字体）的原地文本更新全部收敛到这一个函数（PreviewLabelText 的
-// 静态 text 分支 / PreviewRenderDataLabel 的 bind_data 分支都走它）——流式生长期 label 的字体
-// 只在 RenderPreviewNode 首次建对象时由 ApplyLabelStyle 定过一次，之后签名不变全靠这里原地
-// 更新文本（PreviewNodeSignature 对 label 剔除了 text），不会再回头重新过 SafeFont；若标题
-// 前几个字符恰好是 ASCII/已覆盖汉字、后面才吐出缺字新字符，不在这里补一次检查就会长成
-// "先正常后半句豆腐"。故每次落文本前都用最终（剪过尾）的文本重过一遍 SafeFont，一旦回退到
-// puhui_30_4 就不会再变回 24（font 已不等于 &font_puhui_24_4，判据自然短路）。
-void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
-    size_t len = std::strlen(txt);
-    size_t cut = len;
-    for (size_t back = 1; back <= 3 && back <= len; ++back) {
-        unsigned char c = static_cast<unsigned char>(txt[len - back]);
-        if ((c & 0xC0) == 0x80) continue;  // continuation byte，继续往前找 lead
-        if ((c & 0x80) == 0) break;        // ASCII 收尾：完整，不剪
-        size_t need = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
-        if (need > back) cut = len - back;  // 序列没凑齐字节数 → 从 lead 处剪断
-        break;  // 找到 lead（或非法字节）即定论；再往前都是已完整的字符
-    }
-    const std::string cut_buf = (cut == len) ? std::string() : std::string(txt, cut);
-    const char* final_txt = (cut == len) ? txt : cut_buf.c_str();
-    const lv_font_t* f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
-    if (SafeFont(f, final_txt)) lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
-    lv_label_set_text(lbl, final_txt);
-}
+constexpr int kPreviewMaxNodes = 64;  // 同正式渲染节点上限（§6.1），预览超限静默停止建、不报错
 
 // 预览期 bind 一次性取值（流式期 bind 控件不再空转占位）：不走 Acquire——那会动 refcount、
 // 触发种子/活性刷新、对动态路径还会启动异步拉取，预览"零 bind 零 DataConsumer"的零副作用
@@ -1590,8 +1377,8 @@ void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
 // （getter 均非阻塞、线程安全，在 LVGL 线程跑与在 worker 线程跑等同安全，见 pi_card_data.h
 // 头注），动态路径（stock.*）恒 false、Unsafe/未注册也 false——这些场景返回 false，调用方
 // 维持缺省占位（"--"/0/JSON 静态值），等 adopt 后正式 bind 接管。取值是建控件时的一次快照，
-// 不随流持续刷新（流式期就几秒，不值得为它加订阅生命周期）；label 走每帧原地更新通道，
-// 天然逐帧重读。
+// 不随流持续刷新（同一 grid 只要签名不变就不会重建，值也就不会跟着 DataHub 联动——这是"零
+// 订阅"设计的直接后果，adopt 后正式渲染立刻接管保证最终值正确）。
 bool PreviewPeekInt(const char* path, int& out) {
     if (path == nullptr) return false;
     HubValue v;
@@ -1632,62 +1419,48 @@ bool PreviewSeedBindLabel(lv_obj_t* lbl, const cJSON* node, const char* path) {
     return true;
 }
 
-// ---- 预览期 bind_data 数据标签（值在 args 自己的 "data" 对象里，text 是 {value} 模板）----
-// 难点在流序：顶层 schema 属性序是 root → … → data，data 在整棵 root 之后才吐——root 流完
-// 时数据标签早已渲成 "--" 定稿，data 姗姗来迟没人刷新它们，只能干等 adopt。解法：建标签时
-// 打 LV_OBJ_FLAG_USER_4 + user_data 挂 ctx（key+模板；USER_1 choice/USER_2 预览容器/USER_3
-// 占位均已占用，USER_4 此前空闲；预览 label 的 user_data 空闲——正式渲染的 num-anim ctx 是
-// adopt 后另一棵树的事），每帧 PreviewOnArgs 处理完树同步后全树回刷一遍（≤64 节点走一趟
-// 指针树，代价可忽略；文本没变时跳过 set_text 不白白 invalidate）。
-// s_preview_data 指向 PreviewOnArgs 当帧快照树里的 "data" 对象，帧尾必须清回 nullptr——快照
-// 随后就被 cJSON_Delete，绝不允许跨帧存活（见 PreviewSetData 头注）。
+// 尾部不完整 UTF-8 序列剪除后落 label：partial parser 补全未闭合字符串时按字节截断，快照
+// 可能停在多字节字符中间（"三城�"），LVGL 会渲出替换乱码一闪而过。渲进预览 label/button 前
+// 把结尾那半个字符剪掉（最多回看 3 字节找 lead byte，纯 ASCII 尾部零开销）。只影响预览观感；
+// 正式渲染拿到的是校验过的完整 JSON，不经过这里。
+void SetPreviewLabelText(lv_obj_t* lbl, const char* txt) {
+    size_t len = std::strlen(txt);
+    size_t cut = len;
+    for (size_t back = 1; back <= 3 && back <= len; ++back) {
+        unsigned char c = static_cast<unsigned char>(txt[len - back]);
+        if ((c & 0xC0) == 0x80) continue;  // continuation byte，继续往前找 lead
+        if ((c & 0x80) == 0) break;        // ASCII 收尾：完整，不剪
+        size_t need = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+        if (need > back) cut = len - back;  // 序列没凑齐字节数 → 从 lead 处剪断
+        break;  // 找到 lead（或非法字节）即定论；再往前都是已完整的字符
+    }
+    const std::string cut_buf = (cut == len) ? std::string() : std::string(txt, cut);
+    const char* final_txt = (cut == len) ? txt : cut_buf.c_str();
+    const lv_font_t* f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+    if (SafeFont(f, final_txt)) lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+    lv_label_set_text(lbl, final_txt);
+}
+
+// 预览期 bind_data 上下文：PreviewSetData/PreviewOnArgs 每帧把快照顶层 "data" 对象借出，
+// 建标签时一次性直读（不是通道式回刷——data 变化会让引用它的 grid 签名变化、整块重渲，见
+// pi_card_preview_sig.h 头注）；帧尾必须清空，指针不许跨帧存活。
 const cJSON* s_preview_data = nullptr;
 
-struct PreviewDataLabelCtx {
-    std::string key;
-    std::string tpl;
-};
-
-void PreviewDataLabelFreeCb(lv_event_t* e) {
-    lv_obj_t* lbl = static_cast<lv_obj_t*>(lv_event_get_target(e));
-    delete static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(lbl));
-}
-
-void PreviewRenderDataLabel(lv_obj_t* lbl, const PreviewDataLabelCtx& ctx) {
-    std::string txt = "--";  // data 还没流到这个键：占位，绝不裸渲 "{value}%" 模板
-    if (const cJSON* v = s_preview_data ? GetItem(s_preview_data, ctx.key.c_str()) : nullptr) {
-        txt = ctx.tpl.empty() ? Stringify(v) : SubstDataValue(ctx.tpl, v);
-    }
-    if (std::strcmp(lv_label_get_text(lbl), txt.c_str()) != 0) SetPreviewLabelText(lbl, txt.c_str());
-}
-
-// 建 ctx（无则挂新、有则更新 key/模板——生长边 label 的 text 模板可能还在逐字吐）并渲一次。
-void PreviewBindDataLabel(lv_obj_t* lbl, const char* key, const char* tpl) {
-    PreviewDataLabelCtx* ctx = lv_obj_has_flag(lbl, LV_OBJ_FLAG_USER_4)
-                                   ? static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(lbl))
-                                   : nullptr;
-    if (ctx == nullptr) {
-        ctx = new PreviewDataLabelCtx();
-        lv_obj_set_user_data(lbl, ctx);
-        lv_obj_add_flag(lbl, LV_OBJ_FLAG_USER_4);
-        lv_obj_add_event_cb(lbl, PreviewDataLabelFreeCb, LV_EVENT_DELETE, nullptr);
-    }
-    ctx->key = key;
-    ctx->tpl = tpl != nullptr ? tpl : "";
-    PreviewRenderDataLabel(lbl, *ctx);
-}
-
-// 预览 label 文本统一决策，镜像正式渲染优先级：bind（DataHub 快照）> bind_data（partial data
+// 预览 label 文本决策，镜像正式渲染优先级：bind（DataHub 快照）> bind_data（partial data
 // 直读）> 静态 text。bind/bind_data 取不到值时 "--" 占位；静态 text 含 {value}/{v} 视为
-// bind_data 键还没流完的半成品模板，同样占位不裸渲（键到齐后签名变化会重渲走正路）。
-// 建标签（RenderPreviewNode）与原地更新（SyncPreviewNode）共用，保证两条路径口径一致。
+// bind_data 键还没流完的半成品模板，同样占位不裸渲。
 void PreviewLabelText(lv_obj_t* lbl, const cJSON* node) {
     if (const char* bind = GetStr(node, "bind")) {
         if (!PreviewSeedBindLabel(lbl, node, bind)) lv_label_set_text(lbl, "--");
         return;
     }
     if (const char* dk = GetStr(node, "bind_data")) {
-        PreviewBindDataLabel(lbl, dk, GetStr(node, "text"));
+        std::string txt = "--";
+        if (const cJSON* v = s_preview_data ? GetItem(s_preview_data, dk) : nullptr) {
+            const char* tpl = GetStr(node, "text");
+            txt = tpl ? SubstDataValue(tpl, v) : Stringify(v);
+        }
+        SetPreviewLabelText(lbl, txt.c_str());
         return;
     }
     if (const char* txt = GetStr(node, "text")) {
@@ -1701,145 +1474,15 @@ void PreviewLabelText(lv_obj_t* lbl, const cJSON* node) {
     lv_label_set_text(lbl, "");  // text/bind/bind_data 全都还没流出来：置空，别渲 LVGL 默认 "Text"
 }
 
-void PreviewSetData(const cJSON* data) { s_preview_data = cJSON_IsObject(data) ? data : nullptr; }
-
-void RefreshPreviewDataLabels(lv_obj_t* obj) {
-    if (obj == nullptr) return;
-    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_4)) {
-        if (auto* ctx = static_cast<PreviewDataLabelCtx*>(lv_obj_get_user_data(obj))) {
-            PreviewRenderDataLabel(obj, *ctx);
-        }
-    }
-    uint32_t n = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < n; i++) RefreshPreviewDataLabels(lv_obj_get_child(obj, i));
-}
-
-lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int& node_count,
-                            int parent_flow, bool row_all_growable) {
-    EnsureCardStyles();  // 惰性初始化共享几何样式——预览是独立入口，RenderNode 从未跑过时也得有这行
-    if (!cJSON_IsObject(node)) return MakePreviewPlaceholder(parent);
-    if (depth > kPreviewMaxDepth) return MakePreviewPlaceholder(parent);
+// 预览专用叶子构造：与 BuildLeafWidget 同构（12 种类型中的 10 种——chart/stock_chart 数据
+// 驱动或有网络副作用，预览期跳过不建、留空位，见函数头注），零 bind/事件/DataConsumer 注册，
+// 值用上面几个"快照直读"辅助函数取。返回 nullptr 表示"这个位置预览期不建实体"（不是错误）。
+lv_obj_t* BuildLeafWidgetPreview(lv_obj_t* parent, const cJSON* node) {
     const char* type = GetStr(node, "type");
-    if (!type) return MakePreviewPlaceholder(parent);  // type 键还没吐出来：占位等下一帧。注意
-                                // partial parser 会补全未闭合的字符串**值**（半吐的 type 如
-                                // "labe 是会出现的），那种落到下方"未知 type"分支同样占位，
-                                // 下一帧吐全后经签名变化换成真身；只有半吐的 key 才被丢弃。
-    if (std::strcmp(type, "list") == 0 || std::strcmp(type, "chart") == 0 ||
-        std::strcmp(type, "stock_chart") == 0) {
-        return MakePreviewPlaceholder(parent);  // 数据驱动/自管生命周期类型：预览没有
-                         // card->data、没有 DataHub 订阅上下文，占位、不建实体、不占预算。
-    }
-    // 预算耗尽：占位停止生长，不报错。阈值放 2×：帧内是"先删旧再重渲"的滚动计数（grid 整块
-    // 重建时旧子树的计数还没被帧尾重算冲掉，新子树又全额 ++），贴着 64 卡会让接近满额的卡
-    // 在最后一次 grid 重建时误伤真节点——留一倍瞬时余量，真正的失控流仍被兜住；帧尾
-    // CountSpecNodes 会把口径拉回真实 JSON 节点数。
-    if (node_count >= kPreviewMaxNodes * 2) return MakePreviewPlaceholder(parent);
-
+    if (type == nullptr) return nullptr;  // 半吐的 cell（type 键还没吐出来）：安静跳过
     lv_obj_t* obj = nullptr;
-    const bool is_container = std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0;
-
-    if (is_container) {
-        const bool is_row = std::strcmp(type, "row") == 0;
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        ApplyPreviewContainerGeom(obj, is_row, node, parent_flow);
-    } else if (std::strcmp(type, "grid") == 0) {
-        // 预览版 grid：镜像 RenderNode 的 grid 分支（行主序自动放置 + span + 轨道 dsc 堆分配随
-        // DELETE 释放），去掉 bind/事件/id。流式期 cols 可能整个还没吐——一列都没有就占位等待
-        // （同"type 未吐"口径）；只吐了前缀就按前缀列数布局，签名含整个节点（见 SyncPreviewNode
-        // 的 grid 分支），cols/children 每变一次整块重建，最终收敛到与正式渲染一致的形状。
-        // 正式渲染有 Validate 兜底保证 cols 元素合法，这里没有——非法元素（半吐的 "aut"、越界
-        // 数值）按 fr 1 容错，不报错（预览不是校验器）。
-        const cJSON* cols = GetItem(node, "cols");
-        const int ncol = (cols && cJSON_IsArray(cols)) ? cJSON_GetArraySize(cols) : 0;
-        if (ncol < 1) return MakePreviewPlaceholder(parent);
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        // 默认宽口径镜像 RenderNode 的 grid 分支（见那里的头注）。
-        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
-        else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                 parent_flow == FLOW_GRID_AUTO)
-            lv_obj_set_width(obj, LV_SIZE_CONTENT);
-        else
-            lv_obj_set_width(obj, LV_PCT(100));
-        lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
-        int gap = GetInt(node, "gap", 12);
-        lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
-        lv_obj_set_style_pad_column(obj, gap, LV_PART_MAIN);
-
-        auto* dsc = new GridDsc();
-        dsc->cols.reserve(ncol + 1);
-        const cJSON* cel = nullptr;
-        cJSON_ArrayForEach(cel, cols) {
-            if (cJSON_IsString(cel)) dsc->cols.push_back(LV_GRID_CONTENT);  // "auto"：按内容宽
-            else if (cJSON_IsNumber(cel) && cel->valueint >= 1 && cel->valueint <= 20)
-                dsc->cols.push_back(LV_GRID_FR(cel->valueint));
-            else dsc->cols.push_back(LV_GRID_FR(1));  // 半吐/非法：fr 1 容错
-        }
-        dsc->cols.push_back(LV_GRID_TEMPLATE_LAST);
-
-        const cJSON* children = GetItem(node, "children");
-        auto place_next = [ncol](int span, int& cur, int& cur_row, int& col_out, int& row_out) {
-            if (span < 1) span = 1;
-            if (span > ncol) span = ncol;
-            if (cur + span > ncol) { ++cur_row; cur = 0; }  // 本行放不下 → 换到下一行
-            col_out = cur;
-            row_out = cur_row;
-            cur += span;
-            if (cur >= ncol) { ++cur_row; cur = 0; }  // 填满 → 为下一 cell 进位
-            return span;
-        };
-        int cursor = 0, cur_row = 0, col_out = 0, row_out = 0;
-        const cJSON* ch = nullptr;
-        cJSON_ArrayForEach(ch, children) place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
-        int nrow = (cursor > 0) ? cur_row + 1 : cur_row;  // 末行未满也计一行
-        if (nrow < 1) nrow = 1;
-        dsc->rows.assign(static_cast<size_t>(nrow), LV_GRID_CONTENT);
-        dsc->rows.push_back(LV_GRID_TEMPLATE_LAST);
-        lv_obj_set_grid_dsc_array(obj, dsc->cols.data(), dsc->rows.data());
-        lv_obj_add_event_cb(obj, GridDscFreeCb, LV_EVENT_DELETE, dsc);
-
-        cursor = 0;
-        cur_row = 0;
-        cJSON_ArrayForEach(ch, children) {
-            int span = place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
-            // FLOW_GRID/FLOW_GRID_AUTO：子项跳过全部 flex 尺寸默认（同正式渲染），宽度语义归
-            // set_grid_cell 的 col_align 管；STRETCH/START 判据逐字镜像 RenderNode 的 grid 分支
-            // （容器 FR 轨 STRETCH、auto 轨 START+内容宽，见 FLOW_GRID_AUTO 头注）。
-            const bool cell_auto = GridCellOnAutoTrack(cols, col_out, span);
-            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count,
-                                               cell_auto ? FLOW_GRID_AUTO : FLOW_GRID);  // 失败即占位，永不 null
-            // 口径同 RenderNode 的 grid 分支：带 bind/bind_data 的 label 不 STRETCH，防
-            // "空文本量列 → 0 宽钉死 → 数据到了逐字竖排"的 auto 列塌缩（见那里的头注）。
-            const char* ct = GetStr(ch, "type");
-            const bool dyn_label = ct != nullptr && std::strcmp(ct, "label") == 0 &&
-                                   (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
-            lv_grid_align_t col_align = LV_GRID_ALIGN_START;
-            if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
-                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0 ||
-                 (IsContainerType(ct) && !cell_auto))) {
-                col_align = LV_GRID_ALIGN_STRETCH;
-            }
-            lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
-        }
-    } else if (std::strcmp(type, "label") == 0) {
+    if (std::strcmp(type, "label") == 0) {
         obj = lv_label_create(parent);
-        // 口径同 RenderNode：行内 label 夹像素钳宽 + 单行收口，避免超长文本把 button 等
-        // 兄弟挤到下一行（坑F）；列内保持原 WRAP 换行。像素钳宽/动态 label 用 CLIP 的
-        // 原因见 RenderNode 的 label 分支头注（PCT 在内容宽 row 塌 0、LONG_DOT 与
-        // set_text_fmt 组合会让陈旧 dot 备份污染新文本——预览的 PreviewSeedBindLabel/
-        // 每帧原地更新同样走 set_text_fmt，一样中招）。
-        if (parent_flow == FLOW_ROW) {
-            lv_obj_set_style_max_width(obj, kRowLabelMaxWidthPx, LV_PART_MAIN);
-            const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
-            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
-        } else {
-            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
-        }
         ApplyLabelStyle(obj, node);  // 先落字体/角色，PreviewSeedBindLabel 的 SafeFont 才有正确基准
         PreviewLabelText(obj, node);
     } else if (std::strcmp(type, "icon") == 0) {
@@ -1920,210 +1563,209 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         lv_obj_set_height(obj, 1);
         pi_theme::ApplyBg(obj, Tok::Line);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
-    } else if (std::strcmp(type, "spacer") == 0) {
-        obj = lv_obj_create(parent);
-        screen_strip_obj_chrome(obj);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_size(obj, 0, 0);
     } else {
-        return MakePreviewPlaceholder(parent);  // 未知 type：预览静默跳过，不当错误（不是校验器）
+        return nullptr;  // chart/stock_chart（数据驱动/有网络副作用）、未知/半吐 type：跳过不建
     }
-    if (!obj) return MakePreviewPlaceholder(parent);  // OOM 兜底
+    return obj;
+}
 
-    ++node_count;
-    ApplyDefaultStyle(obj, type, depth);  // depth==0 时含卡片外观（底色+圆角+边框+内边距）
-    // 预览版通用属性：只要外观相关的 pad/fill/hidden，不登记 id（预览没有 card->nodes）。
-    if (HasKey(node, "pad")) lv_obj_set_style_pad_all(obj, GetInt(node, "pad", 0), LV_PART_MAIN);
-    ApplyFill(obj, node);
-    if (GetBool(node, "hidden")) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    // 自适应尺寸按真实父容器主轴走（曾经统一按 FLOW_COL 近似——row 里铺满宽的 label 会把
-    // icon+标题挤成两行，adopt 才并回一行，真机抓到的跳变；现与正式渲染同口径）。
-    ApplySizing(obj, type, node, parent_flow, row_all_growable);
+// 落位 + 外观收尾（无 bind/事件/DataConsumer 注册）：口径同 FinishLeafWidget，去掉 card 相关的
+// 一切（ApplyBind/AttachEvent/DataConsumer/死控件判定）。wrap_mode 语义同 FinishLeafWidget；
+// 预览路径原本就不钳高（流式生长期间高度本就在变，钳死一行反而跟"随内容自然生长"的预览定位
+// 冲突），这里维持这个既有取舍，只是判定依据从 role 猜测换成 solver 回填的 wrap 字段。
+void FinishLeafWidgetPreview(lv_obj_t* obj, const cJSON* node, int x, int w, const char* align,
+                             const char* wrap_mode) {
+    const char* type = GetStr(node, "type");
+    lv_obj_set_pos(obj, x, 0);
+    if (!std::strcmp(type, "arc") || !std::strcmp(type, "qrcode")) {
+        if (w > 0) lv_obj_set_size(obj, w, w);
+    } else if (!std::strcmp(type, "divider")) {
+        if (w > 0) lv_obj_set_width(obj, w);
+    } else if (std::strcmp(type, "icon") != 0 && w > 0) {
+        lv_obj_set_width(obj, w);
+    }
+    if (!std::strcmp(type, "label")) {
+        const bool right = align && !std::strcmp(align, "end");
+        if (right) lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        const bool dynamic_text = GetStr(node, "bind") || GetStr(node, "bind_data");
+        const bool ellipsis = wrap_mode && !std::strcmp(wrap_mode, "ellipsis");
+        if (ellipsis) {
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
+        } else {
+            lv_label_set_long_mode(obj, dynamic_text ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_WRAP);
+        }
+    }
+    ApplyDefaultStyle(obj, type, /*depth=*/1);
+}
 
-    if (is_container) {
-        const bool is_row_type = std::strcmp(type, "row") == 0;
-        // 口径同 RenderNode：本容器若是内容宽列（父是 row/内容宽列、自己无显式 w/grow），
-        // 子节点传 FLOW_COL_CONTENT 而非普通 FLOW_COL，打破"父等子内容、子等父 100%"循环
-        // 引用（见 FLOW_COL_CONTENT 枚举头注）。
-        const bool col_content_width = !is_row_type &&
-                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                                        parent_flow == FLOW_GRID_AUTO) &&
-                                       !HasKey(node, "w") && !HasKey(node, "grow");
-        const int child_flow =
-            is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
-        const cJSON* children = GetItem(node, "children");
-        // 口径同 RenderNode：row 里 button/choice 均分整行还是内容自适应宽，取决于这一行当前
-        // 已知的兄弟构成，扫一遍传给每个孩子。
-        const bool child_row_all_growable =
-            child_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
-        if (children && cJSON_IsArray(children)) {
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) {
-                lv_obj_t* cobj = RenderPreviewNode(obj, child, depth + 1, node_count, child_flow,
-                                                   child_row_all_growable);  // 静默跳过失败子节点
-                ApplyColCrossLabelSizing(cobj, child, node, child_flow);
+}  // namespace
+
+lv_obj_t* MakePreviewCardRoot(lv_obj_t* parent, int viewport_w) {
+    EnsureCardStyles();
+    // 镜像 RenderNode 顶层 card_root 的建法（圆角/边框/pad/竖排间距）——两处刻意保持同一份视觉
+    // 常量，adopt 换装时观感零跳变；card_root 外观与 UiCard 无关，不需要card 指针。
+    lv_obj_t* card_root = lv_obj_create(parent);
+    screen_strip_obj_chrome(card_root);
+    lv_obj_remove_flag(card_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_style(card_root, &s_transp_bg, LV_PART_MAIN);
+    lv_obj_set_width(card_root, viewport_w + 48);  // 48 = 2×24 卡片内边距，呼应 RenderNode
+    lv_obj_set_height(card_root, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(card_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card_root, solver::kStackGap, LV_PART_MAIN);
+    pi_theme::ApplyBg(card_root, Tok::Card);
+    lv_obj_set_style_bg_opa(card_root, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card_root, 18, LV_PART_MAIN);
+    pi_theme::ApplyBorder(card_root, Tok::Line);
+    lv_obj_set_style_border_width(card_root, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card_root, 24, LV_PART_MAIN);
+    return card_root;
+}
+
+lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, const cJSON* data,
+                                 int viewport_w, int gap) {
+    EnsureCardStyles();
+    solver::Input in;
+    cJSON* one = cJSON_CreateArray();
+    cJSON_AddItemReferenceToArray(one, const_cast<cJSON*>(grid_json));  // 引用，Delete(one) 不连累 grid_json
+    in.root = one;
+    in.data = data;
+    in.viewport_w = viewport_w;
+    in.gap = gap;
+    in.measure = SolverMeasureCb;
+    in.measure_ctx = nullptr;
+    cJSON* layout = solver::Solve(in);
+    const cJSON* layout_grid = cJSON_GetArrayItem(GetItem(layout, "grids"), 0);
+
+    lv_obj_t* gobj = lv_obj_create(card_root);
+    screen_strip_obj_chrome(gobj);
+    lv_obj_remove_flag(gobj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_style(gobj, &s_transp_bg, LV_PART_MAIN);
+    lv_obj_set_width(gobj, viewport_w);
+    lv_obj_set_height(gobj, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
+    ApplyFill(gobj, grid_json);
+
+    if (!layout_grid) {
+        cJSON_Delete(layout);
+        cJSON_Delete(one);
+        return gobj;  // solver 没吐出这个 grid 的 layout（不该发生，防御性早退，留空盒子）
+    }
+
+    const cJSON* cells_json = GetItem(grid_json, "cells");
+    const cJSON* rows_json = GetItem(grid_json, "rows");
+    cJSON* owned_rows = nullptr;
+    const cJSON* effective_rows = nullptr;
+    if (cJSON_IsArray(rows_json)) {
+        effective_rows = rows_json;
+    } else if (HasKey(grid_json, "bind_rows")) {
+        owned_rows = BuildBindRowsForRender(grid_json, data);  // card-agnostic，正式/预览共用
+        effective_rows = owned_rows;
+    }
+    const cJSON* cols_meta = GetItem(grid_json, "cols");
+    bool has_title = false;
+    if (cJSON_IsArray(cols_meta)) {
+        const cJSON* cd = nullptr;
+        cJSON_ArrayForEach(cd, cols_meta)
+            if (GetStr(cd, "title")) has_title = true;
+    }
+
+    std::map<int, std::vector<const cJSON*>> by_row;
+    const cJSON* lc = nullptr;
+    cJSON_ArrayForEach(lc, GetItem(layout_grid, "cells")) { by_row[GetInt(lc, "row", 0)].push_back(lc); }
+
+    int seq = 0;
+    int node_count = 0;
+    for (auto& kv : by_row) {
+        std::vector<const cJSON*>& row_cells = kv.second;
+        lv_obj_t* rowobj = lv_obj_create(gobj);
+        screen_strip_obj_chrome(rowobj);
+        lv_obj_remove_flag(rowobj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_style(rowobj, &s_transp_bg, LV_PART_MAIN);
+        lv_obj_set_width(rowobj, viewport_w);
+        lv_obj_set_height(rowobj, LV_SIZE_CONTENT);
+
+        const bool is_header_row = has_title && seq == 0;
+        const bool is_divider_row = has_title && seq == 1;
+        ++seq;
+
+        if (is_header_row) {
+            RenderColsHeaderRow(rowobj, row_cells, cols_meta);
+            continue;
+        }
+        if (is_divider_row) {
+            RenderColsDividerRow(rowobj, row_cells, viewport_w);
+            continue;
+        }
+
+        for (const cJSON* cellj : row_cells) {
+            if (node_count >= kPreviewMaxNodes) break;  // 预算耗尽：静默停止生长，不报错
+            int ci = GetInt(cellj, "ci", -2);
+            int x = GetInt(cellj, "x", 0);
+            int w = GetInt(cellj, "w", 0);
+            const char* align_s = GetStr(cellj, "align", "start");
+            const char* wrap_mode = GetStr(cellj, "wrap", "nowrap");
+            if (ci < 0) continue;
+
+            const cJSON* leaf = nullptr;
+            if (cells_json) {
+                leaf = cJSON_GetArrayItem(cells_json, ci);
+            } else if (effective_rows) {
+                int r = ci / 100, c = ci % 100;
+                const cJSON* rowarr = cJSON_GetArrayItem(effective_rows, r);
+                leaf = rowarr ? cJSON_GetArrayItem(rowarr, c) : nullptr;
             }
+            if (!leaf) continue;
+
+            lv_obj_t* leafobj = BuildLeafWidgetPreview(rowobj, leaf);
+            if (!leafobj) continue;  // chart/stock_chart/半吐 type：跳过不建，不是错误
+            ++node_count;
+            FinishLeafWidgetPreview(leafobj, leaf, x, w, align_s, wrap_mode);
         }
-        // 打预览容器记号 + 记 committed 游标：认定最后一个已建子节点仍是"生长边"，留给下次
-        // SyncPreviewNode/PreviewSyncContainer 继续对齐——无论这个容器是本次整棵新建、还是
-        // 上一轮生长边刚定形被 RenderPreviewNode 整棵重渲，规则统一，不需要区分调用来源。
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_USER_2);
-        int built = lv_obj_get_child_count(obj);
-        lv_obj_set_user_data(obj, reinterpret_cast<void*>(static_cast<intptr_t>(built > 0 ? built - 1 : 0)));
     }
-    return obj;
+
+    if (owned_rows) cJSON_Delete(owned_rows);
+    cJSON_Delete(layout);
+    cJSON_Delete(one);
+    return gobj;
 }
 
-lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* node_spec, int depth,
-                          int& node_count, int parent_flow, bool row_all_growable) {
-    const char* type = GetStr(node_spec, "type");
-    if (!type) {
-        // 类型还没吐出来：维持原状——但这个位置必须有个占位对齐下标（首次到达这个位置，
-        // existing 为 null 时补一个；已经有占位/半成品的话别重建，留着它，等类型可识别再换）。
-        return existing ? existing : MakePreviewPlaceholder(parent);
-    }
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
-        if (existing && lv_obj_has_flag(existing, LV_OBJ_FLAG_USER_2)) {
-            PreviewSyncContainer(existing, node_spec, depth, node_count, parent_flow);
-            return existing;  // 指针不变——递归深入继续生长，不推倒重来
+int CountSpecNodes(const cJSON* node) {
+    // v2：node 是信封的 "root" 数组（grid 块列表）。逐 grid 累计其 cells/rows/bind_rows 展开
+    // 后的叶子数——口径必须与 kMaxGrids/64 节点上限同源（§6.1），bind_rows 按 max×行 cell 数
+    // 预留（EffMax 已经把 max 夹在 [1,20]，与 Validate 的口径一致）。
+    if (!cJSON_IsArray(node)) return 0;
+    int count = 0;
+    const cJSON* grid = nullptr;
+    cJSON_ArrayForEach(grid, node) {
+        ++count;  // grid 块自身也计一个节点（与 RenderGridBlockPreview 的 kPreviewMaxNodes 口径
+                  // 松弛对齐；grid 数已经另有 kMaxGrids 上限，这里的 +1 只是让口径不低估）。
+        const cJSON* cells = GetItem(grid, "cells");
+        if (cJSON_IsArray(cells)) {
+            count += cJSON_GetArraySize(cells);
+            continue;
         }
-        if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算，不在此回补
-        return RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
-    }
-    if (std::strcmp(type, "grid") == 0) {
-        // grid 不做逐子增量生长：行主序落位使 cols/children/span 任一变化都可能让所有 cell
-        // 整体重排（换行点漂移），逐位对齐得不偿失。整节点签名（不剔 children/text），变了
-        // 删旧整块重建——规模受预览预算（≤64 节点）约束，重建成本可忽略；快照没碰这个子树
-        // 时签名不变，原对象一动不动。
-        const uint32_t sig = PreviewNodeSignature(node_spec, false, false);
-        const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
-        if (existing && cacheable && s_leaf_sig[depth] == sig) return existing;
-        if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
-        if (cacheable) s_leaf_sig[depth] = sig;
-        return obj;
-    }
-    // 叶子（含 label）：属性签名变化 → 删旧重渲，把 role/tone/grow/w/h/size/mono/fill/icon/
-    // hidden 等一切"比 text 晚到"的属性一次性补齐（改造1 遗留的"迟到属性"问题）。签名口径
-    // 分型：label 剔 text（有原地更新通道，签名不变时走下方原地文本更新，长文本不闪烁）；
-    // 其它叶子（button/qrcode…）text 算进签名——它们没有原地通道，text 生长只能靠签名变化
-    // 触发重渲。按深度缓存签名，同一生长路径上一帧写、下一帧读，见 PreviewNodeSignature/
-    // s_leaf_sig 头注；depth 超出缓存范围（罕见的最大嵌套边界）时放弃比较、总是重渲，与
-    // RenderPreviewNode 在超深度时整体放弃生长的口径一致。
-    const bool is_label = std::strcmp(type, "label") == 0;
-    const uint32_t sig = PreviewNodeSignature(node_spec, true, is_label);
-    const bool cacheable = depth >= 0 && depth <= kPreviewMaxDepth;
-    const bool same_sig = existing && cacheable && s_leaf_sig[depth] == sig;
-
-    if (is_label) {
-        if (same_sig && lv_obj_check_type(existing, &lv_label_class)) {
-            PreviewLabelText(existing, node_spec);  // 含 bind 快照重读/bind_data ctx 更新/模板护栏
-            return existing;  // 原地更新文本，不重建——长文本不闪烁
+        const cJSON* rows = GetItem(grid, "rows");
+        if (cJSON_IsArray(rows)) {
+            const cJSON* row = nullptr;
+            cJSON_ArrayForEach(row, rows) {
+                if (cJSON_IsArray(row)) count += cJSON_GetArraySize(row);
+            }
+            continue;
         }
-        if (existing) lv_obj_delete(existing);
-        lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
-        if (cacheable) s_leaf_sig[depth] = sig;
-        return obj;
+        if (HasKey(grid, "bind_rows")) {
+            const cJSON* item = GetItem(grid, "item");
+            int item_cells = cJSON_IsArray(item) ? cJSON_GetArraySize(item) : 1;
+            int max = HasKey(grid, "max") ? GetInt(grid, "max", 20) : 20;
+            if (max < 1) max = 1;
+            if (max > 20) max = 20;
+            count += max * item_cells;
+        }
     }
-    // 其它叶子类型（button/icon/slider/arc/bar/switch/qrcode/choice/divider/spacer）：没有
-    // label 那样的原地更新通道，签名不变原对象不动（同一位置一直是"生长边"时，row 组成没变，
-    // 旧对象的 grow 状态就是最后一次用正确的 row_all_growable 算出来的，不必重算）、变了删旧
-    // 重渲（这条路径含 button/choice——重渲会用调用方最新算出的 row_all_growable 重新定尺寸，
-    // 见 PreviewSyncContainer 的"定稿"循环：一旦本行来了新兄弟，旧的生长边会被强制删旧重渲）。
-    if (same_sig) return existing;
-    if (existing) lv_obj_delete(existing);
-    lv_obj_t* obj = RenderPreviewNode(parent, node_spec, depth, node_count, parent_flow, row_all_growable);
-    if (cacheable) s_leaf_sig[depth] = sig;
-    return obj;
+    return count;
 }
 
-void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, int depth,
-                          int& node_count, int parent_flow) {
-    if (depth > kPreviewMaxDepth) return;
-    // 生长路径容器每帧幂等重打容器级属性：gap/pad/fill/bg/w/grow/justify/align/hidden + 顶层
-    // 卡片外观。SyncPreviewNode 已保证走到这里 type 一定是 column/row，以下全是幂等 style
-    // setter/flag，不新建/不删除对象、不碰子节点指针——覆盖"justify/align 等迟到属性只有
-    // adopt 那一刻才生效"的问题（container 版；叶子版见 SyncPreviewNode 的签名重渲）。hidden
-    // 单独拎出来双向纠正（不是"缺省不动"）：AI_TO_UI 文档明载"hidden:true 的块做展开详情"
-    // 这个用法，容器的 hidden 迟到会让本该藏起来的详情块生长期先闪现再消失，观感比不做还差。
-    const char* type = GetStr(json_container, "type");
-    ApplyPreviewContainerGeom(lv_container, std::strcmp(type, "row") == 0, json_container, parent_flow);
-    ApplyDefaultStyle(lv_container, type, depth);
-    if (HasKey(json_container, "pad")) {
-        lv_obj_set_style_pad_all(lv_container, GetInt(json_container, "pad", 0), LV_PART_MAIN);
-    }
-    ApplyFill(lv_container, json_container);
-    ApplySizing(lv_container, type, json_container, parent_flow);
-    if (GetBool(json_container, "hidden")) lv_obj_add_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_remove_flag(lv_container, LV_OBJ_FLAG_HIDDEN);
-
-    const bool is_row_type = std::strcmp(type, "row") == 0;
-    // 口径同 RenderNode/RenderPreviewNode：本容器若是内容宽列，子节点传 FLOW_COL_CONTENT 打破
-    // 循环引用（见 FLOW_COL_CONTENT 枚举头注）。
-    const bool col_content_width = !is_row_type &&
-                                   (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
-                                    parent_flow == FLOW_GRID_AUTO) &&
-                                   !HasKey(json_container, "w") && !HasKey(json_container, "grow");
-    const int child_flow =
-        is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
-    const cJSON* children = GetItem(json_container, "children");
-    // 口径同 RenderNode/RenderPreviewNode：按这一行**当前已知**的全部 children（定稿区+生长边）
-    // 算一次是否清一色 growable，本帧内统一用这个值——这正是"button 先 grow、label 追加后收回"
-    // 得以成立的关键：label 一旦进入 children 数组（哪怕还在生长边位置、属性没吐全），本帧算出
-    // 的 row_all_growable 就是 false，下面 while 循环会把此前已建的 button 强制删旧重渲成
-    // 内容自适应宽。
-    const bool child_row_all_growable =
-        child_flow == FLOW_ROW ? RowChildrenAllGrowable(children) : true;
-    int n = (children && cJSON_IsArray(children)) ? cJSON_GetArraySize(children) : 0;
-    if (n == 0) return;  // 还没孩子，等下一帧
-    intptr_t committed = reinterpret_cast<intptr_t>(lv_obj_get_user_data(lv_container));
-    int lv_n = lv_obj_get_child_count(lv_container);
-
-    // 已建子对象的 grow 幂等纠偏（verifier 抓到的真实 bug）：下面的 while 循环只重渲"定稿
-    // 游标"位置，行内更早、已经冻结进定稿区的 button/choice 子对象不会被再摸一次——若它们是
-    // 在本行还清一色 growable 时建的（那时 grow=1 是对的），后来行里追加了非 growable 兄弟
-    // （label 等）使 child_row_all_growable 翻成 false，这些更早的兄弟就会残留过期的 grow=1。
-    // row 一旦混排，mixed 状态单调不可逆（定稿区内容只增不改型，不会倒退回清一色），故只需
-    // 单向纠偏：混排时把已建的 button/choice（且 JSON 未显式给 grow/w）清 grow=0；反向（重新
-    // 变回清一色）不会发生，不需要处理。
-    if (!child_row_all_growable) {
-        const int scan_n = std::min(lv_n, n);
-        for (int i = 0; i < scan_n; i++) {
-            const cJSON* cj = cJSON_GetArrayItem(children, i);
-            const char* ct = GetStr(cj, "type");
-            if (ct == nullptr || !IsRowGrowConditional(ct)) continue;
-            if (HasKey(cj, "grow") || HasKey(cj, "w")) continue;  // 显式给过，不覆盖
-            if (lv_obj_t* existing_child = lv_obj_get_child(lv_container, static_cast<uint32_t>(i)))
-                lv_obj_set_flex_grow(existing_child, 0);
-        }
-    }
-
-    // 1) 定稿区 [committed, n-2]：这些位置后面已经出现了更晚的兄弟，证明不会再变了——逐个
-    //    渲染成最终形（若该位是上一轮生长边留下的半成品，先删再重渲）。
-    while (committed < n - 1) {
-        if (committed < lv_n) {
-            lv_obj_t* existing = lv_obj_get_child(lv_container, static_cast<uint32_t>(committed));
-            if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算
-            lv_n = lv_obj_get_child_count(lv_container);
-        }
-        const cJSON* cj = cJSON_GetArrayItem(children, static_cast<int>(committed));
-        lv_obj_t* cobj = RenderPreviewNode(lv_container, cj, depth + 1, node_count, child_flow,
-                                           child_row_all_growable);
-        ApplyColCrossLabelSizing(cobj, cj, json_container, child_flow);
-        lv_n = lv_obj_get_child_count(lv_container);
-        committed++;
-    }
-
-    // 2) 生长边（第 n-1 个）：find-or-create，递归/原地更新/删旧重建三选一（见 SyncPreviewNode）。
-    lv_obj_t* existing_edge =
-        (lv_n > committed) ? lv_obj_get_child(lv_container, static_cast<uint32_t>(committed)) : nullptr;
-    lv_obj_t* edge_obj = SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1),
-                                         depth + 1, node_count, child_flow, child_row_all_growable);
-    ApplyColCrossLabelSizing(edge_obj, cJSON_GetArrayItem(children, n - 1), json_container, child_flow);
-    lv_obj_set_user_data(lv_container, reinterpret_cast<void*>(static_cast<intptr_t>(committed)));
-}
+void PreviewSetData(const cJSON* data) { s_preview_data = cJSON_IsObject(data) ? data : nullptr; }
 
 bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err) {
     if (!cJSON_IsObject(props)) {
@@ -2193,89 +1835,84 @@ bool ChoiceLabel(lv_obj_t* obj, std::string& out) {
     return false;
 }
 
-// ------------------------------- 干跑校验 ----------------------------------
+// ------------------------------- 干跑校验（v2） ------------------------------
+// docs/CARD_V2.md §6.1：root = grid 块数组，每块恰含 cells/rows/bind_rows 之一，树深恒 2
+// （grid → 叶子），叶子是 12 种类型之一。叶子级规则（bind 存在性/fmt 相容/数值控件禁绑
+// string/qrcode 长度/choice 选项数/chart 历史/stock_chart/action 合法性）逐条复用 v1 已实现
+// 的逻辑，未重写判定本身。
 namespace {
-// 先扫一遍收集全树已声明的 id，供 toggle/show/hide 的 target 校验。递归口径必须与渲染器
-// 一致（只有 column/row 的 children 会被渲染），否则会放行一个运行时根本找不到的 target。
-// list 的 item 模板挂在 "item" 字段而非 "children"，本函数天然不递归进去——行内 id 不进
-// node_ids（与渲染期不进 card->nodes 呼应），toggle/show/hide/patch 校验期已整体拒绝行内用。
-void CollectNodeIds(const cJSON* node, std::set<std::string>& ids) {
-    if (!cJSON_IsObject(node)) return;
-    if (const char* id = GetStr(node, "id")) ids.insert(id);
-    const char* type = GetStr(node, "type");
-    if (!type) return;
-    if (std::strcmp(type, "column") != 0 && std::strcmp(type, "row") != 0 &&
-        std::strcmp(type, "grid") != 0)
-        return;
-    const cJSON* children = GetItem(node, "children");
-    if (!children || !cJSON_IsArray(children)) return;
-    const cJSON* child = nullptr;
-    cJSON_ArrayForEach(child, children) CollectNodeIds(child, ids);
+
+constexpr int kMaxGrids = 8;  // §6.1：grid 数上限（root 数组长度）
+
+bool IsLeafType(const char* t) {
+    static const char* kLeaf[] = {"label", "button", "slider", "arc",   "switch",
+                                 "bar",   "icon",   "divider", "qrcode", "choice",
+                                 "chart", "stock_chart"};
+    for (auto* k : kLeaf)
+        if (!std::strcmp(k, t)) return true;
+    return false;
 }
 
-bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int& count,
-                  const std::set<std::string>& node_ids, const cJSON* data, std::string& err,
-                  bool in_list_row = false) {
-    if (!cJSON_IsObject(node)) {
-        err = "node is not an object";
-        return false;
+// 先扫一遍收集全树已声明的 id，供 toggle/show/hide/patch 的 target 校验。递归口径与渲染器
+// 一致：只有 cells/rows 里的叶子会被渲染出真实控件；bind_rows 的 "item" 行模板不收集
+// （N 行实例 id 不唯一，同 v1 list 语义，toggle/show/hide/patch 校验期已对行内动作整体收窄）。
+void CollectLeafId(const cJSON* leaf, std::set<std::string>& ids) {
+    if (!cJSON_IsObject(leaf)) return;
+    if (const char* id = GetStr(leaf, "id")) ids.insert(id);
+}
+void CollectRowIds(const cJSON* row, std::set<std::string>& ids) {
+    if (!cJSON_IsArray(row)) return;
+    const cJSON* c = nullptr;
+    cJSON_ArrayForEach(c, row) CollectLeafId(c, ids);
+}
+void CollectGridIds(const cJSON* grid, std::set<std::string>& ids) {
+    if (!cJSON_IsObject(grid)) return;
+    if (const cJSON* cells = GetItem(grid, "cells"); cJSON_IsArray(cells)) {
+        const cJSON* c = nullptr;
+        cJSON_ArrayForEach(c, cells) CollectLeafId(c, ids);
+    } else if (const cJSON* rows = GetItem(grid, "rows"); cJSON_IsArray(rows)) {
+        const cJSON* r = nullptr;
+        cJSON_ArrayForEach(r, rows) CollectRowIds(r, ids);
     }
-    if (depth > limits.max_depth) {
-        err = "nesting too deep (max " + std::to_string(limits.max_depth) + ")";
+}
+void CollectNodeIdsV2(const cJSON* root, std::set<std::string>& ids) {
+    if (!cJSON_IsArray(root)) return;
+    const cJSON* g = nullptr;
+    cJSON_ArrayForEach(g, root) CollectGridIds(g, ids);
+}
+
+// 校验单个叶子 cell（12 种之一）。逐条规则原样照抄 v1 ValidateNode 里对应类型的判定，
+// 只是去掉了容器（column/row/grid/list）分支——v2 里叶子不可能是容器，出现即拒绝。
+// in_row：是否位于 bind_rows 的 "item" 行模板内（受限 action 集合：仅 report/set/close，
+// 复用 ValidateActions 的 in_list_row 语义）。
+bool ValidateLeaf(const cJSON* node, const std::set<std::string>& node_ids, std::string& err,
+                  bool in_row, int& count, const RenderLimits& limits) {
+    if (!cJSON_IsObject(node)) {
+        err = "cell is not an object";
         return false;
     }
     if (++count > limits.max_nodes) {
         err = "too many nodes (max " + std::to_string(limits.max_nodes) + ")";
         return false;
     }
+    if (HasKey(node, "children")) {
+        err = "leaf cells can't have children — tree depth is fixed at card -> grid -> leaf";
+        return false;
+    }
     const char* type = GetStr(node, "type");
     if (!type) {
-        err = "node missing type";
+        err = "cell missing type";
         return false;
     }
-    static const char* kTypes[] = {"column", "row",   "label", "button",  "slider", "arc",
-                                   "switch", "bar",   "icon",  "divider", "spacer", "qrcode",
-                                   "choice", "list",  "chart", "stock_chart", "grid"};
-    bool known = false;
-    for (auto* t : kTypes)
-        if (std::strcmp(t, type) == 0) known = true;
-    if (!known) {
-        err = std::string("unknown type: ") + type;
+    if (!IsLeafType(type)) {
+        if (!std::strcmp(type, "column") || !std::strcmp(type, "row") ||
+            !std::strcmp(type, "grid") || !std::strcmp(type, "list")) {
+            err = std::string("no nested containers allowed inside a grid cell (got type: '") +
+                  type + "'); a card is only card -> grid -> leaf, two levels deep";
+        } else {
+            err = std::string("unknown type: ") + type;
+        }
         return false;
-    }
-    if (std::strcmp(type, "list") == 0) {
-        // 嵌套 list 拒绝：外层 list 重渲时会 lv_obj_clean 掉整个行子树，内层 list 注册的
-        // DataConsumer/json_pool 模板会悬垂且每次外层重渲都会新增一份，永久增长。与 D6
-        // "行模板受限"同一口径——直接在校验期堵死，不留渲染期兜底的坑。
-        if (in_list_row) {
-            err = "a list can't nest inside another list's item template; flatten the data or use one list";
-            return false;
-        }
-        const cJSON* item = GetItem(node, "item");
-        if (!cJSON_IsObject(item)) {
-            err = "list needs an 'item' node template";
-            return false;
-        }
-        const char* bind_data = GetStr(node, "bind_data");
-        if (!bind_data) {
-            err = "list needs a 'bind_data' data key";
-            return false;
-        }
-        const cJSON* arr = data ? GetItem(data, bind_data) : nullptr;
-        int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-        int eff = EffMax(node, len);
-        int tcount = 0;
-        if (!ValidateNode(item, limits, depth + 1, tcount, node_ids, data, err, /*in_list_row=*/true)) {
-            return false;
-        }
-        count += eff * tcount;  // 预留：validate 按 eff_max×模板节点数记账，≥render 实际用量
-        if (count > limits.max_nodes) {
-            err = "list reserves " + std::to_string(eff * tcount) + " nodes (max×rowNodes); over " +
-                  std::to_string(limits.max_nodes) + " — lower max or simplify the row";
-            return false;
-        }
-        if (GetStr(node, "empty")) ++count;
-        return true;  // list 不再走通用 children 递归（其"children"本就不存在）
     }
     if (std::strcmp(type, "chart") == 0) {
         const char* path = GetStr(node, "bind_history");
@@ -2324,60 +1961,13 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
             }
         }
     }
-    if (std::strcmp(type, "grid") == 0) {
-        // 结构性错误直接拒绝（仿 choice）：cols 缺失/空/超 6/元素非法、子节点 span 越界。
-        const cJSON* cols = GetItem(node, "cols");
-        if (!cols || !cJSON_IsArray(cols)) {
-            err = "grid needs a \"cols\" array (1-6 track weights: positive int 1-20, or \"auto\")";
-            return false;
-        }
-        int ncol = cJSON_GetArraySize(cols);
-        if (ncol < 1 || ncol > 6) {
-            err = "grid cols must have 1 to 6 tracks";
-            return false;
-        }
-        const cJSON* cel = nullptr;
-        cJSON_ArrayForEach(cel, cols) {
-            if (cJSON_IsString(cel)) {
-                if (std::strcmp(cel->valuestring, "auto") != 0) {
-                    err = "grid cols string track must be \"auto\" (content-sized)";
-                    return false;
-                }
-            } else if (cJSON_IsNumber(cel)) {
-                if (cel->valueint < 1 || cel->valueint > 20) {
-                    err = "grid cols fr weight must be 1 to 20";
-                    return false;
-                }
-            } else {
-                err = "grid cols entries must be a positive int (fr weight) or \"auto\"";
-                return false;
-            }
-        }
-        const cJSON* gch = GetItem(node, "children");
-        if (gch && cJSON_IsArray(gch)) {
-            const cJSON* c = nullptr;
-            cJSON_ArrayForEach(c, gch) {
-                if (HasKey(c, "span")) {
-                    int span = GetInt(c, "span", 1);
-                    if (span < 1 || span > ncol) {
-                        err = "grid child span must be 1 to " + std::to_string(ncol) +
-                              " (number of cols)";
-                        return false;
-                    }
-                }
-            }
-        }
-    }
     // bind 路径必须已注册（或命中动态 provider 的合法模式）
     if (const char* path = GetStr(node, "bind")) {
         if (!DataHub::Instance().Has(path)) {
             err = std::string("unknown bind path: ") + path;
-            // 前缀对但格式错（如 stock.茅台.price）：附 provider 的用法提示教 LLM 改对。
             if (const char* h = DataHub::Instance().HintFor(path)) err += std::string("; ") + h;
             return false;
         }
-        // label 的 fmt 必须与绑定值类型相容，否则渲染时 newlib vsnprintf 会解引用坏指针崩溃
-        // （见 FmtSafeForType）。首道也是主道防线：同步把错误回给 LLM 重试。
         if (std::strcmp(type, "label") == 0) {
             if (const char* fmt = GetStr(node, "fmt")) {
                 HubType t = HubType::Int;
@@ -2385,11 +1975,6 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
                 if (!FmtSafeForType(fmt, t, err)) return false;
             }
         }
-        // 数值型控件（slider/arc/bar/switch/choice）只能绑 Int/Bool 路径：它们的 bind 落地在
-        // lv_subject 的 int union 上（lv_*_bind_value / 手动 observer 都读 int），绑到 String
-        // 路径不会崩，但读到的是 union 里的垃圾值，显示无意义。校验器比渲染器更严是允许的
-        // （同构约束只要求"放行的必可安全渲染"），这里直接同步拒绝，让 LLM 换绑数值路径或
-        // 改用带 fmt 的 label 展示字符串。
         if (std::strcmp(type, "slider") == 0 || std::strcmp(type, "arc") == 0 ||
             std::strcmp(type, "bar") == 0 || std::strcmp(type, "switch") == 0 ||
             std::strcmp(type, "choice") == 0) {
@@ -2402,31 +1987,313 @@ bool ValidateNode(const cJSON* node, const RenderLimits& limits, int depth, int&
             }
         }
     }
-    // 事件动作合法性（in_list_row 时拒绝 toggle/show/hide/patch，见 ValidateActions）
-    if (!ValidateActions(GetItem(node, "on_click"), node_ids, err, in_list_row)) return false;
-    if (!ValidateActions(GetItem(node, "on_change"), node_ids, err, in_list_row)) return false;
-    if (!ValidateActions(GetItem(node, "on_release"), node_ids, err, in_list_row)) return false;
-    // 递归子节点（column/row/grid 三种容器都有 children）
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0 ||
-        std::strcmp(type, "grid") == 0) {
-        const cJSON* children = GetItem(node, "children");
-        if (children && cJSON_IsArray(children)) {
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children)
-                if (!ValidateNode(child, limits, depth + 1, count, node_ids, data, err, in_list_row))
-                    return false;
-        }
+    if (!ValidateActions(GetItem(node, "on_click"), node_ids, err, in_row)) return false;
+    if (!ValidateActions(GetItem(node, "on_change"), node_ids, err, in_row)) return false;
+    if (!ValidateActions(GetItem(node, "on_release"), node_ids, err, in_row)) return false;
+    return true;
+}
+
+bool ValidateCellArray(const cJSON* arr, const std::set<std::string>& node_ids, std::string& err,
+                       bool in_row, int& count, const RenderLimits& limits) {
+    const cJSON* c = nullptr;
+    cJSON_ArrayForEach(c, arr) {
+        if (!ValidateLeaf(c, node_ids, err, in_row, count, limits)) return false;
     }
     return true;
 }
+
+// 一个 grid 块：恰含 cells/rows/bind_rows 之一（§6.1）。
+bool ValidateGrid(const cJSON* grid, const std::set<std::string>& node_ids, const cJSON* data,
+                  std::string& err, int& count, const RenderLimits& limits) {
+    if (!cJSON_IsObject(grid)) {
+        err = "each root element must be a grid block object";
+        return false;
+    }
+    const bool has_cells = HasKey(grid, "cells");
+    const bool has_rows = HasKey(grid, "rows");
+    const bool has_bind_rows = HasKey(grid, "bind_rows");
+    const int forms = (has_cells ? 1 : 0) + (has_rows ? 1 : 0) + (has_bind_rows ? 1 : 0);
+    if (forms != 1) {
+        err = forms == 0
+                  ? "grid block needs exactly one of cells/rows/bind_rows (has none)"
+                  : "grid block must contain exactly one of cells/rows/bind_rows (has more than one)";
+        return false;
+    }
+
+    if (has_cells) {
+        const cJSON* cells = GetItem(grid, "cells");
+        if (!cJSON_IsArray(cells) || cJSON_GetArraySize(cells) == 0) {
+            err = "cells must be a non-empty array of leaf cells";
+            return false;
+        }
+        return ValidateCellArray(cells, node_ids, err, /*in_row=*/false, count, limits);
+    }
+
+    if (has_rows) {
+        const cJSON* rows = GetItem(grid, "rows");
+        if (!cJSON_IsArray(rows) || cJSON_GetArraySize(rows) == 0) {
+            err = "rows must be a non-empty 2D array (array of row arrays)";
+            return false;
+        }
+        const cJSON* row = nullptr;
+        cJSON_ArrayForEach(row, rows) {
+            if (!cJSON_IsArray(row) || cJSON_GetArraySize(row) == 0) {
+                err = "each row must be a non-empty array of leaf cells";
+                return false;
+            }
+            if (!ValidateCellArray(row, node_ids, err, /*in_row=*/false, count, limits)) return false;
+        }
+        return true;
+    }
+
+    // bind_rows：需要 item（叶子或叶子数组）+ bind_rows（data key）。行内 action 已被
+    // ValidateLeaf 的 in_row=true 收窄到 report/set/close（复用 ValidateActions 语义）。
+    const cJSON* item = GetItem(grid, "item");
+    if (!item || !(cJSON_IsObject(item) || cJSON_IsArray(item))) {
+        err = "bind_rows needs an 'item' leaf or leaf array (the row template)";
+        return false;
+    }
+    const char* key = GetStr(grid, "bind_rows");
+    if (!key || !key[0]) {
+        err = "bind_rows needs a non-empty data key";
+        return false;
+    }
+    int tmpl_cells = cJSON_IsArray(item) ? cJSON_GetArraySize(item) : 1;
+    if (tmpl_cells < 1) tmpl_cells = 1;
+    int tmpl_probe = 0;  // 独立探针计数：只校验模板结构本身，不占用真实 64 节点账本
+    if (cJSON_IsArray(item)) {
+        if (cJSON_GetArraySize(item) == 0) {
+            err = "bind_rows item array must not be empty";
+            return false;
+        }
+        if (!ValidateCellArray(item, node_ids, err, /*in_row=*/true, tmpl_probe, limits)) return false;
+    } else {
+        if (!ValidateLeaf(item, node_ids, err, /*in_row=*/true, tmpl_probe, limits)) return false;
+    }
+    const cJSON* arr = data ? GetItem(data, key) : nullptr;
+    int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    int eff = EffMax(grid, len);
+    count += eff * tmpl_cells;  // 预留：按 eff_max×模板 cell 数记账，≥render 实际用量
+    if (count > limits.max_nodes) {
+        err = "bind_rows reserves " + std::to_string(eff * tmpl_cells) +
+              " nodes (max×template cells); over " + std::to_string(limits.max_nodes) +
+              " — lower max or simplify the row template";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool Validate(const cJSON* root_node, const cJSON* data, std::string& err) {
+    if (!cJSON_IsArray(root_node)) {
+        err = "root must be an array of grid blocks: [{\"cells\":[...]}|{\"rows\":[...]}|"
+              "{\"bind_rows\":\"key\",\"item\":...}, ...]";
+        return false;
+    }
+    int ngrid = cJSON_GetArraySize(root_node);
+    if (ngrid < 1) {
+        err = "root must have at least 1 grid block";
+        return false;
+    }
+    if (ngrid > kMaxGrids) {
+        err = "root has " + std::to_string(ngrid) + " grid blocks (max " +
+              std::to_string(kMaxGrids) + "); split into a smaller card";
+        return false;
+    }
     RenderLimits limits;
-    int count = 0;
     std::set<std::string> node_ids;
-    CollectNodeIds(root_node, node_ids);  // 两遍：target 可以前向引用树里靠后声明的节点
-    return ValidateNode(root_node, limits, 0, count, node_ids, data, err);
+    CollectNodeIdsV2(root_node, node_ids);  // 两遍：target 可以前向引用数组里靠后声明的 grid
+    int count = 0;
+    const cJSON* g = nullptr;
+    cJSON_ArrayForEach(g, root_node) {
+        if (!ValidateGrid(g, node_ids, data, err, count, limits)) return false;
+    }
+    return true;
+}
+
+// --------------------------------- Repair（v2） ------------------------------
+// docs/CARD_V2.md §6.2：能修则修、不重试；正确性/安全类问题仍留给 Validate 同步拒绝。
+namespace {
+
+// 静默剥除的旧属性（grid 块级 + 叶子级通用，见 §6.2 表第一行）。"cols" 不在此列——它在
+// rows/bind_rows 形态里是合法的表头描述数组，只有值为纯数字（旧 fr 权重）时才当作旧属性剥除。
+constexpr const char* kStaleKeys[] = {"justify", "align",  "grow", "gap", "pad", "w",
+                                      "h",       "span",   "size", "color", "bg"};
+
+void StripStaleKeys(cJSON* obj) {
+    if (!cJSON_IsObject(obj)) return;
+    for (auto* k : kStaleKeys) cJSON_DeleteItemFromObject(obj, k);
+}
+
+// 旧 fr 权重 cols（元素全是数字）在 rows/bind_rows 形态里没有意义（v2 cols 只描述 title/num
+// 表头），静默整体剥除，solver/渲染器改按内容/行 cell 数自动定列。cells 形态的 cols 本就无
+// 意义，出现即剥除（不区分新旧写法）。
+void StripStaleColsIfLegacy(cJSON* grid, bool is_cells_form) {
+    cJSON* cols = cJSON_GetObjectItem(grid, "cols");
+    if (!cJSON_IsArray(cols)) return;
+    if (is_cells_form) {
+        cJSON_DeleteItemFromObject(grid, "cols");
+        return;
+    }
+    bool all_scalar = cJSON_GetArraySize(cols) > 0;
+    const cJSON* c = nullptr;
+    cJSON_ArrayForEach(c, cols) {
+        if (!cJSON_IsNumber(c) && !cJSON_IsString(c)) { all_scalar = false; break; }
+    }
+    if (all_scalar) cJSON_DeleteItemFromObject(grid, "cols");  // 旧 fr 权重 / "auto" 轨道声明
+}
+
+// 一个叶子 cell 数组（cells[] / 某一 row[] / bind_rows 的 item[]）级别的修复：
+//  * 剥除每个叶子上的旧属性；
+//  * 删除旧 spacer 节点，若它夹在两个 cell 之间则给紧随其后的 cell 补 side:"end"（启发式，
+//    仅当 spacer 既不是首元素也不是末元素时才补，对应 "两 cell 之间" 的字面意思）。
+// 注意：column/row/grid/list 等容器类型叶子**不**在此做自动扁平化——即便只嵌套一层，语义
+// 也无法安全展开（它们携带布局属性，简单提升 children 可能改变原意），统一交给 Validate
+// 以 "no nested containers" 拒绝重试，让模型显式改写。
+cJSON* RepairCellArray(cJSON* arr, bool* changed) {
+    if (!cJSON_IsArray(arr)) return arr;
+    cJSON* out = cJSON_CreateArray();
+    int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n; ++i) {
+        cJSON* cell = cJSON_GetArrayItem(arr, i);
+        const char* type = GetStr(cell, "type");
+        if (type && !std::strcmp(type, "spacer")) {
+            if (changed) *changed = true;
+            // spacer 在两个真实 cell 之间：给下一个即将追加进 out 的 cell 补 side:end。
+            // 用一个待处理标记：下一次追加非 spacer 时补上。
+            bool between = (i > 0) && (i < n - 1);
+            if (between) {
+                // 找下一个非 spacer 的原始节点在 arr 里的位置，直接改写它自己的 cJSON（还没被
+                // 复制进 out 之前）。简单起见：标记到 "cell" 本身之后遇到的第一个真实叶子。
+                for (int j = i + 1; j < n; ++j) {
+                    cJSON* nxt = cJSON_GetArrayItem(arr, j);
+                    const char* nt = GetStr(nxt, "type");
+                    if (nt && !std::strcmp(nt, "spacer")) continue;
+                    if (!HasKey(nxt, "side")) cJSON_AddStringToObject(nxt, "side", "end");
+                    break;
+                }
+            }
+            continue;  // spacer 本身不进 out
+        }
+        cJSON* dup = cJSON_Duplicate(cell, 1);
+        StripStaleKeys(dup);
+        cJSON_AddItemToArray(out, dup);
+    }
+    return out;
+}
+
+void ReplaceCellArray(cJSON* grid, const char* key) {
+    cJSON* arr = cJSON_GetObjectItem(grid, key);
+    if (!cJSON_IsArray(arr)) return;
+    bool changed = false;
+    cJSON* fixed = RepairCellArray(arr, &changed);
+    cJSON_ReplaceItemInObject(grid, key, fixed);
+}
+
+// 单个 grid 块的修复：剥属性 + cols 长度纠偏 + 旧 list→bind_rows 改写 + cells/rows 内容修复。
+// 返回值：该数组元素最终应替换成的 cJSON（可能是原地修改后的同一个指针，也可能是新分配的）。
+cJSON* RepairGrid(cJSON* grid, std::vector<std::string>* notes) {
+    if (!cJSON_IsObject(grid)) return grid;
+
+    // 旧 v1 "list" 节点（type:"list", item, bind_data, max?, empty?）→ 改写成 bind_rows 形态。
+    if (const char* t = GetStr(grid, "type"); t && !std::strcmp(t, "list")) {
+        cJSON* item = cJSON_DetachItemFromObject(grid, "item");
+        const char* bind_data = GetStr(grid, "bind_data");
+        cJSON* out = cJSON_CreateObject();
+        if (item) cJSON_AddItemToObject(out, "item", item);
+        cJSON_AddStringToObject(out, "bind_rows", bind_data ? bind_data : "");
+        if (HasKey(grid, "max")) cJSON_AddNumberToObject(out, "max", GetInt(grid, "max", 8));
+        if (const char* empty = GetStr(grid, "empty")) cJSON_AddStringToObject(out, "empty", empty);
+        cJSON_Delete(grid);
+        if (notes) notes->push_back("legacy list node rewritten to bind_rows");
+        return out;
+    }
+
+    StripStaleKeys(grid);  // grid 块级旧属性
+    const bool is_cells_form = HasKey(grid, "cells");
+    StripStaleColsIfLegacy(grid, is_cells_form);
+
+    if (is_cells_form) {
+        ReplaceCellArray(grid, "cells");
+        return grid;
+    }
+    if (cJSON* rows = cJSON_GetObjectItem(grid, "rows"); cJSON_IsArray(rows)) {
+        // 逐行剥属性/spacer 修复。
+        int nrows = cJSON_GetArraySize(rows);
+        cJSON* fixed_rows = cJSON_CreateArray();
+        int max_cells = 0;
+        for (int i = 0; i < nrows; ++i) {
+            cJSON* row = cJSON_GetArrayItem(rows, i);
+            bool changed = false;
+            cJSON* fixed_row = cJSON_IsArray(row) ? RepairCellArray(row, &changed) : cJSON_Duplicate(row, 1);
+            int rc = cJSON_IsArray(fixed_row) ? cJSON_GetArraySize(fixed_row) : 0;
+            if (rc > max_cells) max_cells = rc;
+            cJSON_AddItemToArray(fixed_rows, fixed_row);
+        }
+        cJSON_ReplaceItemInObject(grid, "rows", fixed_rows);
+        // cols 长度纠偏（§6.2）：更短则补空列，更长则截断。
+        if (cJSON* cols = cJSON_GetObjectItem(grid, "cols"); cJSON_IsArray(cols)) {
+            int ncols = cJSON_GetArraySize(cols);
+            if (ncols != max_cells && max_cells > 0) {
+                cJSON* fixed_cols = cJSON_CreateArray();
+                for (int c = 0; c < max_cells; ++c) {
+                    if (c < ncols) cJSON_AddItemToArray(fixed_cols, cJSON_Duplicate(cJSON_GetArrayItem(cols, c), 1));
+                    else cJSON_AddItemToArray(fixed_cols, cJSON_CreateObject());
+                }
+                cJSON_ReplaceItemInObject(grid, "cols", fixed_cols);
+                if (notes) notes->push_back("cols length adjusted to match row cell count");
+            }
+        }
+        return grid;
+    }
+    if (HasKey(grid, "bind_rows")) {
+        // item 模板（叶子或叶子数组）同样剥属性；不做 spacer 启发式（行模板里 spacer 罕见且
+        // 语义不明确——一行只渲一次模板，"两 cell 之间" 的相邻关系在多行重复展开后会失真）。
+        if (cJSON* item = cJSON_GetObjectItem(grid, "item"); cJSON_IsArray(item)) {
+            bool changed = false;
+            cJSON* fixed = RepairCellArray(item, &changed);
+            cJSON_ReplaceItemInObject(grid, "item", fixed);
+        } else if (cJSON_IsObject(item)) {
+            StripStaleKeys(item);
+        }
+        return grid;
+    }
+    return grid;  // 多形态/零形态等结构性问题留给 Validate 拒绝
+}
+
+}  // namespace
+
+bool Repair(cJSON* envelope, std::string& err, std::vector<std::string>* notes) {
+    if (!cJSON_IsObject(envelope)) return true;  // 非对象：不是本函数能处理的形状，交给上游
+    cJSON* root = cJSON_GetObjectItem(envelope, "root");
+    if (!root) return true;  // 缺 root：Validate 自己会报 "missing root" 之类，无需在此处理
+
+    if (cJSON_IsObject(root)) {
+        if (HasKey(root, "preset") || HasKey(root, "slots")) {
+            err = "preset 已移除，请直接给 root grid 数组，示例见 system prompt";
+            return false;
+        }
+        // "children" 键是旧深层树的标志——无法安全展开成 v2 单 grid 块，原样留给 Validate
+        // 以 "root must be an array" 拒绝，不强行包数组制造一张看似合法实则语义全错的卡。
+        if (!HasKey(root, "children")) {
+            cJSON* wrapped = cJSON_CreateArray();
+            cJSON_AddItemToArray(wrapped, cJSON_Duplicate(root, 1));
+            cJSON_ReplaceItemInObject(envelope, "root", wrapped);
+            if (notes) notes->push_back("root was a single grid object, wrapped into a 1-element array");
+        }
+        root = cJSON_GetObjectItem(envelope, "root");
+    }
+
+    if (cJSON_IsArray(root)) {
+        int n = cJSON_GetArraySize(root);
+        for (int i = 0; i < n; ++i) {
+            cJSON* grid = cJSON_GetArrayItem(root, i);
+            cJSON* fixed = RepairGrid(grid, notes);
+            if (fixed != grid) cJSON_ReplaceItemInArray(root, i, fixed);
+        }
+    }
+    return true;
 }
 
 // --------------------------------- Lint ------------------------------------
@@ -2442,13 +2309,25 @@ bool ActionsHaveReport(const cJSON* arr) {
     return false;
 }
 
+// choice 的 on_change 数组里有没有任何「回流」动作（report/set/patch）——没有就说明这个
+// choice 的选择结果哪儿都去不了（F3：choice 专属检查，见 Lint() 规则清单）。
+bool ActionsHaveOutlet(const cJSON* arr) {
+    if (!arr || !cJSON_IsArray(arr)) return false;
+    const cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, arr) {
+        const char* d = GetStr(item, "do");
+        if (d && (!std::strcmp(d, "report") || !std::strcmp(d, "set") || !std::strcmp(d, "patch")))
+            return true;
+    }
+    return false;
+}
+
 struct LintState {
     int node_count = 0;
-    int max_depth = 0;
+    int grid_count = 0;
     int primary_count = 0;
     bool has_label = false;
-    bool emoji_seen = false;        // 整卡只提示一次，别按节点刷屏
-    bool split_grids_seen = false;  // 同上：兄弟同构 grid 提示整卡一次
+    bool emoji_seen = false;  // 整卡只提示一次，别按节点刷屏
     std::vector<std::string>* hints = nullptr;
 };
 
@@ -2486,22 +2365,6 @@ bool TextHasEmoji(const char* s) {
     return false;
 }
 
-// 粗略数一棵模板子树的节点数（不生成 hint，仅供 list 的 eff×tcount 预估用）。
-int CountTemplateNodes(const cJSON* node) {
-    if (!cJSON_IsObject(node)) return 0;
-    int c = 1;
-    const char* type = GetStr(node, "type");
-    if (type && (!std::strcmp(type, "column") || !std::strcmp(type, "row") ||
-                 !std::strcmp(type, "grid"))) {
-        const cJSON* children = GetItem(node, "children");
-        if (children && cJSON_IsArray(children)) {
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) c += CountTemplateNodes(child);
-        }
-    }
-    return c;
-}
-
 // invoke 动作若指向 confirm 级命令，点击会弹固件确认 sheet——非阻断提醒 LLM 别把它当
 // 零往返的本地动作用（用户可能取消，流程要能处理「没发生」这一支）。
 void LintInvokeConfirm(const cJSON* actions, std::vector<std::string>* hints) {
@@ -2521,17 +2384,18 @@ void LintInvokeConfirm(const cJSON* actions, std::vector<std::string>* hints) {
     }
 }
 
-void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
-    if (!cJSON_IsObject(node)) return;
+void LintLeaf(const cJSON* leaf, const cJSON* data, LintState& st) {
+    if (!cJSON_IsObject(leaf)) return;
     ++st.node_count;
-    if (depth > st.max_depth) st.max_depth = depth;
-    const char* type = GetStr(node, "type");
+    const char* type = GetStr(leaf, "type");
     if (!type) return;
-    LintInvokeConfirm(GetItem(node, "on_click"), st.hints);
-    LintInvokeConfirm(GetItem(node, "on_change"), st.hints);
-    LintInvokeConfirm(GetItem(node, "on_release"), st.hints);
+
+    LintInvokeConfirm(GetItem(leaf, "on_click"), st.hints);
+    LintInvokeConfirm(GetItem(leaf, "on_change"), st.hints);
+    LintInvokeConfirm(GetItem(leaf, "on_release"), st.hints);
+
     if (!st.emoji_seen) {
-        const char* text = GetStr(node, "text");
+        const char* text = GetStr(leaf, "text");
         if (text != nullptr && TextHasEmoji(text)) {
             st.emoji_seen = true;
             st.hints->push_back(
@@ -2540,213 +2404,153 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
                 "instead.");
         }
     }
-    if (std::strcmp(type, "list") == 0) {
-        // list 无 "children"，其行数按 eff_max×模板节点数逼近 render 实际用量，累进
-        // node_count 让 56/64 上限提示对 list 卡也生效；不深入生成行内 hint（避免同一条
-        // 提示因行数被放大 N 倍地重复）。
-        const cJSON* arr = data ? GetItem(data, GetStr(node, "bind_data", "")) : nullptr;
-        int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-        int eff = EffMax(node, len);
-        int tcount = CountTemplateNodes(GetItem(node, "item"));
-        st.node_count += eff * tcount;
-        return;
+
+    if (std::strcmp(type, "label") == 0) {
+        const char* text = GetStr(leaf, "text");
+        const bool has_bind = HasKey(leaf, "bind") || HasKey(leaf, "bind_data");
+        if ((text == nullptr || text[0] == '\0') && !has_bind) {
+            st.hints->push_back(
+                "This label has no text and no bind/bind_data; it renders empty.");
+        } else {
+            st.has_label = true;
+        }
     }
-    if (std::strcmp(type, "label") == 0) st.has_label = true;
+
     if (std::strcmp(type, "chart") == 0) {
-        const char* path = GetStr(node, "bind_history");
+        const char* path = GetStr(leaf, "bind_history");
         if (!path || !DataHub::Instance().HasHistory(path)) {
             st.hints->push_back(std::string("This chart's bind_history '") + (path ? path : "") +
                                 "' isn't a history-enabled path; it will render empty.");
         }
-        if (HasKey(node, "points")) {
-            int p = GetInt(node, "points", 60);
+        if (HasKey(leaf, "points")) {
+            int p = GetInt(leaf, "points", 60);
             if (p < 8 || p > 120) {
                 st.hints->push_back("chart points is clamped to [8,120]; the declared value is out "
                                     "of range and will be silently adjusted.");
             }
         }
     }
+
     if (std::strcmp(type, "button") == 0) {
-        const char* variant = GetStr(node, "variant");
+        const char* variant = GetStr(leaf, "variant");
         if (variant && std::strcmp(variant, "primary") == 0) ++st.primary_count;
-        const char* text = GetStr(node, "text");
-        if ((text == nullptr || text[0] == '\0') && GetStr(node, "icon") == nullptr) {
+        const char* text = GetStr(leaf, "text");
+        if ((text == nullptr || text[0] == '\0') && GetStr(leaf, "icon") == nullptr) {
             st.hints->push_back("This button has neither text nor icon and renders as a blank "
                                 "pill; give it a short text and/or an icon (Lucide name).");
         }
+        if (!HasKey(leaf, "on_click")) {
+            st.hints->push_back(
+                "This button has no on_click and does nothing when tapped — a dead control.");
+        }
     }
+
     {
         // 未知图标名回落成圆点——当场纠正 LLM 生造的名字（button 的 icon 属性同样适用）。
-        const char* icon = GetStr(node, "icon");
-        if (icon == nullptr && std::strcmp(type, "icon") == 0) icon = GetStr(node, "name");
+        const char* icon = GetStr(leaf, "icon");
+        if (icon == nullptr && std::strcmp(type, "icon") == 0) icon = GetStr(leaf, "name");
         if (icon != nullptr && !IconKnown(icon)) {
             st.hints->push_back(std::string("Icon '") + icon +
                                 "' is not in the built-in Lucide subset and renders as a plain "
                                 "dot; use a more common Lucide icon name.");
         }
     }
-    const bool ctrl = std::strcmp(type, "slider") == 0 || std::strcmp(type, "switch") == 0 ||
-                      std::strcmp(type, "arc") == 0 || std::strcmp(type, "choice") == 0;
-    if (ctrl) {
-        if (ActionsHaveReport(GetItem(node, "on_change"))) {
+
+    // 死控件：slider/switch/arc 有交互属性却 on_click/on_change/on_release 全缺——用户碰它
+    // 什么都不会发生（F3 规则清单）。choice 走独立的「回流出口」检查，见下。
+    if (std::strcmp(type, "slider") == 0 || std::strcmp(type, "switch") == 0 ||
+        std::strcmp(type, "arc") == 0) {
+        if (ActionsHaveReport(GetItem(leaf, "on_change"))) {
             st.hints->push_back(std::string("The on_change of this ") + type +
                                 " reports on every change and costs an LLM round-trip each time; "
                                 "use on_release or a local patch/set/toggle instead.");
         }
-        const char* bind = GetStr(node, "bind");
-        const bool writable = bind && DataHub::Instance().Writable(bind);
-        const bool has_id = GetStr(node, "id") != nullptr;
-        const bool has_handler =
-            GetItem(node, "on_change") != nullptr || GetItem(node, "on_release") != nullptr;
-        if (std::strcmp(type, "choice") == 0) {
-            if (!(has_id || bind || has_handler)) {
-                st.hints->push_back(
-                    "This choice has no id, bind, or on_change, so the selection goes nowhere; add "
-                    "an id (rides back on the next report) or an on_change.");
-            }
-        } else if (!(writable || has_handler || (!bind && has_id))) {
+        const bool has_handler = HasKey(leaf, "on_click") || HasKey(leaf, "on_change") ||
+                                 HasKey(leaf, "on_release");
+        if (!has_handler) {
             st.hints->push_back(std::string("This ") + type +
-                                " is inert (no writable bind, id, or handler) and will render "
-                                "dimmed/read-only; give it an id to report its value, a writable "
-                                "bind, or an on_release.");
+                                " has no on_click/on_change/on_release — a dead control that does "
+                                "nothing when the user interacts with it.");
         }
     }
-    if (std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0) {
-        // justify/align 未知枚举值：不拒绝、静默回落默认（依「修饰性枚举回落」约定），
-        // 但出 Lint 提示纠正 LLM。
-        lv_flex_align_t tmp;
-        const char* jz = GetStr(node, "justify");
-        if (jz != nullptr && !FlexJustifyOf(jz, tmp)) {
-            st.hints->push_back(std::string("justify '") + jz +
-                                "' is not a recognized value (start|center|end|between|around|"
-                                "evenly); it is ignored and the default is used.");
+
+    if (std::strcmp(type, "choice") == 0) {
+        if (ActionsHaveReport(GetItem(leaf, "on_change"))) {
+            st.hints->push_back(
+                "The on_change of this choice reports on every change and costs an LLM round-trip "
+                "each time; use on_release or a local patch/set/toggle instead.");
         }
-        const char* al = GetStr(node, "align");
-        if (al != nullptr && !FlexCrossOf(al, tmp)) {
-            st.hints->push_back(std::string("align '") + al +
-                                "' is not a recognized value (start|center|end); it is ignored and "
-                                "the default is used.");
-        }
-        // row 的 justify=between/around/evenly 分配「剩余空间」，但 row 内会 grow 的子项会吃光
-        // 剩余空间 → justify 视觉上无效。提示改用显式 w 或去掉 grow。是否会 grow 现按 ApplySizing
-        // 的真实规则判定：显式 grow>0（不管默认/显式来源，反正吃空间）→ 算；显式 w → 不算（占
-        // 固定宽，不挤占）；否则按类型默认——spacer 恒 grow；button/choice 只在整行清一色
-        // growable（RowChildrenAllGrowable）时才默认 grow，混排时保持内容宽、不算；
-        // slider/bar/arc/chart 恒默认 grow。
-        const bool is_row = std::strcmp(type, "row") == 0;
-        const bool space_justify = jz != nullptr && (std::strcmp(jz, "between") == 0 ||
-                                                     std::strcmp(jz, "around") == 0 ||
-                                                     std::strcmp(jz, "evenly") == 0);
-        const cJSON* children = GetItem(node, "children");
-        if (is_row && space_justify && children != nullptr && cJSON_IsArray(children)) {
-            const bool row_all_growable = RowChildrenAllGrowable(children);
-            bool has_default_grow = false;
-            const cJSON* c = nullptr;
-            cJSON_ArrayForEach(c, children) {
-                const char* ct = GetStr(c, "type");
-                if (ct == nullptr) continue;
-                if (HasKey(c, "grow") && GetInt(c, "grow", 0) > 0) {
-                    has_default_grow = true;  // 显式 grow>0：不管默认规则，反正会吃空间
-                    break;
-                }
-                if (HasKey(c, "w") || HasKey(c, "grow")) continue;  // 显式定宽，或显式 grow:0
-                const bool grows = std::strcmp(ct, "spacer") == 0 ||
-                                   (IsGrowable(ct) && (!IsRowGrowConditional(ct) || row_all_growable));
-                if (grows) { has_default_grow = true; break; }
-            }
-            if (has_default_grow) {
-                // 文案不分"默认拿到的 grow"和"显式给的 grow"——两种场景下这条 hint 都可能触发
-                // （见上面的判定：显式 grow>0 与整行清一色 growable 的默认 grow 走的是同一个
-                // has_default_grow=true 结论），措辞须两态皆准，不能说成"defaults to"。
-                st.hints->push_back(std::string("justify '") + jz +
-                                    "' distributes free space, but a child in this row has grow "
-                                    "and eats it, so the spacing has no visible effect; give it an "
-                                    "explicit w or drop grow.");
-            }
-        }
-        // 兄弟同构 grid（列数相同、常被 divider 隔开的"分区表"写法）各自独立量 "auto" 轨宽，
-        // 跨区列永远对不齐（真机设备全览卡复现：三段 3 列 auto grid 三种列宽）。提示合并成
-        // 一个 grid、区标题用 span 占整行——同一轨道模板天然全对齐。整卡提示一次。
-        if (!st.split_grids_seen && !is_row && children != nullptr && cJSON_IsArray(children)) {
-            int grid_n = 0, first_cols = -1;
-            bool same_cols = true;
-            const cJSON* c = nullptr;
-            cJSON_ArrayForEach(c, children) {
-                const char* ct = GetStr(c, "type");
-                if (ct == nullptr || std::strcmp(ct, "grid") != 0) continue;
-                const cJSON* gc = GetItem(c, "cols");
-                const int ncols = (gc != nullptr && cJSON_IsArray(gc)) ? cJSON_GetArraySize(gc) : 0;
-                if (first_cols < 0) first_cols = ncols;
-                else if (ncols != first_cols) same_cols = false;
-                ++grid_n;
-            }
-            if (grid_n >= 2 && same_cols) {
-                st.split_grids_seen = true;
-                st.hints->push_back(
-                    std::to_string(grid_n) +
-                    " sibling grids with the same column count size their \"auto\" tracks "
-                    "independently, so columns will NOT align across sections; merge them into one "
-                    "grid and give each section label span:<cols> to keep a single aligned table.");
-            }
-        }
-        if (children != nullptr && cJSON_IsArray(children)) {
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) {
-                // row 里的容器是内容宽（SIZE_CONTENT）；嵌套 grid 若带 fr 列，fr 按"剩余空间"
-                // 分而内容宽容器没有剩余空间可言——fr 轨塌 0。提示给显式 w 或挪出 row。
-                const char* ct = GetStr(child, "type");
-                if (is_row && ct != nullptr && std::strcmp(ct, "grid") == 0 &&
-                    GridHasFrCols(child) && !HasKey(child, "w") && !HasKey(child, "grow")) {
-                    st.hints->push_back(
-                        "A grid with fr columns nested in a row is content-sized, so its fr tracks "
-                        "have no free space to share and collapse; give the grid an explicit w or "
-                        "move it out of the row.");
-                }
-                LintWalk(child, depth + 1, data, st);
-            }
-        }
-    } else if (std::strcmp(type, "grid") == 0) {
-        // grid 无 justify/align；子节点纳入 Lint 递归（口径与渲染/校验一致）。另提示一种退化
-        // 组合：落在 "auto" 轨上的 cell 若是"带 fr 列的嵌套 grid"——外层 auto 轨按内容量宽、
-        // 内层 fr 又等着按剩余空间分，互相等待，fr 轨塌 0（渲染侧该 cell 已按内容宽处理，
-        // 见 FLOW_GRID_AUTO 头注）。落位游标复刻渲染分支的 place_next 行主序规则。
-        const cJSON* cols = GetItem(node, "cols");
-        const int ncol = (cols != nullptr && cJSON_IsArray(cols)) ? cJSON_GetArraySize(cols) : 0;
-        const cJSON* children = GetItem(node, "children");
-        if (children != nullptr && cJSON_IsArray(children)) {
-            int cur = 0;
-            const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) {
-                int span = GetInt(child, "span", 1);
-                if (ncol > 0) {
-                    if (span < 1) span = 1;
-                    if (span > ncol) span = ncol;
-                    if (cur + span > ncol) cur = 0;
-                    const int col_out = cur;
-                    cur += span;
-                    if (cur >= ncol) cur = 0;
-                    const char* ct = GetStr(child, "type");
-                    if (ct != nullptr && std::strcmp(ct, "grid") == 0 &&
-                        GridCellOnAutoTrack(cols, col_out, span) && GridHasFrCols(child) &&
-                        !HasKey(child, "w")) {
-                        st.hints->push_back(
-                            "A grid with fr columns placed in an \"auto\" track is content-sized, "
-                            "so its fr tracks collapse to zero width; use all-\"auto\" columns in "
-                            "the nested grid, give it an explicit w, or make the outer track fr.");
-                    }
-                }
-                LintWalk(child, depth + 1, data, st);
-            }
+        const bool has_id = GetStr(leaf, "id") != nullptr;
+        const bool has_outlet = ActionsHaveOutlet(GetItem(leaf, "on_change"));
+        if (!has_outlet && !has_id) {
+            st.hints->push_back(
+                "This choice's on_change has no report/set/patch action and no id, so the "
+                "selection has no way back to the app or the LLM.");
         }
     }
 }
+
+// 一个 grid 块（cells/rows/bind_rows 三形态之一）的叶子遍历（CARD_V2.md §1.2）。
+void LintGrid(const cJSON* grid, const cJSON* data, LintState& st) {
+    if (!cJSON_IsObject(grid)) return;
+    ++st.grid_count;
+    const cJSON* cells = GetItem(grid, "cells");
+    const cJSON* rows = GetItem(grid, "rows");
+    if (cJSON_IsArray(cells)) {
+        const cJSON* c = nullptr;
+        cJSON_ArrayForEach(c, cells) LintLeaf(c, data, st);
+        return;
+    }
+    if (cJSON_IsArray(rows)) {
+        const cJSON* r = nullptr;
+        cJSON_ArrayForEach(r, rows) {
+            if (!cJSON_IsArray(r)) continue;
+            const cJSON* c = nullptr;
+            cJSON_ArrayForEach(c, r) LintLeaf(c, data, st);
+        }
+        return;
+    }
+    // bind_rows：行数据来自 data，节点账本按 eff_max×模板 cell 数预留（与 Validate 同口径），
+    // 不逐行重复同一条 hint——只对模板本身跑一遍 leaf 检查（LintLeaf 会 ++node_count，这里
+    // 先扣掉那次自增再按预留数补回，避免模板 cell 被数两次）。
+    const char* key = GetStr(grid, "bind_rows");
+    const cJSON* item = GetItem(grid, "item");
+    const cJSON* arr = (data && key) ? GetItem(data, key) : nullptr;
+    const int len = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    const int eff = EffMax(grid, len);
+    int tcount = 0;
+    if (cJSON_IsArray(item)) {
+        const cJSON* c = nullptr;
+        cJSON_ArrayForEach(c, item) {
+            LintLeaf(c, data, st);
+            --st.node_count;
+            ++tcount;
+        }
+    } else if (item) {
+        LintLeaf(item, data, st);
+        --st.node_count;
+        tcount = 1;
+    }
+    st.node_count += eff * tcount;
+}
 }  // namespace
 
+// Lint v2（CARD_V2.md §8 步骤5）：遍历 root（grid 块数组）+ 三种形态展开到叶子，非阻断建议。
+// 检查项：primary 按钮 >1；空 label（无 text 也无 bind/bind_data）；死控件（button/slider/
+// switch/arc 交互属性 on_click/on_change/on_release 全缺）；choice 无回流出口（on_change 里
+// 没有 report/set/patch 且无 id）；逼近节点上限（>=64 的 90%=58）/ grid 上限（>=8 的 90%=7）。
+// 沿用的 v1 检查语义（emoji/未知 icon/invoke confirm 级/chart bind_history 有效性/on_change
+// 挂 report 的往返代价）不依赖树形状，逐叶子判断即可，一并保留在 LintLeaf 里。
 std::vector<std::string> Lint(const cJSON* root_node, const cJSON* data) {
     std::vector<std::string> hints;
     LintState st;
     st.hints = &hints;
-    LintWalk(root_node, 0, data, st);
+    if (cJSON_IsArray(root_node)) {
+        const cJSON* grid = nullptr;
+        cJSON_ArrayForEach(grid, root_node) LintGrid(grid, data, st);
+    } else {
+        LintGrid(root_node, data, st);  // 兼容 Repair 前的单 grid 对象（§6.2 自动修规则）
+    }
 
     if (st.primary_count > 1) {
         hints.push_back("Card has " + std::to_string(st.primary_count) +
@@ -2756,13 +2560,13 @@ std::vector<std::string> Lint(const cJSON* root_node, const cJSON* data) {
     if (!st.has_label) {
         hints.push_back("Card has no text label; add a title/label so the user can tell what it is.");
     }
-    if (st.node_count >= 56) {
+    if (st.node_count >= 58) {
         hints.push_back("Card uses " + std::to_string(st.node_count) +
                         "/64 nodes; near the limit — split it or simplify.");
     }
-    if (st.max_depth >= 7) {
-        hints.push_back("Card nests " + std::to_string(st.max_depth) +
-                        " levels deep (max 8); flatten some rows/columns.");
+    if (st.grid_count >= 7) {
+        hints.push_back("Card uses " + std::to_string(st.grid_count) +
+                        "/8 grid blocks; near the limit — merge or drop some.");
     }
     return hints;
 }

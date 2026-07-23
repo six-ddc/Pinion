@@ -1,0 +1,26 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "对齐与截断验收" } ] },
+    {
+      "cols": [ { "title": "名称" }, { "title": "数值", "num": true } ],
+      "rows": [
+        [ { "type": "label", "text": "这是一段特意写得很长会被截断的名称文本用于验证DOT截断行为" }, { "type": "label", "text": "1" } ],
+        [ { "type": "label", "text": "短名称" }, { "type": "label", "text": "12345" } ],
+        [ { "type": "label", "text": "另一个较长一些的名称示例" }, { "type": "label", "text": "-987" } ]
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "label", "text": "开关" },
+        { "type": "switch", "checked": true, "side": "end" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "arc", "value": 30 },
+        { "type": "arc", "value": 70 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "STATUS" },
+        { "type": "label", "role": "title", "text": "设备状态" }
+      ]
+    },
+    {
+      "cols": [ { "title": "" }, { "title": "" }, { "title": "", "num": true } ],
+      "rows": [
+        [ { "type": "icon", "icon": "battery" }, { "type": "label", "role": "label", "text": "电量" },
+          { "type": "label", "role": "value", "bind": "battery.level", "fmt": "%d%%" } ],
+        [ { "type": "icon", "icon": "volume" }, { "type": "label", "role": "label", "text": "音量" },
+          { "type": "label", "role": "value", "bind": "audio.volume", "fmt": "%d%%" } ],
+        [ { "type": "icon", "icon": "wifi", "tone": "ok" }, { "type": "label", "role": "label", "text": "网络" },
+          { "type": "label", "role": "value", "bind": "net.type" } ]
+      ]
+    },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "cells": [
+        { "type": "label", "role": "section", "text": "SIGNAL" },
+        { "type": "label", "role": "value", "tone": "dim", "bind": "net.rssi", "fmt": "%d dBm", "side": "end" }
+      ]
+    }
+  ]
+}

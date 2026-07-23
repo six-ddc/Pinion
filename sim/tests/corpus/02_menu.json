@@ -1,0 +1,19 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "SELECT" },
+        { "type": "label", "role": "title", "text": "选择操作" }
+      ]
+    },
+    {
+      "rows": [
+        [ { "type": "button", "text": "新建对话", "on_click": [ { "do": "report", "text": "新建对话" }, { "do": "close" } ] } ],
+        [ { "type": "button", "text": "导出记录", "on_click": [ { "do": "report", "text": "导出记录" }, { "do": "close" } ] } ],
+        [ { "type": "button", "text": "清空历史", "on_click": [ { "do": "report", "text": "清空历史" }, { "do": "close" } ] } ],
+        [ { "type": "button", "variant": "ghost", "text": "关闭", "on_click": [ { "do": "close" } ] } ]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "本地 patch" } ] },
+    {
+      "cells": [
+        { "type": "slider", "id": "s", "min": 0, "max": 100, "value": 0,
+          "on_change": [ { "do": "patch", "target": "lbl", "props": { "text": "{v}%" } } ] },
+        { "type": "label", "role": "value", "id": "lbl", "text": "0%" }
+      ]
+    }
+  ]
+}

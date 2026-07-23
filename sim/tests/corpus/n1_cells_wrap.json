@@ -1,0 +1,18 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "折行压力（不等宽按钮）" } ] },
+    {
+      "cells": [
+        { "type": "button", "text": "开" },
+        { "type": "button", "text": "确定" },
+        { "type": "button", "text": "重新连接网络" },
+        { "type": "button", "text": "A" },
+        { "type": "button", "text": "设置" },
+        { "type": "button", "text": "取消订单" },
+        { "type": "button", "text": "OK" },
+        { "type": "button", "text": "更多选项" }
+      ]
+    }
+  ]
+}

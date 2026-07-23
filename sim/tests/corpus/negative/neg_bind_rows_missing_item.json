@@ -1,0 +1,7 @@
+{
+  "display": "overlay",
+  "data": { "tracks": [ { "title": "a" } ] },
+  "root": [
+    { "bind_rows": "tracks", "max": 8 }
+  ]
+}

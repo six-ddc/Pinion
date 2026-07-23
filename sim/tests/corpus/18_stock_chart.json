@@ -1,0 +1,6 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "stock_chart", "symbol": "sh600519", "name": "贵州茅台" } ] }
+  ]
+}

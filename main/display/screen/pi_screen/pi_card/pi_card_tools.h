@@ -44,56 +44,54 @@ const char *pi_card_system_prompt(void);
 
 /* ---- 喂给 LLM 的工具描述与 JSON-Schema（编译期常量）---- */
 
-/* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述。
+/* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述（CARD_V2）。
  * 拆两段是因为路径清单必须插在「双向 bind 目标」与「事件/图标/示例」这两段说明
  * 之间——HEAD 收尾在类型清单/设计规范，TAIL 从"路径清单之后的补充说明"接着讲
- * fmt/事件/图标/示例。 */
+ * fmt/事件/图标/示例。v2：root 是 grid 块数组，只有一种容器（grid），无嵌套；
+ * preset/slots/column/row/旧grid/justify/align/grow/gap/pad/w/h/size/color/bg/span/children
+ * 全部删除（docs/CARD_V2.md §1）。 */
 #define PI_CARD_DESC_HEAD                                                                            \
-    "Render an interactive UI card into the chat. Args ARE the card spec: {display?:'chat'|"        \
-    "'overlay'|'standby', ttl_ms?:int, card?:'id', data?:{key:scalar|array}, preset?:'confirm'|'form'|"        \
-    "'dashboard'|'menu', slots?:{…}, root:<node>}. Give root, OR preset+slots. Returns "              \
-    "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = current value of every "  \
-    "hardware path this card binds (this IS your device read); hints = non-blocking design tips. "   \
-    "On invalid input returns an error to fix and retry; overlays auto-close (ttl_ms) and are "      \
-    "capped. Node={\"type\":…}. Types: column|row{children:[],gap?,justify?,align?}; "                \
-    "grid{cols:[1-6 fr-weights 1-20 or \"auto\"],children:[cells row-major],gap?} (cell span:N "      \
-    "crosses N cols; aligned tables, no coords); label{text?,role?,bind?,fmt?,"                       \
-    "bind_data?}; button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,"        \
-    "on_release?}; arc{…like slider} (round dial); switch{checked,bind?,id?,on_change?}; "            \
-    "bar{min,max,value,bind?}; choice{options:[2-6],value?,id?,bind?,on_change?} (segmented picker; " \
-    "value=selected index; reports index and label); list{bind_data:'key',item:<node>,max?,empty?} " \
-    "(repeats item once per element of data[key]; inside item strings use {i}=0-based index, "       \
-    "{n}=1-based, {item.FIELD}=that record's field; row actions may be report/set/close only, not "  \
-    "toggle/patch); chart{bind_history:'path',points?,w?,h?} (LINE chart of a history-enabled "      \
-    "path); stock_chart{symbol,name?,mode?} (live CN/HK/US stock chart, self-refreshing, on-card "    \
-    "timeframe buttons, touch-and-hold inspects points; symbol from the stock tool; mode enum in "    \
-    "schema); "                                                                                       \
-    "qrcode{text,size?}; icon{icon:'name',size?}; divider; spacer. role (label ramp): "               \
-    "eyebrow|kicker|section|title|heading|label|value|caption. variant (button): primary(the ONE "   \
-    "amber CTA)|ghost|plain|default. Common props: id,w,h,grow,pad,gap,size,mono,tone,fill,color,bg," \
-    "hidden. tone(text)/fill(bg) take a semantic token auto-adapting to light/dark: accent|"          \
-    "accent_dim|ok|err|tx|dim|faint|card|card2|line|line2|bg; or color/bg \"#RRGGBB\". "
+    "Render an interactive UI card. Args ARE the card spec: {display?:'chat'|"                        \
+    "'overlay'|'standby', ttl_ms?:int, card?:'id', data?:{key:scalar|array}, root:[grid,…]}. root: "  \
+    "ARRAY of grid blocks, top-to-bottom. ONLY container is grid (no nesting; depth fixed "           \
+    "card->grid->leaf); no x/y/w/h/gaps/grow/justify/align. Returns "                                 \
+    "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = every hardware path this " \
+    "card binds (this IS your device read); hints = non-blocking tips. "                              \
+    "Invalid input returns a fixable error; overlays auto-close (ttl_ms) and are capped. "            \
+    "Each grid has exactly one of: "                                                                  \
+    "cells:[leaf,…] (size-wrapped flow; divider/chart/choice/qrcode get their own line); "            \
+    "cols?:[{title?,num?}],rows:[[leaf,…],…] (aligned TABLE, shared tracks; num:true=right-align "    \
+    "mono; 1 cell/row=vertical menu); "                                                               \
+    "item:<leaf>|[leaf,…],bind_rows:'key',max?,empty? (repeats item per data[key] elem; "             \
+    "{i}=idx0,{n}=idx1,{item.FIELD}; row taps: report/set/close only). "                               \
+    "Leaves (12, exactly these, never nested): label{text?,role?,bind?,fmt?,mono?,bind_data?}; "      \
+    "button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,on_release?}; " \
+    "arc{like slider}(round dial); switch{checked,bind?,id?,on_change?}; bar{min,max,value,bind?}; "  \
+    "choice{options:[2-6],value?,id?,bind?,on_change?}(picker; reports idx+label); "                   \
+    "icon{icon:'name'}; divider; qrcode{text}; chart{bind_history:'path',points?}(LINE chart, fixed " \
+    "height); stock_chart{symbol,name?,mode?}(live CN/HK/US chart, self-refreshing, timeframe "        \
+    "buttons, hold-to-inspect; symbol from stock tool). "                                              \
+    "role ramp: eyebrow|kicker|section|title|heading|label|value|caption (header=eyebrow+title; "     \
+    "big number=value). variant(button): primary(ONE amber CTA)|ghost|plain|default. Common props: "  \
+    "id,bind,tone,hidden,side (side:'end'=push cell to row's right edge). Grid fill=bg box. "         \
+    "tone/fill: semantic token (auto light/dark): accent|accent_dim|ok|err|tx|dim|faint|card|card2|"  \
+    "line|line2|bg — never hex. "
 
-/* PI_CARD_DESC_TAIL：路径清单之后——fmt 安全/事件模型/preset/图标/限额/示例。 */
-#define PI_CARD_DESC_TAIL                                                                            \
-    "A bound label's fmt MUST match the bound type and hold ONE placeholder: number paths %d/"       \
-    "\"%d%%\", string paths %s (a %s on a number path is rejected — it would crash); use mono:true "  \
-    "for numbers. A bind_data label shows card data[key] (put {value} in its text to inline it). "   \
-    "EVENTS: action arrays, zero round-trip — {do:'close'} | "                                        \
-    "{do:'set',path,value?} | {do:'toggle'|'show'|'hide',target:'id'} (a hidden:true block toggled "  \
-    "for 'show details') | {do:'patch',target:'id',props:{text?,value?,checked?,hidden?,tone?,"      \
-    "color?}} ({v}/{value} in props.text = triggering control's value) | {do:'invoke',cmd:'…'} (safe " \
-    "cmds run at once, others pop a firmware confirm). Only {do:'report',text:"                        \
-    "'…{v}…{label}…'} when you must generate/decide ({v}=value, {label}=choice's selected text; a "  \
-    "report auto-carries every id'd control's value, choice as idx(label)). DATA: ui_update mutates " \
-    "card data (data.set/append/remove/replace) and any list/bind_data label re-renders. PRESETS "    \
-    "shapes: see system prompt. Icons: Lucide names (wifi|battery|play|check|x…); unknown name → "    \
-    "dot. "                                                                                            \
-    "Limits: 64 nodes (list reserves max×rowNodes), depth 8; layout is adaptive — rarely need w/h. "  \
-    "LAYOUT: row packs left, cross-centered; justify:'between' -> ends, align:'center' -> lone "       \
-    "item, not w. Buttons/choices-only row splits evenly; mixed w/ label/icon -> shrink; "             \
-    "slider/bar/arc/chart always fill. "                                                               \
-    "Table data: grid aligns columns, no grow tricks (see system prompt)."
+/* PI_CARD_DESC_TAIL：路径清单之后——fmt 安全/事件模型/图标/限额/布局提要。 */
+#define PI_CARD_DESC_TAIL                                                                             \
+    "Bound label fmt: ONE placeholder matching the type — number->%d/\"%d%%\", string->%s (%s on a "  \
+    "number path crashes); mono:true for numbers. bind_data label shows card data[key] ({value} in "  \
+    "its text inlines it). "                                                                          \
+    "EVENTS: action arrays, zero round-trip — close | set,path,value? | toggle/show/hide,target "     \
+    "(hidden:true block) | patch,target,props:{text?,value?,checked?,hidden?,tone?} ({v} in "         \
+    "props.text=trigger value) | invoke,cmd (safe cmds run at once, else confirm). report,text only " \
+    "when you must generate text ({v}=value,{label}=choice's text; every id'd control's value "      \
+    "auto-attaches, choice as idx(label)). "                                                          \
+    "DATA: ui_update mutates card data (set/append/remove/replace); bound bind_rows/bind_data "        \
+    "re-render. Icons: Lucide names (wifi|battery|play|check|x…); unknown → dot. "                     \
+    "Limits: 64 nodes (bind_rows reserves max×row-leaf-count), 8 grids/card. Layout auto (no "        \
+    "coordinates): cells wraps by size; rows aligns to shared tracks (num=right-align,text=truncate); " \
+    "bind_rows repeats template per element. See system prompt for CHOOSE tree+example."
 
 #define PI_CARD_RENDER_SCHEMA \
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
@@ -101,39 +99,42 @@ const char *pi_card_system_prompt(void);
     "ke\"]},\"pa" \
     "th\":{\"type\":\"string\"},\"value\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"},\"targ" \
     "et\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"},\"cmd\":{\"type\":\"string\"}},\"req" \
-    "uired\":[\"do\"]},\"node\":{\"t" \
-    "ype\":" \
-    "\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"column\",\"row\",\"grid\"," \
-    "\"label\",\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"spacer\",\"qr" \
-    "code\",\"choice\",\"list\",\"chart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\"" \
-    ":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"min\",\"5d\",\"day\",\"week\"]},\"children\":{\"type" \
-    "\":\"array\",\"items\":{\"$ref\":\"#/$defs/node\"}},\"text\":{\"type\":\"string\"},\"role\":{\"t" \
-    "ype\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"heading\",\"label\",\"" \
-    "value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"ghost\",\"plain\"" \
-    ",\"default\"]},\"bind\":{\"type\":\"string\"},\"bind_data\":{\"type\":\"string\"},\"bind_histor" \
-    "y\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"},\"item\":{\"$r" \
-    "ef\":\"#/$defs/node\"},\"empty\":{\"type\":\"string\"},\"fmt\":{\"type\":\"string\"},\"icon\":{" \
-    "\"type\":\"string\"},\"value\":{\"type\":\"number\"},\"min\":{\"type\":\"number\"},\"max\":{\"ty" \
-    "pe\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"options\":{\"type\":\"array\",\"items\":{" \
-    "\"type\":\"string\"}},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"" \
-    "accent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg" \
-    "\"]},\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"d" \
-    "im\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\":\"string\"},\"" \
-    "bg\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"size\":{\"type\":\"number\"},\"mono\":" \
-    "{\"type\":\"boolean\"},\"gap\":{\"type\":\"number\"},\"pad\":{\"type\":\"number\"},\"w\":{\"type" \
-    "\":\"number\"},\"h\":{\"type\":\"number\"},\"grow\":{\"type\":\"number\"},\"justify\":{\"type\":" \
-    "\"string\",\"enum\":[\"start\",\"center\",\"end\",\"between\",\"around\",\"evenly\"]},\"align\":{" \
-    "\"type\":\"string\",\"enum\":[\"start\",\"center\",\"end\"]},\"cols\":{\"type\":\"array\",\"item" \
-    "s\":{\"type\":[\"integer\",\"string\"]},\"minItems\":1,\"maxItems\":6},\"span\":{\"type\":\"inte" \
-    "ger\"},\"hidden\":{\"type\":" \
-    "\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_chan" \
-    "ge\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\":\"arr" \
-    "ay\",\"items\":{\"$ref\":\"#/$defs/action\"}}}}},\"properties\":{\"root" \
-    "\":{\"$ref\":\"#/$defs/node\"},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\"," \
-    "\"standby\"]}" \
-    ",\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"type" \
-    "\":\"object\"},\"preset\":{\"type\":\"string\",\"enum\":[\"confirm\",\"form\",\"dashboard\",\"m" \
-    "enu\"]},\"slots\":{\"type\":\"object\"}}}"
+    "uired\":[\"do\"]}," \
+    "\"leaf\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"label\"" \
+    ",\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"qrcode\",\"choice\",\"c" \
+    "hart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"mode\"" \
+    ":{\"type\":\"string\",\"enum\":[\"min\",\"5d\",\"day\",\"week\"]},\"text\":{\"type\":\"string\"" \
+    "},\"role\":{\"type\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"headin" \
+    "g\",\"label\",\"value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"g" \
+    "host\",\"plain\",\"default\"]},\"bind\":{\"type\":\"string\"},\"bind_data\":{\"type\":\"string\"" \
+    "},\"bind_history\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"},\"empty\":{\"type\":\"" \
+    "string\"},\"fmt\":{\"type\":\"string\"},\"icon\":{\"type\":\"string\"},\"value\":{\"type\":\"nu" \
+    "mber\"},\"min\":{\"type\":\"number\"},\"max\":{\"type\":\"number\"},\"checked\":{\"type\":\"boo" \
+    "lean\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":2,\"maxIte" \
+    "ms\":6},\"mono\":{\"type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"acc" \
+    "ent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
+    ",\"id\":{\"type\":\"string\"},\"side\":{\"type\":\"string\",\"enum\":[\"end\"]},\"hidden\":{\"ty" \
+    "pe\":\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on" \
+    "_change\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\"" \
+    ":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}}},\"required\":[\"type\"]}," \
+    "\"col\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"num\":{\"type\":" \
+    "\"boolean\"}}}," \
+    "\"grid\":{\"type\":\"object\",\"properties\":{" \
+    "\"cells\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/leaf\"}}," \
+    "\"cols\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/col\"}}," \
+    "\"rows\":{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/leaf\"" \
+    "}}}," \
+    "\"item\":{\"oneOf\":[{\"$ref\":\"#/$defs/leaf\"},{\"type\":\"array\",\"items\":{\"$ref\":\"#/$d" \
+    "efs/leaf\"}}]}," \
+    "\"bind_rows\":{\"type\":\"string\"},\"max\":{\"type\":\"number\"},\"empty\":{\"type\":\"string\"" \
+    "}," \
+    "\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\"" \
+    ",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
+    "}}}," \
+    "\"properties\":{\"root\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/grid\"},\"minItems\"" \
+    ":1,\"maxItems\":8},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
+    "},\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"typ" \
+    "e\":\"object\"}},\"required\":[\"root\"]}"
 
 #define PI_CARD_UPDATE_DESC                                                                          \
     "Patch a node inside a rendered card, or mutate card data. Args {card?:'' (latest), id?:"        \

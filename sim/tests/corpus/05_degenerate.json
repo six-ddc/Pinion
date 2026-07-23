@@ -1,0 +1,15 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "退化输入兜底" } ] },
+    { "cells": [ { "type": "slider", "min": 80, "max": 20, "value": 50 } ] },
+    { "cells": [ { "type": "button" } ] },
+    {
+      "cells": [
+        { "type": "icon", "icon": "wibblewobble" },
+        { "type": "label", "role": "label", "text": "未知图标 → 圆点" }
+      ]
+    },
+    { "cells": [ { "type": "label", "role": "caption", "text": "以上均应安全渲染,不崩不溢出" } ] }
+  ]
+}

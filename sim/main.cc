@@ -45,6 +45,7 @@
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
+#include "pi/pi_partial_json.h"  // previewscenechunks：真实字节级流式回放用
 #include "pi_card/pi_card_preview.h"
 #include "pi_card/pi_card_tools.h"
 #include "pi_ui_bridge.h"
@@ -66,502 +67,98 @@ std::atomic<bool> g_demo_pending{false};  // F9 = 渲染一张 pi_card 演示卡
 int g_previewscene_countdown = -1;
 std::string g_previewscene_shot_path;
 
-// pi_card 声明式 UI 演示卡：覆盖 icon/slider/bar/label(mono+puhui)/switch/button/
-// divider/spacer + 双向 bind + tone 语义色 + 自适应布局。走完整管道（校验→入队→
-// drain 渲染），是渲染器 + 主题 + 图标 + 自适应的单图核验。
-constexpr const char* kCard0 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":22,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"PI CONTROL\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"设备控制\"}]},"
-    "{\"type\":\"column\",\"gap\":18,\"children\":["
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},"
-    "{\"type\":\"slider\",\"bind\":\"audio.volume\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\"},"
-    "{\"type\":\"slider\",\"bind\":\"display.brightness\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"display.brightness\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
-    "{\"type\":\"bar\",\"bind\":\"battery.level\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\",\"bind\":\"battery.level\","
-    "\"fmt\":\"%d%%\"}]}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"switch\",\"checked\":true}]},"
-    "{\"type\":\"row\",\"gap\":12,\"children\":["
-    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"取消\",\"on_click\":[{\"do\":\"close\"}]},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"确认\","
-    "\"on_click\":[{\"do\":\"report\",\"text\":\"确认\"},{\"do\":\"close\"}]}]}"
-    "]}}";
-
-// ---- 稳定性压力测试语料：多样 + 对抗性用例，验证"怎么拼都不崩不溢出不难看" ----
-// 1 确认框（长正文换行 + ghost/primary 层级）
-constexpr const char* kCard1 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"CONFIRM\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"切换到 4G?\"}]},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"当前使用 WiFi。切换到蜂窝网络会断开连接"
-    "并重启设备,大约需要 30 秒,期间无法使用。确定继续吗?\"},"
-    "{\"type\":\"row\",\"gap\":12,\"children\":["
-    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"取消\",\"on_click\":[{\"do\":\"close\"}]},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"切换并重启\","
-    "\"on_click\":[{\"do\":\"report\",\"text\":\"切换到4G\"},{\"do\":\"close\"}]}]}]}}";
-// 2 菜单/列表（一列全宽按钮）
-constexpr const char* kCard2 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"SELECT\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"选择操作\"},"
-    "{\"type\":\"spacer\",\"h\":4},"
-    "{\"type\":\"button\",\"text\":\"新建对话\",\"on_click\":[{\"do\":\"report\",\"text\":\"新建对话\"},{\"do\":\"close\"}]},"
-    "{\"type\":\"button\",\"text\":\"导出记录\",\"on_click\":[{\"do\":\"report\",\"text\":\"导出记录\"},{\"do\":\"close\"}]},"
-    "{\"type\":\"button\",\"text\":\"清空历史\",\"on_click\":[{\"do\":\"report\",\"text\":\"清空历史\"},{\"do\":\"close\"}]},"
-    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"关闭\",\"on_click\":[{\"do\":\"close\"}]}]}}";
-// 3 信息/状态卡（键值行 + spacer 对齐 + 只读 bind + 字符串 bind）
-constexpr const char* kCard3 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STATUS\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"设备状态\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"电量\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.level\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"volume\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"音量\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.type\"}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"SIGNAL\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\",\"bind\":\"net.rssi\","
-    "\"fmt\":\"%d dBm\"}]}]}}";
-// 4 换行/分配压力（超长正文 + 一排 6 按钮）
-constexpr const char* kCard4 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"换行与分配压力测试\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"这是一段刻意写得很长很长很长的说明文字,"
-    "用来验证固定宽度卡片里长文本会正确折行显示完整,而不是溢出边界或被裁剪,连续无空格的中文"
-    "也应当逐字换行铺满可用宽度。\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"button\",\"text\":\"一\"},{\"type\":\"button\",\"text\":\"二\"},"
-    "{\"type\":\"button\",\"text\":\"三\"},{\"type\":\"button\",\"text\":\"四\"},"
-    "{\"type\":\"button\",\"text\":\"五\"},{\"type\":\"button\",\"text\":\"六\"}]}]}}";
-// 5 对抗/退化（min>max 滑块 / 无文字按钮 / 未知图标→圆点 / 空容器 / 极简）
-constexpr const char* kCard5 =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"退化输入兜底\"},"
-    "{\"type\":\"slider\",\"min\":80,\"max\":20,\"value\":50},"
-    "{\"type\":\"button\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wibblewobble\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"未知图标 → 圆点\"}]},"
-    "{\"type\":\"column\",\"children\":[]},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"以上均应安全渲染,不崩不溢出\"}]}}";
-
-// 6 对抗/崩溃根因：数值路径 label 误用 %s。真机(newlib-nano)上 lv_label_bind_text 立即
-// 回调 → clib vsnprintf 把 net.rssi(断网=0) 当指针 strlen((char*)0) → Load access fault
-// （即 docs 记录的那次渲染崩溃）。修复后 Validate 在工具期直接拒绝整卡：pi_card_tool_render
-// 返回 (ERROR)，绝不进入渲染。注：本 sim 用 macOS libc，对 %s 套整数比 newlib 宽容、不复现
-// 该崩溃，故此卡在 sim 里只核验「修复=Validate 同步拒绝」这一层（真机崩溃已由 panic 日志确证）。
-constexpr const char* kCardBadFmt =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"畸形 fmt 对抗\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.rssi\",\"fmt\":\"%s\"},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"数值路径误用 %s: 应被拒绝而非崩溃\"}]}}";
-
-// pi_card v1 新能力演示卡（arc / qrcode / choice / patch）——各覆盖一条能力的核心路径，
-// 校验+入队+drain 走完整真管道。
-// 8 arc：绑 audio.volume 的环形旋钮 + 同绑路径的 value label（联动验证）。
-constexpr const char* kCardArc =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"音量旋钮\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"arc\",\"bind\":\"audio.volume\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]}]}}";
-// 9 qrcode：标题 + 居中二维码（两侧 spacer）。
-constexpr const char* kCardQr =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"扫码\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"spacer\"},"
-    "{\"type\":\"qrcode\",\"text\":\"https://metalio.example\"},{\"type\":\"spacer\"}]}]}}";
-// 10 choice：三档选择 + primary 按钮回传选中值。
-constexpr const char* kCardChoice =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"难度\"},"
-    "{\"type\":\"choice\",\"id\":\"level\",\"options\":[\"低\",\"中\",\"高\"],\"value\":1},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"确认\","
-    "\"on_click\":[{\"do\":\"report\",\"text\":\"确认 {v} 档\"},{\"do\":\"close\"}]}]}}";
-// 11 patch：拖 slider 本地实时 patch 邻近 label 的文本，零往返（stderr 应无 report ->）。
-constexpr const char* kCardPatch =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"本地 patch\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"slider\",\"id\":\"s\",\"min\":0,\"max\":100,"
-    "\"value\":0,\"grow\":1,\"on_change\":[{\"do\":\"patch\",\"target\":\"lbl\","
-    "\"props\":{\"text\":\"{v}%\"}}]},"
-    "{\"type\":\"label\",\"role\":\"value\",\"id\":\"lbl\",\"text\":\"0%\"}]}]}}";
-
-// P4-a 数据面扩容验收卡（临时）：绑定新增只读遥测路径，核验 Register→bind→subject→
-// render→活性刷新全链路。信息卡（电池扩展/网络/存储）+ chart 卡（功耗/性能历史曲线）。
-constexpr const char* kCardP4aInfo =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"TELEMETRY\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"系统遥测\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"温度\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.temp_c10\",\"fmt\":\"%d x0.1C\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"健康\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\","
-    "\"bind\":\"battery.soh_pct\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"续航\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"battery.tte_min\","
-    "\"fmt\":\"%d min\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"循环\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"battery.cycles\",\"fmt\":\"%d\"}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"wifi\",\"tone\":\"ok\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"运营商\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.operator\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"IP\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"net.ip\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"SD 剩余\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"storage.free_mb\","
-    "\"fmt\":\"%d MB\"}]}]}}";
-constexpr const char* kCardP4aChart =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"CHARTS\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"功耗 / 性能\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"电压 mV\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"battery.voltage_mv\",\"fmt\":\"%d\"}]},"
-    "{\"type\":\"chart\",\"bind_history\":\"battery.voltage_mv\",\"points\":60,\"h\":120},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"section\",\"text\":\"CPU %\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"sys.cpu\",\"fmt\":\"%d%%\"}]},"
-    "{\"type\":\"chart\",\"bind_history\":\"sys.cpu\",\"points\":60,\"h\":120}]}}";
-
-// P4-b 事件与触觉验收卡（临时）：imu 姿态路径 + usb/无线充在场路径 + device.vibrate invoke 按钮。
-// 按钮能渲染即证明 device.vibrate 已注册且过 ValidateActions（真机是否真震动另需设备烟测）。
-constexpr const char* kCardP4bSensors =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"SENSORS\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"传感器 / 触觉\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"俯仰\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"imu.pitch\","
-    "\"fmt\":\"%d deg\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"横滚\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"imu.roll\","
-    "\"fmt\":\"%d deg\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"battery\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"USB 插入\"},{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\",\"bind\":\"power.usb_in\",\"fmt\":\"%d\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"无线充\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"power.wireless_charging\",\"fmt\":\"%d\"}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"震动一下\","
-    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"device.vibrate\"}]}]}}";
-
-// P4-c GPS 验收卡（临时）：定位路径 + 启用/停用 invoke。默认门控关时全 --/0；
-// PI_SIM_GPS=1 跑 sim 可见上海演示坐标（验证 gps.lat/lon 的 FormatDegE5 手动格式化）。
-constexpr const char* kCardP4cGps =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
-    "{\"type\":\"column\",\"gap\":2,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"LOCATION\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"卫星定位\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"定位\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"ok\","
-    "\"bind\":\"gps.fix\",\"fmt\":\"%d\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"纬度\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.lat\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"经度\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.lon\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"海拔\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"tone\":\"dim\","
-    "\"bind\":\"gps.alt_m\",\"fmt\":\"%d m\"}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"卫星\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":\"gps.sats\",\"fmt\":\"%d 颗\"}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"row\",\"gap\":12,\"children\":["
-    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"停用\","
-    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"gps.disable\"}]},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"启用 GPS\","
-    "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"gps.enable\"}]}]}]}}";
-
-// 一行多列标签测试（用户反馈设备端 LLM 始终写不对）：上半部分 = 无 grow 的朴素多列
-//（列宽随内容、各行不对齐）；下半部分 = 每列 grow:1 的表格式多列（列对齐）。
-constexpr const char* kCardMultiCol =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"多列标签\"},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"A. row 直排(无 grow, 列不对齐)\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"text\":\"北京\"},{\"type\":\"label\",\"text\":\"32C\"},"
-    "{\"type\":\"label\",\"text\":\"晴\"}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"text\":\"乌鲁木齐\"},{\"type\":\"label\",\"text\":\"28C\"},"
-    "{\"type\":\"label\",\"text\":\"多云\"}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"B. 每列 grow:1(表格式对齐)\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"城市\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"温度\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"天气\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"text\":\"北京\",\"grow\":1},"
-    "{\"type\":\"label\",\"text\":\"32C\",\"grow\":1},"
-    "{\"type\":\"label\",\"text\":\"晴\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"text\":\"乌鲁木齐\",\"grow\":1},"
-    "{\"type\":\"label\",\"text\":\"28C\",\"grow\":1},"
-    "{\"type\":\"label\",\"text\":\"多云\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"text\":\"上海\",\"grow\":1},"
-    "{\"type\":\"label\",\"mono\":true,\"text\":\"30C\",\"grow\":1},"
-    "{\"type\":\"label\",\"tone\":\"ok\",\"text\":\"小雨\",\"grow\":1}]}]}}";
-
-// Phase4 stock 动态绑定验收卡（临时）：两 symbol 各绑若干 stock.<sym>.<field> 路径，
-// 覆盖 price/pct（±号）、pe/pb（HK 的 pb 应显 "--"）、market_cap（万亿 CJK → 验 SafeFont
-// mono 兜底）、amount 人性化、time。渲染先全 "--"，报价落地（~1-3s）后经 subject 自动填。
-constexpr const char* kCardStockBind =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STOCK BIND\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"动态行情绑定\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"贵州茅台\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.sh600519.price\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.sh600519.pct\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"PE / PB\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.sh600519.pe\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.sh600519.pb\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"市值/换手\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.sh600519.market_cap\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.sh600519.turnover\",\"grow\":1}]},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"腾讯控股\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.hk00700.price\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"stock.hk00700.pct\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"市值/PB\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.hk00700.market_cap\",\"grow\":1},"
-    "{\"type\":\"label\",\"bind\":\"stock.hk00700.pb\",\"grow\":1}]},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"spacer\"},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"stock.sh600519.time\"}]}]}}";
-
-// Stage B（media）：正在播放 + 进度条 + 控制排 + 曲目列表 的媒体控制卡。title/state/进度
-// 全 bind media.* 路径（1Hz PublishLive 自动刷新）；三个按钮 invoke media.prev/toggle/next；
-// list 行 tap → set media.play_index {i} 切曲（value 用字符串 "{i}"，行替换后 atoi）。
-constexpr const char* kCardMediaCtl =
-    "{\"display\":\"overlay\",\"data\":{\"tracks\":[{\"title\":\"曲目 1\"},{\"title\":\"曲目 2\"},"
-    "{\"title\":\"曲目 3\"}]},\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"MEDIA\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"bind\":\"media.title\"},"
-    "{\"type\":\"row\",\"gap\":10,\"children\":["
-    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"media.state\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"caption\",\"bind\":\"media.position_s\",\"fmt\":\"%ds\","
-    "\"mono\":true,\"grow\":1}]},"
-    "{\"type\":\"bar\",\"min\":0,\"max\":100,\"bind\":\"media.progress_pct\"},"
-    "{\"type\":\"row\",\"gap\":8,\"children\":["
-    "{\"type\":\"button\",\"text\":\"上一\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.prev\"}]},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"播放/暂停\",\"on_click\":[{\"do\":"
-    "\"invoke\",\"cmd\":\"media.toggle\"}]},"
-    "{\"type\":\"button\",\"text\":\"下一\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"media.next\"}]}]},"
-    "{\"type\":\"list\",\"bind_data\":\"tracks\",\"max\":8,\"item\":{\"type\":\"button\",\"text\":"
-    "\"{item.title}\",\"on_click\":[{\"do\":\"set\",\"path\":\"media.play_index\",\"value\":"
-    "\"{i}\"}]}}]}}";
-
-// stock_chart 控件验收卡（idx 18）：真网拉行情；验周期分段按钮 + 图面按住十字线取值。
-// w 520 收进 overlay wrapper（80% 屏宽 - 卡片 pad）不裁边；不给 h——节点 h 会被通用
-// ApplySizing 打在控件根上把脚部裁掉（canvas 高度用默认 260 即可）。
-constexpr const char* kCardStockChart =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"stock_chart\",\"symbol\":\"sh600519\",\"name\":\"贵州茅台\",\"w\":520}]}}";
-
-// 样式收敛验收卡 S1（idx 19，Commit 1 硬验收）：四 variant 按钮 + 全控件家福，一张卡
-// 覆盖所有走共享/局部几何样式的入口——primary/default/ghost/plain 按钮（s_btn_base /
-// s_ghost_extra / s_transp_bg）、slider（s_round_track/s_track_indic/s_knob）、bar、
-// switch、choice（choice-box 局部 radius/pad + s_choice_seg）、divider、fill 容器
-// （ApplyFill 局部 radius）、卡面（局部 radius/pad/border）。全静态值 → 完全确定，
-// 收敛前后逐像素可比。
-constexpr const char* kCardStyleFam =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":14,\"children\":["
-    "{\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"STYLE FAMILY\"},"
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"样式家福\"},"
-    "{\"type\":\"row\",\"gap\":10,\"children\":["
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"主\"},"
-    "{\"type\":\"button\",\"variant\":\"default\",\"text\":\"默认\"},"
-    "{\"type\":\"button\",\"variant\":\"ghost\",\"text\":\"描边\"},"
-    "{\"type\":\"button\",\"variant\":\"plain\",\"text\":\"纯文\"}]},"
-    "{\"type\":\"slider\",\"value\":40},"
-    "{\"type\":\"bar\",\"value\":65},"
-    "{\"type\":\"row\",\"children\":[{\"type\":\"label\",\"role\":\"label\",\"text\":\"开关\"},"
-    "{\"type\":\"spacer\"},{\"type\":\"switch\",\"checked\":true}]},"
-    "{\"type\":\"choice\",\"id\":\"seg\",\"options\":[\"低\",\"中\",\"高\"],\"value\":1},"
-    "{\"type\":\"divider\"},"
-    "{\"type\":\"column\",\"fill\":\"card2\",\"gap\":6,\"children\":["
-    "{\"type\":\"label\",\"role\":\"caption\",\"text\":\"fill 容器（圆角 radius 局部设）\"}]}]}}";
-
-// justify 全枚举验收卡 A1（idx 20，Commit 2）：6 行分别 justify=start/center/end/between/
-// around/evenly，每行 3 个自然宽 icon（row 内 icon 不 grow）→ 主轴分布差异可见。全静态。
-constexpr const char* kCardJustify =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"justify 全枚举\"},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"START\"},"
-    "{\"type\":\"row\",\"justify\":\"start\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"CENTER\"},"
-    "{\"type\":\"row\",\"justify\":\"center\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"END\"},"
-    "{\"type\":\"row\",\"justify\":\"end\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"BETWEEN\"},"
-    "{\"type\":\"row\",\"justify\":\"between\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"AROUND\"},"
-    "{\"type\":\"row\",\"justify\":\"around\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"EVENLY\"},"
-    "{\"type\":\"row\",\"justify\":\"evenly\",\"children\":[{\"type\":\"icon\",\"icon\":\"circle\"},"
-    "{\"type\":\"icon\",\"icon\":\"circle\"},{\"type\":\"icon\",\"icon\":\"circle\"}]}]}}";
-
-// align 全枚举验收卡 A2（idx 21，Commit 2）：3 行分别 align=start/center/end，每行含
-// 大 icon(size40)+文字+小 icon(size18) 高差 → 交叉轴（竖向）对齐差异可见。全静态。
-constexpr const char* kCardAlign =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"align 交叉轴\"},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=start\"},"
-    "{\"type\":\"row\",\"align\":\"start\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"顶对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=center\"},"
-    "{\"type\":\"row\",\"align\":\"center\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"中对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"row align=end\"},"
-    "{\"type\":\"row\",\"align\":\"end\",\"children\":[{\"type\":\"icon\",\"icon\":\"sun\",\"size\":40},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"底对齐\"},{\"type\":\"icon\",\"icon\":\"dot\",\"size\":18}]}]}}";
-
-// grid 验收卡（Commit 3）。全静态，可视验证行主序自动放置 + span + auto 轨道 + col_align 分派。
-// G1（idx22）：基础表格 cols[2,1,1] + 表头 section + divider span3 全宽 + 数据行。
-constexpr const char* kCardGridBasic =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"网格表格\"},"
-    "{\"type\":\"grid\",\"cols\":[2,1,1],\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"项目\"},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"今日\"},"
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"昨日\"},"
-    "{\"type\":\"divider\",\"span\":3},"
-    "{\"type\":\"label\",\"text\":\"温度\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"24\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"22\"},"
-    "{\"type\":\"label\",\"text\":\"湿度\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"60\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"55\"},"
-    "{\"type\":\"label\",\"text\":\"气压\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"1013\"},"
-    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"1009\"}]}]}}";
-// G2（idx23）：auto 轨道——首列按内容宽（LV_GRID_CONTENT），次列 fr:1 铺满。
-constexpr const char* kCardGridAuto =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"auto 轨道\"},"
-    "{\"type\":\"grid\",\"cols\":[\"auto\",1],\"gap\":10,\"children\":["
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"名称\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"Metalio Claw\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"固件\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"Claw6 v1\"},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"网络\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"4G\"}]}]}}";
-// G3（idx24）：控件混排——icon/switch 靠列首(START)、slider/label 铺满(STRETCH)。
-constexpr const char* kCardGridCtl =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"控件混排\"},"
-    "{\"type\":\"grid\",\"cols\":[1,2],\"gap\":12,\"children\":["
-    "{\"type\":\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"value\":60},"
-    "{\"type\":\"icon\",\"icon\":\"sun\"},{\"type\":\"slider\",\"value\":40},"
-    "{\"type\":\"label\",\"role\":\"label\",\"text\":\"开关\"},{\"type\":\"switch\",\"checked\":true}]}]}}";
-// G5（idx25）：超高 grid（根 grid，得卡面）——22 行溢出 overlay 86% 高封顶，触发
-// ReflowOverlay 固定高度 + 竖向滚动，验 grid 布局与 overlay 滚动兼容不裁不崩。
-constexpr const char* kCardGridTall =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"grid\",\"cols\":[1,1],\"gap\":8,\"children\":["
-    "{\"type\":\"label\",\"role\":\"section\",\"text\":\"KEY\"},{\"type\":\"label\",\"role\":\"section\",\"text\":\"VAL\"},"
-    "{\"type\":\"label\",\"text\":\"行01\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v01\"},"
-    "{\"type\":\"label\",\"text\":\"行02\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v02\"},"
-    "{\"type\":\"label\",\"text\":\"行03\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v03\"},"
-    "{\"type\":\"label\",\"text\":\"行04\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v04\"},"
-    "{\"type\":\"label\",\"text\":\"行05\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v05\"},"
-    "{\"type\":\"label\",\"text\":\"行06\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v06\"},"
-    "{\"type\":\"label\",\"text\":\"行07\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v07\"},"
-    "{\"type\":\"label\",\"text\":\"行08\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v08\"},"
-    "{\"type\":\"label\",\"text\":\"行09\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v09\"},"
-    "{\"type\":\"label\",\"text\":\"行10\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v10\"},"
-    "{\"type\":\"label\",\"text\":\"行11\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v11\"},"
-    "{\"type\":\"label\",\"text\":\"行12\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v12\"},"
-    "{\"type\":\"label\",\"text\":\"行13\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v13\"},"
-    "{\"type\":\"label\",\"text\":\"行14\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v14\"},"
-    "{\"type\":\"label\",\"text\":\"行15\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v15\"},"
-    "{\"type\":\"label\",\"text\":\"行16\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v16\"},"
-    "{\"type\":\"label\",\"text\":\"行17\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v17\"},"
-    "{\"type\":\"label\",\"text\":\"行18\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v18\"},"
-    "{\"type\":\"label\",\"text\":\"行19\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v19\"},"
-    "{\"type\":\"label\",\"text\":\"行20\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v20\"},"
-    "{\"type\":\"label\",\"text\":\"行21\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v21\"},"
-    "{\"type\":\"label\",\"text\":\"行22\"},{\"type\":\"label\",\"role\":\"value\",\"text\":\"v22\"}]}}";
-
-constexpr const char* kCards[] = {kCard0,        kCard1,          kCard2,       kCard3,
-                                  kCard4,        kCard5,          kCardBadFmt,  kCardArc,
-                                  kCardQr,       kCardChoice,     kCardPatch,   kCardP4aInfo,
-                                  kCardP4aChart, kCardP4bSensors, kCardP4cGps,  kCardMultiCol,
-                                  kCardStockBind, kCardMediaCtl,  kCardStockChart, kCardStyleFam,
-                                  kCardJustify,  kCardAlign,      kCardGridBasic, kCardGridAuto,
-                                  kCardGridCtl,  kCardGridTall};
-
-// TEMP SCAFFOLD（B 验收 §4 断言 3/5 的负向用例）：qrcode text 超 256 字节 / choice 只给 1 项，
-// 均应在 worker 侧同步被 Validate 拒绝，而非渲染出半张卡。
-std::string BuildLongQrCard() {
-    std::string text(300, 'a');
-    return "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
-           "{\"type\":\"qrcode\",\"text\":\"" + text + "\"}]}}";
+// pi_card v2 演示卡语料：不再硬编码 v1 JSON——F9/PI_SIM_CARD_MS 播放的 26 张卡直接来自
+// sim/tests/corpus/*.json（与 card_solver_test/preview_prefix_test 共用同一份语料，避免第
+// 三份漂移的硬编码卡）。CorpusDir() 在几个常见运行目录候选里探测哪个能读到语料（不依赖
+// cmake 传入宏——main.cc 不在本轮授权改动 CMakeLists.txt 的范围内）。v1 的两张 justify/align
+// 演示卡已随 justify/align 属性一起删除，不迁移（docs/CARD_V2.md §5.2 idx20/21：废弃删除，
+// 非需求变更）。
+std::string CorpusDir() {
+    static std::string dir;
+    if (!dir.empty()) return dir;
+    static const char* kCandidates[] = {
+        "sim/tests/corpus/",     // 从仓库根运行（README 示例用法）
+        "../tests/corpus/",      // 从 sim/build 运行
+        "tests/corpus/",         // 从 sim/ 运行
+        "../sim/tests/corpus/",  // 从其它构建目录布局运行
+    };
+    for (const char* c : kCandidates) {
+        std::ifstream probe(std::string(c) + "00_device_ctl.json");
+        if (probe.good()) {
+            dir = c;
+            return dir;
+        }
+    }
+    dir = kCandidates[0];  // 探测全失败：回落第一个候选（后续读文件会失败并打日志，不静默崩）
+    return dir;
 }
-constexpr const char* kCardChoiceBad =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"choice\",\"options\":[\"仅一项\"]}]}}";
 
-// TEMP SCAFFOLD（verifier minor：数值控件 bind 到 String 路径的负向用例）：slider 绑
-// net.ssid（String）应被 ValidateNode 的新增类型检查同步拒绝，而不是渲染出读垃圾值的滑条。
-constexpr const char* kCardSliderStringBind =
-    "{\"root\":{\"type\":\"column\",\"children\":[{\"type\":\"slider\",\"bind\":\"net.ssid\"}]}}";
+std::string ReadCorpusFile(const std::string& name) {
+    std::ifstream f(CorpusDir() + name);
+    if (!f.good()) {
+        std::fprintf(stderr, "[sim] corpus file not found: %s (tried dir '%s')\n", name.c_str(),
+                     CorpusDir().c_str());
+        return "";
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
 
-// TEMP SCAFFOLD（B 验收 §4 断言 7）：2 个 primary 按钮 + 无 label + on_change 挂 report 的
-// 死 slider——一次触发 Lint 的多条规则，验证 hints 数组非阻断地搭在 render 返回值里。
+// 26 张正例语料（docs/CARD_V2.md §5.2 全量迁移映射表 + n1/n2 新增验收卡），F9/PI_SIM_CARD_IDX
+// 按下标播放；顺序与 sim/tests/corpus/README.md 一致。
+constexpr const char* kCorpusFiles[] = {
+    "00_device_ctl.json", "01_confirm.json",   "02_menu.json",      "03_status.json",
+    "04_wrap_stress.json", "05_degenerate.json", "07_arc.json",      "08_qrcode.json",
+    "09_choice.json",     "10_patch.json",      "11_telemetry.json", "12_charts.json",
+    "13_sensors.json",    "14_gps.json",        "15_multicol.json",  "16_stock_bind.json",
+    "17_media_ctl.json",  "18_stock_chart.json", "19_style_family.json", "22_table.json",
+    "23_grid_auto.json",  "24_grid_ctl.json",   "25_grid_tall.json", "f0_form.json",
+    "n1_cells_wrap.json", "n2_rows_align.json",
+};
+constexpr int kNumCorpusFiles = static_cast<int>(sizeof(kCorpusFiles) / sizeof(kCorpusFiles[0]));
+
+// 11 张负例语料（sim/tests/corpus/negative/*.json），badcards 命令逐个渲染 + 断言全部被拒。
+constexpr const char* kCorpusNegFiles[] = {
+    "neg_bind_rows_missing_item.json",     "neg_choice_single_option.json",
+    "neg_fmt_percent_s_numeric_bind.json", "neg_grid_multiple_forms.json",
+    "neg_nested_container.json",           "neg_numeric_control_string_bind.json",
+    "neg_qrcode_too_long.json",            "neg_root_not_array.json",
+    "neg_too_many_grids.json",             "neg_too_many_nodes.json",
+    "neg_unknown_bind.json",
+};
+constexpr int kNumCorpusNegFiles = static_cast<int>(sizeof(kCorpusNegFiles) / sizeof(kCorpusNegFiles[0]));
+
+// 惰性加载 + 缓存全部 26 张正例文本（F9 demo 每次按需读一次即可，量很小，不必每帧重读）。
+std::vector<std::string>& CorpusCards() {
+    static std::vector<std::string> cards;
+    if (cards.empty()) {
+        cards.reserve(kNumCorpusFiles);
+        for (int i = 0; i < kNumCorpusFiles; i++) cards.push_back(ReadCorpusFile(kCorpusFiles[i]));
+    }
+    return cards;
+}
+
+// v2 版 hints 演示卡（B 验收 §4 断言 7 的迁移版）：2 个 primary 按钮 + 无 on_click 的死按钮 +
+// 无 text/bind/bind_data 的空 label + on_change 挂 report 的死 slider——一次触发 Lint 的多条
+// 规则（primary>1 / 空 label / 死控件 / on_change 挂 report），验证 hints 数组非阻断地搭在
+// render 返回值里（见 pi_card_render.cc 重写后的 Lint()，F3）。
 constexpr const char* kCardHints =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"children\":["
+    "{\"display\":\"overlay\",\"root\":["
+    "{\"cells\":[{\"type\":\"label\",\"text\":\"\"},"
     "{\"type\":\"slider\",\"on_change\":[{\"do\":\"report\",\"text\":\"{v}\"}]},"
     "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"A\"},"
-    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"B\"}]}}";
+    "{\"type\":\"button\",\"variant\":\"primary\",\"text\":\"B\"}]}"
+    "]}";
 
-// TEMP SCAFFOLD（B 验收 §4 断言 18 的可写 bind 半支）：choice 绑到可写 bool 路径 ui.theme
-// （0=dark/1=light，正好落在 choice 的 2 项区间内），点第二段应立即回写主题、屏幕跟着变色。
+// TEMP SCAFFOLD（B 验收 §4 断言 18 的可写 bind 半支，v2 迁移版）：choice 绑到可写 bool 路径
+// ui.theme（0=dark/1=light，正好落在 choice 的 2 项区间内），点第二段应立即回写主题、屏幕跟着
+// 变色。
 constexpr const char* kCardChoiceBind =
-    "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":16,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"主题\"},"
-    "{\"type\":\"choice\",\"bind\":\"ui.theme\",\"options\":[\"深色\",\"浅色\"]}]}}";
-
-// 7 超高卡片（overlay 高度封顶 + 内部滚动的稳定性验证），运行时拼多行。
-std::string BuildTallCard() {
-    static const char* icons[] = {"volume", "sun", "battery", "wifi", "gear", "clock", "info", "music"};
-    std::string s = "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":[";
-    s += "{\"type\":\"label\",\"role\":\"title\",\"text\":\"很高的卡片 / 滚动\"},";
-    const int rows = 20;  // 每行 3 节点 → 20 行 61 节点，压进 64 上限；总高超屏 → 滚动
-    for (int i = 0; i < rows; i++) {
-        char row[200];
-        std::snprintf(row, sizeof(row),
-                      "{\"type\":\"row\",\"children\":[{\"type\":\"icon\",\"icon\":\"%s\"},"
-                      "{\"type\":\"label\",\"role\":\"value\",\"text\":\"ITEM %02d      OK\"}]}%s",
-                      icons[i % 8], i + 1, i < rows - 1 ? "," : "");
-        s += row;
-    }
-    s += "]}}";
-    return s;
-}
+    "{\"display\":\"overlay\",\"root\":["
+    "{\"cells\":[{\"type\":\"label\",\"role\":\"title\",\"text\":\"主题\"}]},"
+    "{\"cells\":[{\"type\":\"choice\",\"bind\":\"ui.theme\",\"options\":[\"深色\",\"浅色\"]}]}"
+    "]}";
 
 // TEMP SCAFFOLD (overlay reflow re-entrancy check): a 20-row overlay card where every
 // row carries an id + starts individually hidden/visible, so a single `showrows <n>`
@@ -572,7 +169,7 @@ std::string BuildGrowCard() {
     static const char* icons[] = {"volume", "sun", "battery", "wifi", "gear", "clock", "info", "music"};
     std::string s = "{\"display\":\"overlay\",\"root\":{\"type\":\"column\",\"gap\":10,\"children\":[";
     s += "{\"type\":\"label\",\"role\":\"title\",\"text\":\"reflow 重入测试\"},";
-    const int rows = 20;  // 全部展开时自然高度 > 86% 屏高（同 BuildTallCard）；前 8 行默认可见时远低于封顶。
+    const int rows = 20;  // 全部展开时自然高度 > 86% 屏高；前 8 行默认可见时远低于封顶。
     for (int i = 0; i < rows; i++) {
         char row[220];
         std::snprintf(row, sizeof(row),
@@ -777,6 +374,54 @@ void ExecPreviewScene(const std::string& path, int n_lines, const std::string& s
     g_previewscene_countdown = 4;
 }
 
+// TEMP SCAFFOLD (CARD V2 §8 步骤4 预览验收): previewscenechunks <json_file> <shot_path> — 直接
+// 对一份**完整** ui_render 信封 JSON 文件（如 sim/tests/corpus/*.json）做真实字节级流式回放：
+// 用 pi-c 的 pi_partial_json_parse_streaming（与真机 pi_agent_task.c 走同一份实现，见
+// pi_provider_util.c）对文本的每个前缀重新解析出一棵 partial 快照，喂给 pi_card::PreviewOnArgs
+// ——比 previewfeed 更贴近真实场景：不需要人工准备逐帧 frames 文件，直接从完整 JSON 反推。
+// 语料卡目前都是 display:"overlay"（sim/tests/corpus 迁移自 v1 demo 卡，用于 solver/校验测试），
+// 但 v2 预览只在 chat 模式生长（overlay/standby 走各自的一次性渲染，没有流式预览）——这里把
+// display 字段临时改写成 "chat" 再喂流，专门用来验证"预览 v2 生长"这个特性本身的视觉效果，
+// 不代表这些卡在产品里真的以 chat 形态出现（如实记录于任务报告 e）。
+void ExecPreviewSceneChunks(const std::string& path, const std::string& shot_path) {
+    std::ifstream f(path);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (text.empty()) {
+        std::fprintf(stderr, "[sim] previewscenechunks: can't read '%s'\n", path.c_str());
+        return;
+    }
+    cJSON* envelope = cJSON_Parse(text.c_str());
+    if (!envelope) {
+        std::fprintf(stderr, "[sim] previewscenechunks: invalid JSON in '%s'\n", path.c_str());
+        return;
+    }
+    cJSON_ReplaceItemInObject(envelope, "display", cJSON_CreateString("chat"));
+    char* forced = cJSON_PrintUnformatted(envelope);
+    std::string chat_text = forced ? forced : text;
+    if (forced) cJSON_free(forced);
+    cJSON_Delete(envelope);
+
+    pi_card::PreviewTeardown();
+    PiScreen::DebugGoChat();
+    pi_card::PreviewOnToolStart("ui_render");
+    uint32_t gen = pi_agent_task_session_gen();
+    for (size_t i = 1; i <= chat_text.size(); ++i) {
+        std::string prefix = chat_text.substr(0, i);
+        cJSON* snap = pi_partial_json_parse_streaming(pi_alloc_default(), prefix.c_str());
+        char* s = cJSON_PrintUnformatted(snap);
+        if (s) {
+            pi_card::PreviewOnArgs(s, gen);
+            cJSON_free(s);
+        }
+        cJSON_Delete(snap);
+    }
+    lv_obj_t* tree = pi_card::PreviewDebugTree();
+    std::fprintf(stderr, "[sim][previewscenechunks] %s: tree=%p children=%u\n", path.c_str(),
+                 static_cast<void*>(tree), tree ? lv_obj_get_child_count(tree) : 0);
+    g_previewscene_shot_path = shot_path;
+    g_previewscene_countdown = 4;
+}
+
 // TEMP SCAFFOLD (merge regression: preview vs. formal render visual A/B): rendercard <file> —
 // read one raw ui_render JSON spec (a "card" id + "root", same shape RenderBadCard uses) from a
 // file and push it through the real (non-preview) pi_card_tool_render path, so a previewfeed
@@ -878,72 +523,42 @@ constexpr const char* kFormCard =
     "{\"type\":\"button\",\"text\":\"确认下单\",\"variant\":\"primary\","
     "\"on_click\":[{\"do\":\"report\",\"text\":\"确认下单\"}]}]}}";
 
-// TEMP SCAFFOLD: 校验器负向用例——target 指向一个卡里根本没声明的 id。应在 worker 侧**同步**
-// 被拒（错误直接回给 LLM 重试），而不是渲染出一个点了没反应的按钮。
-constexpr const char* kBadToggleCard =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"button\",\"text\":\"坏按钮\",\"on_click\":[{\"do\":\"toggle\",\"target\":\"nope\"}]},"
-    "{\"type\":\"label\",\"id\":\"real\",\"text\":\"我才是存在的 id\"}]}}";
-
-// TEMP SCAFFOLD: target 缺失的负向用例。
-constexpr const char* kNoTargetCard =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"button\",\"text\":\"无 target\",\"on_click\":[{\"do\":\"show\"}]}]}}";
-
 // ============================================================================
 // Phase2 演示卡：spec/data 分离 + list 控件 + preset + 字符串回流。
 // ============================================================================
 
-// T1/T4：data 驱动的 list——5 条待办，行模板 {n}. {item.name} + role=value 的 {item.price}。
-// 固定 card id "datacard" 供 dataop 命令后续 ui_update。
+// T1/T4（v2 迁移：list -> bind_rows，§6.2 修复表）：data 驱动的动态行——5 条待办，行模板
+// {n}. {item.name} + role=value 的 {item.price}。固定 card id "datacard" 供 dataop 命令后续
+// ui_update（bind_rows 的行为语义与 v1 list 完全一致——SubstRecord 复用，dataop 的
+// append/remove/replace/set 不用变）。
 constexpr const char* kCardList =
     "{\"card\":\"datacard\",\"display\":\"overlay\",\"data\":{\"items\":["
     "{\"name\":\"苹果\",\"price\":\"12\"},{\"name\":\"香蕉\",\"price\":\"6\"},"
     "{\"name\":\"橙子\",\"price\":\"9\"},{\"name\":\"葡萄\",\"price\":\"20\"},"
     "{\"name\":\"西瓜\",\"price\":\"30\"}]},"
-    "\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"购物清单\"},"
-    // max:8 显式高于初始 5 条：eff_max 在 render 期一次性算定（D2/D3），append 到第 6/7/8 条
-    // 才会真正多出一行；不给 max 则默认 eff_max=初始长度，append 会被截断（这是设计使然，
-    // 见 spec D3），但那样就演示不出"截图行数 +1"，故这里显式留出余量。
-    "{\"type\":\"list\",\"bind_data\":\"items\",\"max\":8,\"empty\":\"清单为空\",\"item\":{\"type\":\"row\","
-    "\"children\":[{\"type\":\"label\",\"text\":\"{n}. {item.name}\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}]}}]}}";
+    "\"root\":["
+    "{\"cells\":[{\"type\":\"label\",\"role\":\"title\",\"text\":\"购物清单\"}]},"
+    // max:8 显式高于初始 5 条：eff_max 在 render 期一次性算定，append 到第 6/7/8 条才会真正
+    // 多出一行；不给 max 则默认 eff_max=初始长度，append 会被截断，但那样就演示不出"截图
+    // 行数 +1"，故这里显式留出余量。
+    "{\"item\":[{\"type\":\"label\",\"text\":\"{n}. {item.name}\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}],"
+    "\"bind_rows\":\"items\",\"max\":8,\"empty\":\"清单为空\"}"
+    "]}";
 
-// 改造4：行模板不含 {i}/{n}（只用 {item.*}）——tpl_uses_index 应算 false，走行级 fast path。
-// max:4、初始 2 条：append 到 3/4 条正常新增行，第 3 次 append（会让底层数组到 5 条）应该
-// "截断区不补行"（可见行数钉在 4，不再新增）。固定 card id "datacard2"，供 listfastop 命令用。
+// 改造4（v2 迁移）：行模板不含 {i}/{n}（只用 {item.*}）——tpl_uses_index 应算 false，走行级
+// fast path。max:4、初始 2 条：append 到 3/4 条正常新增行，第 3 次 append（会让底层数组到 5
+// 条）应该"截断区不补行"（可见行数钉在 4，不再新增）。固定 card id "datacard2"，供
+// listfastop 命令用。
 constexpr const char* kCardListFast =
     "{\"card\":\"datacard2\",\"display\":\"overlay\",\"data\":{\"items\":["
     "{\"name\":\"苹果\",\"price\":\"12\"},{\"name\":\"香蕉\",\"price\":\"6\"}]},"
-    "\"root\":{\"type\":\"column\",\"gap\":12,\"children\":["
-    "{\"type\":\"label\",\"role\":\"title\",\"text\":\"快路径清单\"},"
-    "{\"type\":\"list\",\"bind_data\":\"items\",\"max\":4,\"empty\":\"清单为空\",\"item\":{\"type\":\"row\","
-    "\"children\":[{\"type\":\"label\",\"text\":\"{item.name}\",\"grow\":1},"
-    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}]}}]}}";
-
-// T2：list max:20 × 5 节点/行的行模板 = 100 > 64，validate 应同步拒绝（"list reserves"）。
-constexpr const char* kCardListOverflow =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"list\",\"bind_data\":\"items\",\"max\":20,\"item\":{\"type\":\"row\",\"children\":["
-    "{\"type\":\"icon\",\"icon\":\"dot\"},{\"type\":\"label\",\"text\":\"{item.name}\"},"
-    "{\"type\":\"label\",\"text\":\"{item.price}\"},{\"type\":\"button\",\"text\":\"A\"},"
-    "{\"type\":\"button\",\"text\":\"B\"}]}}]}}";
-
-// T3：行模板里挂 toggle——validate 应同步拒绝（"list row templates can't use"）。
-constexpr const char* kCardListBadAction =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"list\",\"bind_data\":\"items\",\"item\":{\"type\":\"row\",\"id\":\"row\",\"children\":["
-    "{\"type\":\"label\",\"text\":\"{item.name}\"},{\"type\":\"button\",\"text\":\"展开\","
-    "\"on_click\":[{\"do\":\"toggle\",\"target\":\"row\"}]}]}}]}}";
-
-// verifier 判 medium fix 2 负例：list 的 item 模板里再嵌一层 list——外层重渲时 lv_obj_clean
-// 整个行子树会把内层 list 的 DataConsumer/json_pool 变悬垂指针，且每次重渲无界增长；
-// validate 应同步拒绝（"a list can't nest inside another list's item template"）。
-constexpr const char* kCardListNested =
-    "{\"data\":{\"outer\":[{\"inner\":[{\"t\":\"x\"}]}]},\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"list\",\"bind_data\":\"outer\",\"item\":{\"type\":\"list\",\"bind_data\":\"inner\","
-    "\"item\":{\"type\":\"label\",\"text\":\"{item.t}\"}}}]}}";
+    "\"root\":["
+    "{\"cells\":[{\"type\":\"label\",\"role\":\"title\",\"text\":\"快路径清单\"}]},"
+    "{\"item\":[{\"type\":\"label\",\"text\":\"{item.name}\"},"
+    "{\"type\":\"label\",\"role\":\"value\",\"text\":\"¥{item.price}\"}],"
+    "\"bind_rows\":\"items\",\"max\":4,\"empty\":\"清单为空\"}"
+    "]}";
 
 // T7：choice 的 on_change 直接 report "你选了{label}"——{label} 只在**触发控件本身就是
 // choice** 时有值（ChoiceLabel(target,...) 里 target=触发控件；隔壁按钮点它是取不到 choice
@@ -994,62 +609,6 @@ constexpr const char* kCardStandby =
     "{\"type\":\"button\",\"text\":\"切换网络\","
     "\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"net.switch_type\"}]}"
     "]}]}}";
-
-// 负例：chart 的 bind_history 指向一个未声明历史的路径（audio.volume 是可写 Int 但没
-// keep_history）——Validate 应同步拒绝并列出可用历史路径（D16）。
-constexpr const char* kCardChartBadHistory =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"chart\",\"bind_history\":\"audio.volume\"}]}}";
-
-// 负例：invoke 指向未注册命令（power.off 按编排者裁决压根不注册）——ValidateActions 应
-// 同步拒绝并列出可用命令清单（D12）。
-constexpr const char* kCardInvokeBad =
-    "{\"root\":{\"type\":\"column\",\"children\":["
-    "{\"type\":\"button\",\"text\":\"x\",\"on_click\":[{\"do\":\"invoke\",\"cmd\":\"power.off\"}]}]}}";
-
-// Commit 3 E1 grid 负例（均应被 Validate 同步拒绝，is_error=true）。
-constexpr const char* kGridNoCols =
-    "{\"root\":{\"type\":\"grid\",\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
-constexpr const char* kGridEmptyCols =
-    "{\"root\":{\"type\":\"grid\",\"cols\":[],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
-constexpr const char* kGridSevenCols =
-    "{\"root\":{\"type\":\"grid\",\"cols\":[1,1,1,1,1,1,1],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
-constexpr const char* kGridBadElem =
-    "{\"root\":{\"type\":\"grid\",\"cols\":[1,-1,1],\"children\":[{\"type\":\"label\",\"text\":\"x\"}]}}";
-constexpr const char* kGridSpanOver =
-    "{\"root\":{\"type\":\"grid\",\"cols\":[2,1],\"children\":["
-    "{\"type\":\"label\",\"text\":\"x\",\"span\":3}]}}";
-// 正例：column justify 未知值 "middle" → 不拒绝、回落默认、hints 含回落提示。
-constexpr const char* kGridJustifyFallback =
-    "{\"root\":{\"type\":\"column\",\"justify\":\"middle\",\"children\":["
-    "{\"type\":\"label\",\"text\":\"x\"}]}}";
-
-// 撑爆 64 节点预算：grid cols[1] + 70 个 label cell（1 grid + 70 = 71 > 64）→ 应被拒。
-std::string BuildGridOverflow() {
-    std::string s = "{\"root\":{\"type\":\"grid\",\"cols\":[1],\"children\":[";
-    for (int i = 0; i < 70; i++) {
-        if (i) s += ",";
-        s += "{\"type\":\"label\",\"text\":\"n\"}";
-    }
-    s += "]}}";
-    return s;
-}
-
-// 正例断言：期望 is_error=false 且 hints 含指定子串（回落提示）。
-void RenderExpectOkWithHint(const char* spec, const char* tag, const char* want_hint) {
-    cJSON* args = cJSON_Parse(spec);
-    if (!args) {
-        std::fprintf(stderr, "[sim] %s JSON parse failed\n", tag);
-        return;
-    }
-    bool is_err = false;
-    char* res = pi_card_tool_render(args, &is_err);
-    const bool has_hint = res && std::strstr(res, want_hint) != nullptr;
-    std::fprintf(stderr, "[sim][positive] %-14s -> %s (%s, hint %s)\n", tag, res ? res : "(null)",
-                 is_err ? "竟被拒 ✗" : "通过 ✓", has_hint ? "含回落 ✓" : "缺回落 ✗");
-    free(res);
-    cJSON_Delete(args);
-}
 
 // TEMP SCAFFOLD（消息流「贴底跟随」验证）：往 chat feed 里追加一张普通卡片（非 overlay）。
 // 每追加一张都会走 CardEndRow → ScrollFeedToBottom(false)——即模型侧输出的那条跟随分支，
@@ -1150,15 +709,18 @@ void RenderStandbyOversized() {
 void RenderDemoCard() {
     const char* idx_env = std::getenv("PI_SIM_CARD_IDX");
     int idx = idx_env ? std::atoi(idx_env) : 0;
-    std::string tall;
-    const char* spec;
-    const int n_static = static_cast<int>(sizeof(kCards) / sizeof(kCards[0]));
-    if (idx >= 0 && idx < n_static) {
-        spec = kCards[idx];
-    } else {
-        tall = BuildTallCard();  // idx == n_static（kCards[] 实际条数，随数组增删自适应）→ 超高卡
-        spec = tall.c_str();
+    std::vector<std::string>& cards = CorpusCards();
+    const int n_static = static_cast<int>(cards.size());
+    if (n_static == 0) {
+        std::fprintf(stderr, "[sim] demo card: corpus not found (CorpusDir='%s')\n",
+                     CorpusDir().c_str());
+        return;
     }
+    // 越界（含原 v1 "超高卡" 兜底槽——25_grid_tall.json 已在语料第 22 位覆盖同一验收目的，
+    // §5.2 idx25）：钳到最后一张，而不是渲染一张越界卡。
+    if (idx < 0) idx = 0;
+    if (idx >= n_static) idx = n_static - 1;
+    const char* spec = cards[idx].c_str();
     cJSON* args = cJSON_Parse(spec);
     if (!args) {
         std::fprintf(stderr, "[sim] demo card %d JSON parse failed\n", idx);
@@ -1458,7 +1020,10 @@ void RenderPreset(const std::string& name) {
         cJSON_AddStringToObject(i2, "text", "导出记录");
         cJSON_AddItemToArray(items, i2);
     }
-    // 负向：未知 preset 名（如 "presetbad"）故意不填 slots 必需字段，走 ExpandPreset 的具名错误串。
+    // preset/slots 已随 v2 重构整删（docs/CARD_V2.md §3 决策 A）：这条命令与下面的
+    // "presetbad" 命令都是 v1 遗留，如今只会走 Repair() 的"顶层 preset/slots 残留→拒绝"分支，
+    // 不再有具名的 preset 校验错误串——保留命令仅为观察这条拒绝路径本身，不在本轮 v2 迁移
+    // 范围内（sim/main.cc 授权改动清单未列出 preset/presetbad）。
     bool is_err = false;
     char* res = pi_card_tool_render(args, &is_err);
     std::fprintf(stderr, "[sim] preset %s -> %s (%s)\n", name.c_str(), res ? res : "(null)",
@@ -1802,7 +1367,8 @@ void ExecCmd(const std::string& line) {
             items.push_back(std::move(m));
         }
         media::MediaController::Instance().StagePlaylist(items, -1);
-        std::fprintf(stderr, "[sim][mediastage] staged %zu stations (no autoplay)\n", items.size());
+        std::fprintf(stderr, "[sim][mediastage] staged %u stations (no autoplay)\n",
+                     static_cast<unsigned>(items.size()));
     } else if (cmd == "mediaplay") {  // TEMP SCAFFOLD: mediaplay <path_or_url> — 单曲起播（金标 WAV
                                       // dump / HLS 验收用）；.m3u8 或 http 前缀按流处理
         std::string p;
@@ -1850,6 +1416,10 @@ void ExecCmd(const std::string& line) {
         int n_lines = -1;
         ss >> path >> n_lines >> shot_path;
         ExecPreviewScene(path, n_lines, shot_path);
+    } else if (cmd == "previewscenechunks") {  // TEMP SCAFFOLD: previewscenechunks <json_file> <shot_path>
+        std::string path, shot_path;
+        ss >> path >> shot_path;
+        ExecPreviewSceneChunks(path, shot_path);
     } else if (cmd == "bargein") {  // TEMP SCAFFOLD: simulate a barge-in/new-session gen bump
         ExecBargeIn();
     } else if (cmd == "rendercard") {  // TEMP SCAFFOLD: rendercard <file> — real ui_render from raw JSON file
@@ -1875,30 +1445,15 @@ void ExecCmd(const std::string& line) {
         RenderIconButtonCard();
     } else if (cmd == "formcard") {  // TEMP SCAFFOLD: render the report-snapshot / toggle test card
         RenderFormCard();
-    } else if (cmd == "badcards") {  // TEMP SCAFFOLD: validator negative cases (bad/missing target)
-        RenderBadCard(kBadToggleCard, "坏 target");
-        RenderBadCard(kNoTargetCard, "缺 target");
-        std::string long_qr = BuildLongQrCard();
-        RenderBadCard(long_qr.c_str(), "qrcode 超长");
-        RenderBadCard(kCardChoiceBad, "choice 单项");
-        RenderBadCard(kCardSliderStringBind, "slider绑string");
-        // Phase2 T2/T3：list 节点预算超限 / 行内非法动作，均应在 worker 侧同步被拒。
-        RenderBadCard(kCardListOverflow, "list超预算");
-        RenderBadCard(kCardListBadAction, "list行内toggle");
-        RenderBadCard(kCardListNested, "list嵌套list");  // verifier fix2 负例
-        // Phase3：chart bind_history 非历史路径 / invoke 未注册命令，均应同步被拒（D12/D16）。
-        RenderBadCard(kCardChartBadHistory, "chart绑非history路径");
-        RenderBadCard(kCardInvokeBad, "invoke未注册cmd");
-        // Commit 3 E1：grid 结构性负例（cols 缺失/空/7列/元素-1/span越界/撑爆64节点）全应拒；
-        // column justify 未知值走回落正例（不拒 + hints 含回落提示）。
-        RenderBadCard(kGridNoCols, "grid缺cols");
-        RenderBadCard(kGridEmptyCols, "grid空cols");
-        RenderBadCard(kGridSevenCols, "grid7列");
-        RenderBadCard(kGridBadElem, "grid元素-1");
-        RenderBadCard(kGridSpanOver, "grid span越界");
-        RenderBadCard(BuildGridOverflow().c_str(), "grid撑爆64");
-        RenderExpectOkWithHint(kGridJustifyFallback, "justify middle",
-                               "is not a recognized value");
+    } else if (cmd == "badcards") {  // v2: sim/tests/corpus/negative/*.json 全部 11 个文件，
+        // 逐个渲染，断言全部同步被 Validate 拒绝（is_error==true）。取代 v1 各种手写负例常量
+        // （bad target / list 超预算 / grid 结构性负例等——v1 shape 本身已被 v2 Validate 拒绝，
+        // 不再是"这条具体规则"的针对性负例，语料目录下的 11 个才是 v2 Validate 的权威负例集）。
+        for (int i = 0; i < kNumCorpusNegFiles; i++) {
+            std::string spec = ReadCorpusFile(std::string("negative/") + kCorpusNegFiles[i]);
+            if (spec.empty()) continue;
+            RenderBadCard(spec.c_str(), kCorpusNegFiles[i]);
+        }
     } else if (cmd == "p1grid") {  // Commit 3 P1: standby grid pin persists → RehydratePin re-renders
         // 直写一张 standby grid 卡的 pin 封套到 NVS（模拟上次会话已持久化），再调
         // RehydratePin（模拟重启回灌）：grid 应 Validate 通过并重渲，不被 discard/erase。
@@ -1992,9 +1547,9 @@ void ExecCmd(const std::string& line) {
     } else if (cmd == "budget") {  // Phase2 T9: system prompt + ui_render desc 字节预算
         const char* sysp = pi_card_system_prompt();
         const char* desc = pi_card_render_desc();
-        size_t sys_len = std::strlen(sysp);
-        size_t desc_len = std::strlen(desc);
-        std::fprintf(stderr, "[sim][budget] sys=%zu desc=%zu sum=%zu (limit 9216) %s\n", sys_len,
+        unsigned sys_len = static_cast<unsigned>(std::strlen(sysp));
+        unsigned desc_len = static_cast<unsigned>(std::strlen(desc));
+        std::fprintf(stderr, "[sim][budget] sys=%u desc=%u sum=%u (limit 9216) %s\n", sys_len,
                      desc_len, sys_len + desc_len, (sys_len + desc_len <= 9216) ? "OK" : "OVER!");
     } else if (cmd == "sysprompt") {  // Phase2 T9: 打印完整 system prompt 供目视核对
         std::fprintf(stderr, "[sim][sysprompt] %s\n", pi_card_system_prompt());

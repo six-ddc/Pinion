@@ -1,0 +1,27 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "FORM" },
+        { "type": "label", "role": "title", "text": "偏好设置" }
+      ]
+    },
+    {
+      "rows": [
+        [ { "type": "label", "role": "label", "text": "亮度" },
+          { "type": "slider", "id": "bri", "min": 0, "max": 100, "value": 60 } ],
+        [ { "type": "label", "role": "label", "text": "静音" },
+          { "type": "switch", "id": "mute", "checked": false } ],
+        [ { "type": "label", "role": "label", "text": "模式" },
+          { "type": "choice", "id": "mode", "options": [ "省电", "均衡", "性能" ], "value": 1 } ]
+      ]
+    },
+    {
+      "cells": [
+        { "type": "button", "variant": "primary", "text": "保存",
+          "on_click": [ { "do": "report", "text": "已保存" }, { "do": "close" } ] }
+      ]
+    }
+  ]
+}

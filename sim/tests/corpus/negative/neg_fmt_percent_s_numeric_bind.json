@@ -1,0 +1,6 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "bind": "net.rssi", "fmt": "%s" } ] }
+  ]
+}

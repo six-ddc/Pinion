@@ -1,0 +1,28 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "GPS" },
+        { "type": "label", "role": "title", "text": "定位信息" }
+      ]
+    },
+    {
+      "cols": [ { "title": "项" }, { "title": "值" } ],
+      "rows": [
+        [ { "type": "label", "text": "定位" }, { "type": "label", "tone": "ok", "bind": "gps.fix", "fmt": "%d" } ],
+        [ { "type": "label", "text": "纬度" }, { "type": "label", "bind": "gps.lat" } ],
+        [ { "type": "label", "text": "经度" }, { "type": "label", "bind": "gps.lon" } ],
+        [ { "type": "label", "text": "海拔" }, { "type": "label", "tone": "dim", "bind": "gps.alt_m", "fmt": "%d m" } ],
+        [ { "type": "label", "text": "卫星" }, { "type": "label", "bind": "gps.sats", "fmt": "%d 颗" } ]
+      ]
+    },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "cells": [
+        { "type": "button", "variant": "ghost", "text": "停用", "on_click": [ { "do": "invoke", "cmd": "gps.disable" } ] },
+        { "type": "button", "variant": "primary", "text": "启用GPS", "on_click": [ { "do": "invoke", "cmd": "gps.enable" } ] }
+      ]
+    }
+  ]
+}

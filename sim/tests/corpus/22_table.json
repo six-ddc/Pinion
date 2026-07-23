@@ -1,0 +1,13 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "网格表格" } ] },
+    { "cols": [ { "title": "项目" }, { "title": "今日", "num": true }, { "title": "昨日", "num": true } ],
+      "rows": [
+        [ { "type": "label", "text": "温度" }, { "type": "label", "text": "24" }, { "type": "label", "text": "22" } ],
+        [ { "type": "label", "text": "湿度" }, { "type": "label", "text": "60" }, { "type": "label", "text": "55" } ],
+        [ { "type": "label", "text": "气压" }, { "type": "label", "text": "1013" }, { "type": "label", "text": "1009" } ]
+      ]
+    }
+  ]
+}

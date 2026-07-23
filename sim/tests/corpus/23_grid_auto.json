@@ -1,0 +1,13 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "auto 轨道" } ] },
+    { "cols": [ { "title": "名称" }, { "title": "值" } ],
+      "rows": [
+        [ { "type": "label", "role": "label", "text": "名称" }, { "type": "label", "role": "value", "text": "Metalio Claw" } ],
+        [ { "type": "label", "role": "label", "text": "固件" }, { "type": "label", "role": "value", "text": "Claw6 v1" } ],
+        [ { "type": "label", "role": "label", "text": "网络" }, { "type": "label", "role": "value", "text": "4G" } ]
+      ]
+    }
+  ]
+}

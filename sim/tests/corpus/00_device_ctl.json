@@ -1,0 +1,47 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "PI CONTROL" },
+        { "type": "label", "role": "title", "text": "设备控制" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "icon", "icon": "volume" },
+        { "type": "slider", "bind": "audio.volume" },
+        { "type": "label", "role": "value", "bind": "audio.volume", "fmt": "%d%%" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "icon", "icon": "sun" },
+        { "type": "slider", "bind": "display.brightness" },
+        { "type": "label", "role": "value", "bind": "display.brightness", "fmt": "%d%%" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "icon", "icon": "battery" },
+        { "type": "bar", "bind": "battery.level" },
+        { "type": "label", "role": "value", "tone": "dim", "bind": "battery.level", "fmt": "%d%%" }
+      ]
+    },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "cells": [
+        { "type": "icon", "icon": "wifi", "tone": "ok" },
+        { "type": "label", "role": "label", "text": "网络" },
+        { "type": "switch", "checked": true, "side": "end" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "button", "variant": "ghost", "text": "取消", "on_click": [ { "do": "close" } ] },
+        { "type": "button", "variant": "primary", "text": "确认",
+          "on_click": [ { "do": "report", "text": "确认" }, { "do": "close" } ] }
+      ]
+    }
+  ]
+}

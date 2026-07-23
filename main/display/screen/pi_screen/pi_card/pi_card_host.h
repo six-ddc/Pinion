@@ -76,23 +76,18 @@ struct UiCard {
         std::string key;                      // 绑定的 data key
         std::string text_tpl;                 // Label：带 {value} 的模板（空=直显原值）
         std::string fmt;                      // Label：可选数值 fmt（预留）
-        cJSON* item_tpl = nullptr;             // List：card-owned 模板（在 json_pool 里）
-        std::string empty_text;                // List：空数组兜底文案
-        int eff_max = 0;                       // List：预留/重渲行上限
-        int depth = 0;                         // List：容器所在深度（重渲行传 depth+1）
-        RenderLimits limits;                    // List：重渲计数用
-        // ---- 改造4：行级 fast path（轻量版）----
-        // 行定位不额外存指针数组——靠"list 容器子节点顺序 == 数组下标"这条不变量，直接
-        // lv_obj_get_child(dc.obj, i) 按位取行，少一份要跟数据同步的状态。empty_shown 为真时
-        // 容器唯一的子节点是 empty_text 占位 label（不是行），fast path 处理任何操作前都要看
-        // 一眼这个标志，别把占位 label 当成第 0 行。
-        bool empty_shown = false;              // List：当前是否正显示 empty_text 占位（0 行）
-        bool tpl_uses_index = false;           // List：行模板序列化后出现过 "{i}"/"{n}" 子串——
-                                                // remove 会让后续行的下标整体前移，这类模板的
-                                                // 显示内容会跟着过时，remove 操作必须退回全量
-                                                // 重建（append/replace 不影响其它行下标，不受
-                                                // 此限制）。RenderNode 渲染时用 TemplateUsesIndex
-                                                // 扫一次算出存下来，不必每次 update 都重扫模板。
+        // ---- List（v2 bind_rows grid）----
+        // v1 遗留的"行模板+item_tpl+RenderNode 逐行插入"机制不适配 v2（bind_rows 展开出的
+        // 每一行是 solver 算过 x/w 的多 cell 网格行，不是单个可以直接挂到 flex 容器末尾的
+        // lv_obj），改成"整 grid 重渲"：grid_spec 是 OnRenderEvent 首次渲染时存下的完整 grid
+        // 块 JSON（card-owned，在 json_pool 里，随卡片存活），数据变化时 pi_card_render.cc 的
+        // RebuildBindRowsGrid() 拿它 + 当前 card->data 重新整块 solver::Solve + 重建，天然吃
+        // 到 grid 自己的 max 声明做"截断区不补行"，不需要额外维护 v1 才需要的行级增量状态
+        // （eff_max/empty_shown/tpl_uses_index 等已随之删除）。
+        cJSON* grid_spec = nullptr;            // List：card-owned 完整 grid 块 JSON（json_pool 持有）
+        int viewport_w = 0;                    // List：首次渲染定下的几何，重渲原样复用
+        int gap = 0;                           // List：同上
+        RenderLimits limits;                    // List：重渲节点计数上限
     };
     std::vector<DataConsumer> consumers;
 };

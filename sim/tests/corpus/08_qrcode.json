@@ -1,0 +1,7 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "label", "role": "title", "text": "扫码" } ] },
+    { "cells": [ { "type": "qrcode", "text": "https://metalio.example" } ] }
+  ]
+}

@@ -1,16 +1,23 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// pi_card::Preview —— 流式生长卡片会话状态机（改造1）
+// pi_card::Preview —— 流式生长卡片会话状态机 v2（docs/CARD_V2.md §4，改造4）
 //
 // ui_render 的参数在 SSE 流入期间，pi_agent_task.c 每收到一片 delta 就把当前累积文本重新
 // parse 成一棵"尽力而为"的 partial cJSON 树，序列化后经 UI_TOOL_ARGS 事件传到这里（drain
-// 侧，LVGL 线程）。本模块据此在聊天流里实时长出一张"预览卡"（零订阅：零 bind observer、零
-// 事件、零 id 注册、零 DataConsumer——因为这时既没有 UiCard，也没有校验过的合法路径；bind
-// 控件的值走 DataHub::ReadForWorker 一次性快照直读，安全路径流式期即显真实值，读不到的
-// 维持 "--"/缺省占位，见 pi_card_render.cc 的 PreviewPeekInt/PreviewSeedBindLabel），流吐完、
-// 真正的 pi_card_tool_render 校验通过、UI_CARD_RENDER 到达时，由正式渲染在同一个 row 容器里
-// "adopt"（接管）这个预览、原地换装成带真实 bind/事件的正式卡，观感上是一帧换装、不跳行。
+// 侧，LVGL 线程）。v2 schema 下 "root" 是 grid 块的竖排数组（§1.1），本模块按
+// pi_card_preview_sig::GridSignature 给每个 grid 下标算一个扁平签名（s_grid_sig[]，
+// §4.2）：下标第一次出现时整块建一次；此后只有"当前最后一个" grid 的签名每帧还会比对——
+// 前面的 grid 一旦其后出现了新 grid 就永久冻结，不再触碰（§4.1 两条生长边：root 数组追加新
+// grid / 末尾 grid 内容生长）。data 折进签名（XOR 数据切片哈希），迟到/变化会让引用它的 grid
+// 签名跟着变，自然触发整块重渲——不需要 v1 那种全树回刷通道。
+//
+// 零订阅：零 bind observer、零事件、零 id 注册、零 DataConsumer——这时既没有 UiCard，也没有
+// 校验过的合法路径；bind 控件的值走 DataHub::ReadForWorker 一次性快照直读，安全路径流式期即
+// 显真实值，读不到的维持 "--"/缺省占位（见 pi_card_render.cc 的 PreviewPeekInt/
+// PreviewSeedBindLabel）。流吐完、真正的 pi_card_tool_render 校验通过、UI_CARD_RENDER 到达
+// 时，由正式渲染在同一个 row 容器里"adopt"（接管）这个预览、原地换装成带真实 bind/事件的正式
+// 卡，观感上是一帧换装、不跳行。
 //
 // 生命周期由 pi_screen.cc 的 DrainQueueTick 驱动（详见各函数头注）：
 //   UI_TOOL_START → PreviewOnToolStart（记住这次是不是 ui_render 在吐字）
@@ -19,8 +26,9 @@
 //   UI_TOOL_END   → PreviewOnToolEnd（校验失败等场景兜底撤除）
 //   UI_AGENT_START/UI_ERROR/UI_DONE，以及每 tick 顶部发现 session gen 变化 → PreviewTeardown
 //
-// 只在 chat 模式生长；overlay/standby（非默认 display）、preset（无 root）一律不预览。
-// 预览行是 feed 的普通子节点，ClearFeed/屏卸载会连同带走——不会悬垂（挂了 DELETE 回调自清）。
+// 只在 chat 模式生长；overlay/standby（非默认 display）一律不预览（v2 已删 preset，不再需要
+// 那一条判据）。预览行是 feed 的普通子节点，ClearFeed/屏卸载会连同带走——不会悬垂（挂了
+// DELETE 回调自清）。
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
@@ -38,10 +46,8 @@ void PreviewOnToolStart(const char* tool_name);
 // cJSON_Parse，不能指望复用 worker 侧的树）。gen 是本次 drain tick 的 session gen（用于预览
 // 首次建行时记下诞生代次，供 PreviewTeardown 判断是否该因新会话/打断被撤）。仅当当前正在流式
 // 的工具是 ui_render 时才处理；一旦顶层 display 值确定不是 "chat"（即不再是 "chat" 的前缀——
-// partial parser 会把半吐的值补全成完整字符串，"ch" 这类前缀要继续等而不是误杀）或出现
-// preset 键（哪怕值还没吐完），本次工具调用永久放弃预览（若已建了行则立即撤除，不新增"仅因
-// display/preset 不合格"之外的第四种撤除时机——这就是那唯一一次主动撤除）。root 还不是
-// object 时安静等待，不算错。
+// partial parser 会把半吐的值补全成完整字符串，"ch" 这类前缀要继续等而不是误杀），本次工具
+// 调用永久放弃预览（若已建了行则立即撤除）。root 还不是数组时安静等待，不算错。
 // 调用方须保证：同一个 DrainQueueTick 里最多调用一次（多条 ARGS 落在同一 tick 时，其余的
 // evt.s1 直接 free，不重复调用——见 pi_screen.cc 的接线注释），避免一个 tick 内被同一批
 // 挤压的 delta 反复重渲。
@@ -67,9 +73,9 @@ void PreviewCheckGen(uint32_t cur_gen);
 // 真卡片）；否则返回 nullptr（调用方走老路径新建一行）。
 lv_obj_t* PreviewAdopt();
 
-// 测试/调试用：返回当前预览会话的树根（对应 args.root），无预览或还没长出内容时为 nullptr。
-// 仅供 sim 验收脚手架窥探节点指针跨帧稳定性用（见 sim/main.cc 的 previewfeed 命令），产品
-// 代码不应依赖它。
+// 测试/调试用：返回当前预览会话的卡片外观容器（MakePreviewCardRoot 建出的那个，子节点是各
+// grid 块——对应 root 数组），无预览或还没长出内容时为 nullptr。仅供 sim 验收脚手架窥探节点
+// 指针跨帧稳定性用（见 sim/main.cc 的 previewfeed 命令），产品代码不应依赖它。
 lv_obj_t* PreviewDebugTree();
 
 }  // namespace pi_card

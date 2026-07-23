@@ -1,0 +1,25 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "title", "text": "换行与分配压力测试" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "label", "text": "这是一段刻意写得很长很长很长的说明文字,用来验证固定宽度卡片里长文本会正确折行显示完整,而不是溢出边界或被裁剪,连续无空格的中文也应当逐字换行铺满可用宽度。" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "button", "text": "一" },
+        { "type": "button", "text": "二" },
+        { "type": "button", "text": "三" },
+        { "type": "button", "text": "四" },
+        { "type": "button", "text": "五" },
+        { "type": "button", "text": "六" }
+      ]
+    }
+  ]
+}

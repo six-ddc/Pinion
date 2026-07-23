@@ -1,0 +1,25 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "CHARTS" },
+        { "type": "label", "role": "title", "text": "功耗 / 性能" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "label", "role": "section", "text": "电压 mV" },
+        { "type": "label", "role": "value", "tone": "dim", "bind": "battery.voltage_mv", "fmt": "%d", "side": "end" }
+      ]
+    },
+    { "cells": [ { "type": "chart", "bind_history": "battery.voltage_mv", "points": 60 } ] },
+    {
+      "cells": [
+        { "type": "label", "role": "section", "text": "CPU %" },
+        { "type": "label", "role": "value", "tone": "dim", "bind": "sys.cpu", "fmt": "%d%%", "side": "end" }
+      ]
+    },
+    { "cells": [ { "type": "chart", "bind_history": "sys.cpu", "points": 60 } ] }
+  ]
+}

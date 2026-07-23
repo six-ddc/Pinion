@@ -1,0 +1,6 @@
+{
+  "display": "overlay",
+  "root": [
+    { "cells": [ { "type": "slider", "bind": "net.ssid" } ] }
+  ]
+}

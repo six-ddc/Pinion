@@ -1,0 +1,35 @@
+{
+  "display": "overlay",
+  "root": [
+    {
+      "cells": [
+        { "type": "label", "role": "eyebrow", "text": "STYLE FAMILY" },
+        { "type": "label", "role": "title", "text": "样式家福" }
+      ]
+    },
+    {
+      "cells": [
+        { "type": "button", "variant": "primary", "text": "主" },
+        { "type": "button", "variant": "default", "text": "默认" },
+        { "type": "button", "variant": "ghost", "text": "描边" },
+        { "type": "button", "variant": "plain", "text": "纯文" }
+      ]
+    },
+    { "cells": [ { "type": "slider", "value": 40 } ] },
+    { "cells": [ { "type": "bar", "value": 65 } ] },
+    {
+      "cells": [
+        { "type": "label", "role": "label", "text": "开关" },
+        { "type": "switch", "checked": true, "side": "end" }
+      ]
+    },
+    { "cells": [ { "type": "choice", "id": "seg", "options": [ "低", "中", "高" ], "value": 1 } ] },
+    { "cells": [ { "type": "divider" } ] },
+    {
+      "fill": "card2",
+      "cells": [
+        { "type": "label", "role": "caption", "text": "fill 容器（圆角 radius 局部设）" }
+      ]
+    }
+  ]
+}
