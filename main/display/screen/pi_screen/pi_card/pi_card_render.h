@@ -115,9 +115,13 @@ lv_obj_t* SyncPreviewNode(lv_obj_t* parent, lv_obj_t* existing, const cJSON* nod
                           int& node_count, int parent_flow = 0, bool row_all_growable = true);
 
 // 预算重算：删除节点时不精确回补 node_count（子树带走几个节点不值得追踪），调用方
-// （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后应该用这个函数对整棵预览树重新计数，
-// 作为下一帧的准确起点。不计入占位对象（RenderPreviewNode 内部的 USER_3 标记）。
-int CountPreviewNodes(lv_obj_t* tree);
+// （PreviewOnArgs）在每帧处理完 SyncPreviewNode 之后用这个函数按**当前快照的 JSON 树**重新
+// 计数，作为下一帧的准确起点。口径必须是 JSON 节点（与 RenderPreviewNode 每个 JSON 节点
+// ++node_count 一致、也与正式渲染的 64 上限同源）——曾按 lv 对象树计数，button 内嵌
+// label/icon、choice 的分段按钮等复合控件的内部对象全被算进预算，58 个 JSON 节点的大卡
+// 在 lv 树里是 70+ 对象，流到后段假性爆预算：该位置若已进定稿区就永远不会重试，正式渲染
+// 正常而预览永久缺一块（控制中心卡的媒体按钮行，真实复现）。
+int CountSpecNodes(const cJSON* node);
 
 // 流式预览的 partial data 上下文：PreviewOnArgs 每帧在 SyncPreviewNode 前把快照顶层的
 // "data" 对象借给渲染器（非 object/缺失传 nullptr 等效清空），bind_data 标签据此直显模板

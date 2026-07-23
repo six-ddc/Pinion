@@ -2091,6 +2091,19 @@ void UpdateDockStat() {
 }
 
 void DrainQueueTick(lv_timer_t*) {
+    // 滚动越界回夹：ui_close 关掉一张高卡（或任何让 feed 内容变矮的删除）后，滚动位置可能
+    // 停在内容底部之外（scroll_bottom<0），视口整个是空的——LVGL 删子节点不会自动回夹滚动，
+    // ScrollFeedToBottom 也只处理"追底"（below>0）不处理越界（sim 复现：关 1300px 高卡后
+    // feedh 显示 scroll_bottom=-605，白屏）。每 tick 廉价核一次，越界就贴回内容底；用户手指
+    // 还按着时不碰（弹性拖拽本就允许瞬时越界，别跟手感打架）。
+    if (s_feed != nullptr && !UserDraggingFeed()) {
+        int32_t below = lv_obj_get_scroll_bottom(s_feed);
+        if (below < 0) {
+            int32_t target = lv_obj_get_scroll_y(s_feed) + below;  // below<0：往回收
+            if (target < 0) target = 0;  // 内容比视口还矮：回到顶，不留负滚动
+            lv_obj_scroll_to_y(s_feed, target, LV_ANIM_ON);
+        }
+    }
     pi_ui_evt_t evt;
     QueueHandle_t q = pi_ui_queue();
     std::string batched_text;

@@ -358,6 +358,35 @@ bool IsRowGrowConditional(const char* type) {
     return std::strcmp(type, "button") == 0 || std::strcmp(type, "choice") == 0;
 }
 
+// grid cell 类判定：这两个只在 grid 分支（正式渲染与预览镜像）落位子节点时用。
+// IsContainerType：默认宽是 PCT(100) 的容器类节点——它们做 FR 轨 cell 时必须 STRETCH（否则
+// START + PCT(100) 解析成整个 grid 内容宽，横穿所有轨道，压住邻列）。
+bool IsContainerType(const char* t) {
+    return std::strcmp(t, "column") == 0 || std::strcmp(t, "row") == 0 ||
+           std::strcmp(t, "grid") == 0 || std::strcmp(t, "list") == 0;
+}
+// GridCellOnAutoTrack：本 cell 落位覆盖的轨道里有没有 "auto"(CONTENT) 轨——见 FLOW_GRID_AUTO
+// 枚举头注。cols 元素是字符串即 auto（与建 dsc 时 IsString→LV_GRID_CONTENT 同口径，预览的
+// 半吐字符串也一致按 auto 对待，收敛帧自然纠正）。
+bool GridCellOnAutoTrack(const cJSON* cols, int col_out, int span) {
+    for (int i = 0; i < span; i++) {
+        const cJSON* c = cJSON_GetArrayItem(cols, col_out + i);
+        if (c != nullptr && cJSON_IsString(c)) return true;
+    }
+    return false;
+}
+// GridHasFrCols：grid 节点的 cols 里有没有数值（fr）列——Lint 用来点名"内容宽位置嵌 fr 列
+// grid"的退化组合（fr 分的是剩余空间，内容宽容器没有剩余空间，fr 轨塌 0）。
+bool GridHasFrCols(const cJSON* grid_node) {
+    const cJSON* cols = GetItem(grid_node, "cols");
+    if (cols == nullptr || !cJSON_IsArray(cols)) return false;
+    const cJSON* c = nullptr;
+    cJSON_ArrayForEach(c, cols) {
+        if (cJSON_IsNumber(c)) return true;
+    }
+    return false;
+}
+
 // ------------------------------ 自适应尺寸 ---------------------------------
 // parent_flow: 0=column（含 root）, 1=row, 2=grid, 3=内容宽列（FLOW_COL_CONTENT）。growable/
 // label 在普通 column 里默认全宽、在 row 里默认按比例分配（flex-grow 1），使「一排按钮均分」
@@ -367,7 +396,12 @@ bool IsRowGrowConditional(const char* type) {
 // 它自己是 LV_SIZE_CONTENT（内容宽，见 RenderNode 的建容器段落），子节点若还按普通 FLOW_COL
 // 默认 100% 宽，就是「父等子内容、子等父 100%」的循环引用，LVGL 实测直接塌陷成 0 宽、整卡
 // 空白——FLOW_COL_CONTENT 下子节点一律退回自然宽，打破循环。
-enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2, FLOW_COL_CONTENT = 3 };
+// FLOW_GRID_AUTO：grid cell 落在 "auto"(LV_GRID_CONTENT) 轨上。CONTENT 轨量尺用的是子项
+// **已解析**的 coords 宽（lv_grid.c calc_cols 的 lv_obj_get_width），PCT(100) 容器子项会被
+// 解析成整个 grid 内容宽、把 auto 轨直接撑爆成整卡宽——这类 cell 的容器子项必须退内容宽
+// （并向下传 FLOW_COL_CONTENT 打破循环引用），落位用 START。FR 轨没有这个问题（纯剩余
+// 空间分配、不看内容），容器子项走 STRETCH 由 item_repos 把 coords 钉成轨道宽。
+enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2, FLOW_COL_CONTENT = 3, FLOW_GRID_AUTO = 4 };
 
 // row_all_growable：本节点所在这一整行的子节点是否**清一色**都是 IsGrowable 类型——由调用方
 // （RenderNode/RenderPreviewNode/PreviewSyncContainer 的 row 子节点遍历处）扫一遍该行的 JSON
@@ -376,7 +410,7 @@ enum { FLOW_COL = 0, FLOW_ROW = 1, FLOW_GRID = 2, FLOW_COL_CONTENT = 3 };
 // （容器自身、grid 单元等场景）。
 void ApplySizing(lv_obj_t* obj, const char* type, const cJSON* node, int parent_flow,
                  bool row_all_growable = true) {
-    if (parent_flow == FLOW_GRID) {
+    if (parent_flow == FLOW_GRID || parent_flow == FLOW_GRID_AUTO) {
         // grid 单元的 growable/STRETCH 由 set_grid_cell 决定，这里只落显式 w/h（无则不动）。
         if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
         if (HasKey(node, "h")) lv_obj_set_height(obj, GetInt(node, "h", 0));
@@ -432,6 +466,25 @@ bool RowChildrenAllGrowable(const cJSON* children) {
         if (!ct || !IsGrowable(ct)) return false;
     }
     return true;
+}
+
+// column 声明了非默认交叉轴对齐（align:center/end）时，label 的"列内默认全宽"（ApplySizing
+// 列分支的 PCT(100)）会让对齐彻底失效——全宽盒子里文本照样靠左，"三列统计牌数值居中"这类
+// 常见诉求（sim case4 复现）看起来就是没居中。这类列里无显式 w/grow 的 label 退自然宽，
+// 交叉轴对齐才有的放矢；max_width 兜底超长文本（FLOW_COL 列必为确定宽，PCT 可解析——
+// 内容宽列走 FLOW_COL_CONTENT，本就自然宽，不经此函数）。幂等 setter，预览生长期可每帧
+// 重打。container_flow 传容器自身的 this_flow/child_flow。
+void ApplyColCrossLabelSizing(lv_obj_t* cobj, const cJSON* child, const cJSON* container,
+                              int container_flow) {
+    if (container_flow != FLOW_COL || cobj == nullptr) return;
+    lv_flex_align_t cross = LV_FLEX_ALIGN_START;
+    FlexCrossOf(GetStr(container, "align"), cross);
+    if (cross == LV_FLEX_ALIGN_START) return;
+    const char* ct = GetStr(child, "type");
+    if (ct == nullptr || std::strcmp(ct, "label") != 0) return;
+    if (HasKey(child, "w") || HasKey(child, "grow")) return;
+    lv_obj_set_width(cobj, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(cobj, LV_PCT(100), LV_PART_MAIN);
 }
 
 // ------------------------------ 默认精致样式 -------------------------------
@@ -964,22 +1017,28 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         // 让子节点也退回自然宽，打破循环；FLOW_ROW 不受影响（row 子节点从不用百分比宽，只用
         // flex_grow 或自然宽，没有这个循环）。
         const bool col_content_width = !is_row &&
-                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                                        parent_flow == FLOW_GRID_AUTO) &&
                                        !HasKey(node, "w") && !HasKey(node, "grow");
         this_flow = is_row ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
         obj = lv_obj_create(parent);
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        // 嵌套容器默认宽：父是 row（或父是内容宽列，链式传递）时用内容宽（LV_SIZE_CONTENT），
-        // 让并排的两个 column/row 各自窄到自己内容、不再互相挤到下一行；父是 column/顶层（含
-        // grid，未受影响）时维持 PCT(100)——列内容器满宽本就是正确默认。显式 grow 仍优先：
+        // 嵌套容器默认宽：父是 row（或父是内容宽列，链式传递）或 auto 轨 grid cell 时用内容宽
+        // （LV_SIZE_CONTENT），让并排的两个 column/row 各自窄到自己内容、不再互相挤到下一行；
+        // 父是 column/顶层时维持 PCT(100)——列内容器满宽本就是正确默认。父是 FR 轨 grid cell
+        // （FLOW_GRID）时 PCT(100) 只是无害初值：落位走 STRETCH，item_repos 会把 coords 钉成
+        // 轨道宽（w_layout=1 后 style 宽不再参与自量）——曾经容器不在 STRETCH 名单里、又吃
+        // PCT(100)（= 整个 grid 内容宽），左列滑块横穿整卡压住右列（真机控制中心卡复现）。
+        // 显式 grow 仍优先：
         // ApplySizing 随后若见到 grow 键会用 flex_grow 撑开，不受这里初始宽度影响（LVGL
         // flex_grow>0 时按主轴权重分配，不看 width 属性——这也是 grow 转义舱不受循环引用影响
         // 的原因：flex_grow 撑出的是确定宽，不是内容宽）。
         if (HasKey(node, "w")) {
             lv_obj_set_width(obj, GetInt(node, "w", 0));
-        } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) {
+        } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                   parent_flow == FLOW_GRID_AUTO) {
             lv_obj_set_width(obj, LV_SIZE_CONTENT);
         } else {
             lv_obj_set_width(obj, LV_PCT(100));
@@ -1006,7 +1065,15 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(obj, &s_transp_bg, LV_PART_MAIN);
-        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+        // 默认宽口径同 column/row 分支：父是 row/内容宽列/auto 轨 cell 时 PCT 解析不出正确值
+        // （content 父下 PCT 塌 0 / auto 轨下 PCT 撑爆），退内容宽；注意内容宽 grid 里 FR 轨
+        // 没有"剩余空间"可分（全 auto 列才有意义），Lint 侧另有提示。
+        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
+        else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                 parent_flow == FLOW_GRID_AUTO)
+            lv_obj_set_width(obj, LV_SIZE_CONTENT);
+        else
+            lv_obj_set_width(obj, LV_PCT(100));
         lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
         int gap = GetInt(node, "gap", 12);
         lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
@@ -1051,10 +1118,13 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         row = 0;
         cJSON_ArrayForEach(ch, children) {
             int span = place_next(GetInt(ch, "span", 1), cursor, row, col_out, row_out);
-            lv_obj_t* cobj =
-                RenderNode(obj, ch, card, limits, depth + 1, node_count, err, FLOW_GRID, in_list_row);
+            const bool cell_auto = GridCellOnAutoTrack(cols, col_out, span);
+            lv_obj_t* cobj = RenderNode(obj, ch, card, limits, depth + 1, node_count, err,
+                                        cell_auto ? FLOW_GRID_AUTO : FLOW_GRID, in_list_row);
             if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
             // col_align 镜像 ApplySizing column：growable/label/divider 铺满列(STRETCH)，
+            // 容器（column/row/grid/list）在 FR 轨同样 STRETCH（钉成轨道宽；auto 轨则 START+
+            // 内容宽，见 FLOW_GRID_AUTO 头注——STRETCH 在 CONTENT 轨会跟量尺互相喂大），
             // 其余（icon/switch/qrcode…）及显式 w 靠列首(START)。row_align 竖向居中。
             // 例外：带 bind/bind_data 的 label 保持 START（内容宽）——渲染时它的文本还是
             // 空的，"auto" 列按空文本量出 ≈0 宽，STRETCH 会把它钉死在 0 宽上；数据到达后
@@ -1065,7 +1135,8 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
                                    (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
             lv_grid_align_t col_align = LV_GRID_ALIGN_START;
             if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
-                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
+                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0 ||
+                 (IsContainerType(ct) && !cell_auto))) {
                 col_align = LV_GRID_ALIGN_STRETCH;
             }
             lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
@@ -1365,9 +1436,10 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) {
-                if (!RenderNode(obj, child, card, limits, depth + 1, node_count, err, this_flow,
-                               in_list_row, child_row_all_growable))
-                    return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
+                lv_obj_t* cobj = RenderNode(obj, child, card, limits, depth + 1, node_count, err,
+                                            this_flow, in_list_row, child_row_all_growable);
+                if (cobj == nullptr) return nullptr;  // 失败向上冒泡，host 删 root 整卡回滚
+                ApplyColCrossLabelSizing(cobj, child, node, this_flow);
             }
         }
     }
@@ -1406,13 +1478,18 @@ lv_obj_t* MakePreviewPlaceholder(lv_obj_t* parent) {
 // 预算重算：node_count 在单次 PreviewOnArgs 调用内靠 ++node_count 实时计数（防止一帧里连续
 // 新建/晋升多个节点时超预算），但删除节点时不精确回补（子树到底带走了几个节点不值得追踪，
 // 容易算错——verify-m2 抓到的第二个真实 bug：只减 1，删掉的若是带孙子的子树就会少减）。
-// 每次 PreviewOnArgs 处理完一帧后改用这个函数全树重算一次，作为下一帧的准确起点——树本就不
-// 大（≤64），重算成本可忽略。占位对象（USER_3）不计数、不递归其子节点（它本来就没有子节点）。
-int CountPreviewNodes(lv_obj_t* obj) {
-    if (!obj) return 0;
-    int count = lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_3) ? 0 : 1;
-    uint32_t n = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < n; i++) count += CountPreviewNodes(lv_obj_get_child(obj, i));
+// 每次 PreviewOnArgs 处理完一帧后按当前快照的 JSON 树全量重算一次，作为下一帧的准确起点——
+// 树本就不大（≤64），重算成本可忽略。计数口径见 pi_card_render.h 的声明头注（必须数 JSON
+// 节点，不能数 lv 对象——复合控件的内部对象会把预算数爆）。list 的 item 模板不展开、不递归
+// （预览端 list 本就渲成占位，1 个 JSON 节点对应 1 个占位对象，计 1 是诚实口径）。
+int CountSpecNodes(const cJSON* node) {
+    if (!cJSON_IsObject(node)) return 0;
+    int count = 1;
+    const cJSON* children = GetItem(node, "children");
+    if (children != nullptr && cJSON_IsArray(children)) {
+        const cJSON* c = nullptr;
+        cJSON_ArrayForEach(c, children) count += CountSpecNodes(c);
+    }
     return count;
 }
 
@@ -1428,7 +1505,8 @@ void ApplyPreviewContainerGeom(lv_obj_t* obj, bool is_row, const cJSON* node, in
     // 注的循环引用说明）：父是 row 或父是内容宽列时内容宽，否则（含顶层）PCT(100)；显式 w 优先。
     if (HasKey(node, "w")) {
         lv_obj_set_width(obj, GetInt(node, "w", 0));
-    } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) {
+    } else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+               parent_flow == FLOW_GRID_AUTO) {
         lv_obj_set_width(obj, LV_SIZE_CONTENT);
     } else {
         lv_obj_set_width(obj, LV_PCT(100));
@@ -1651,7 +1729,11 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         return MakePreviewPlaceholder(parent);  // 数据驱动/自管生命周期类型：预览没有
                          // card->data、没有 DataHub 订阅上下文，占位、不建实体、不占预算。
     }
-    if (node_count >= kPreviewMaxNodes) return MakePreviewPlaceholder(parent);  // 预算耗尽：占位停止生长，不报错
+    // 预算耗尽：占位停止生长，不报错。阈值放 2×：帧内是"先删旧再重渲"的滚动计数（grid 整块
+    // 重建时旧子树的计数还没被帧尾重算冲掉，新子树又全额 ++），贴着 64 卡会让接近满额的卡
+    // 在最后一次 grid 重建时误伤真节点——留一倍瞬时余量，真正的失控流仍被兜住；帧尾
+    // CountSpecNodes 会把口径拉回真实 JSON 节点数。
+    if (node_count >= kPreviewMaxNodes * 2) return MakePreviewPlaceholder(parent);
 
     lv_obj_t* obj = nullptr;
     const bool is_container = std::strcmp(type, "column") == 0 || std::strcmp(type, "row") == 0;
@@ -1677,7 +1759,13 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         screen_strip_obj_chrome(obj);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_width(obj, HasKey(node, "w") ? GetInt(node, "w", 0) : LV_PCT(100));
+        // 默认宽口径镜像 RenderNode 的 grid 分支（见那里的头注）。
+        if (HasKey(node, "w")) lv_obj_set_width(obj, GetInt(node, "w", 0));
+        else if (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                 parent_flow == FLOW_GRID_AUTO)
+            lv_obj_set_width(obj, LV_SIZE_CONTENT);
+        else
+            lv_obj_set_width(obj, LV_PCT(100));
         lv_obj_set_height(obj, HasKey(node, "h") ? GetInt(node, "h", 0) : LV_SIZE_CONTENT);
         int gap = GetInt(node, "gap", 12);
         lv_obj_set_style_pad_row(obj, gap, LV_PART_MAIN);
@@ -1719,9 +1807,12 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         cur_row = 0;
         cJSON_ArrayForEach(ch, children) {
             int span = place_next(GetInt(ch, "span", 1), cursor, cur_row, col_out, row_out);
-            // FLOW_GRID：子项跳过全部 flex 尺寸默认（同正式渲染），宽度语义归 set_grid_cell
-            // 的 col_align 管；STRETCH/START 判据逐字镜像 RenderNode 的 grid 分支。
-            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count, FLOW_GRID);  // 失败即占位，永不 null
+            // FLOW_GRID/FLOW_GRID_AUTO：子项跳过全部 flex 尺寸默认（同正式渲染），宽度语义归
+            // set_grid_cell 的 col_align 管；STRETCH/START 判据逐字镜像 RenderNode 的 grid 分支
+            // （容器 FR 轨 STRETCH、auto 轨 START+内容宽，见 FLOW_GRID_AUTO 头注）。
+            const bool cell_auto = GridCellOnAutoTrack(cols, col_out, span);
+            lv_obj_t* cobj = RenderPreviewNode(obj, ch, depth + 1, node_count,
+                                               cell_auto ? FLOW_GRID_AUTO : FLOW_GRID);  // 失败即占位，永不 null
             // 口径同 RenderNode 的 grid 分支：带 bind/bind_data 的 label 不 STRETCH，防
             // "空文本量列 → 0 宽钉死 → 数据到了逐字竖排"的 auto 列塌缩（见那里的头注）。
             const char* ct = GetStr(ch, "type");
@@ -1729,7 +1820,8 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
                                    (GetStr(ch, "bind") || GetStr(ch, "bind_data"));
             lv_grid_align_t col_align = LV_GRID_ALIGN_START;
             if (!HasKey(ch, "w") && !dyn_label && ct != nullptr &&
-                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0)) {
+                (IsGrowable(ct) || std::strcmp(ct, "label") == 0 || std::strcmp(ct, "divider") == 0 ||
+                 (IsContainerType(ct) && !cell_auto))) {
                 col_align = LV_GRID_ALIGN_STRETCH;
             }
             lv_obj_set_grid_cell(cobj, col_align, col_out, span, LV_GRID_ALIGN_CENTER, row_out, 1);
@@ -1856,7 +1948,8 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         // 子节点传 FLOW_COL_CONTENT 而非普通 FLOW_COL，打破"父等子内容、子等父 100%"循环
         // 引用（见 FLOW_COL_CONTENT 枚举头注）。
         const bool col_content_width = !is_row_type &&
-                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                       (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                                        parent_flow == FLOW_GRID_AUTO) &&
                                        !HasKey(node, "w") && !HasKey(node, "grow");
         const int child_flow =
             is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
@@ -1868,8 +1961,9 @@ lv_obj_t* RenderPreviewNode(lv_obj_t* parent, const cJSON* node, int depth, int&
         if (children && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
             cJSON_ArrayForEach(child, children) {
-                RenderPreviewNode(obj, child, depth + 1, node_count, child_flow,
-                                  child_row_all_growable);  // 静默跳过失败子节点
+                lv_obj_t* cobj = RenderPreviewNode(obj, child, depth + 1, node_count, child_flow,
+                                                   child_row_all_growable);  // 静默跳过失败子节点
+                ApplyColCrossLabelSizing(cobj, child, node, child_flow);
             }
         }
         // 打预览容器记号 + 记 committed 游标：认定最后一个已建子节点仍是"生长边"，留给下次
@@ -1969,7 +2063,8 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     // 口径同 RenderNode/RenderPreviewNode：本容器若是内容宽列，子节点传 FLOW_COL_CONTENT 打破
     // 循环引用（见 FLOW_COL_CONTENT 枚举头注）。
     const bool col_content_width = !is_row_type &&
-                                   (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT) &&
+                                   (parent_flow == FLOW_ROW || parent_flow == FLOW_COL_CONTENT ||
+                                    parent_flow == FLOW_GRID_AUTO) &&
                                    !HasKey(json_container, "w") && !HasKey(json_container, "grow");
     const int child_flow =
         is_row_type ? FLOW_ROW : (col_content_width ? FLOW_COL_CONTENT : FLOW_COL);
@@ -2013,8 +2108,10 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
             if (existing) lv_obj_delete(existing);  // node_count 由 PreviewOnArgs 收尾整树重算
             lv_n = lv_obj_get_child_count(lv_container);
         }
-        RenderPreviewNode(lv_container, cJSON_GetArrayItem(children, static_cast<int>(committed)),
-                          depth + 1, node_count, child_flow, child_row_all_growable);
+        const cJSON* cj = cJSON_GetArrayItem(children, static_cast<int>(committed));
+        lv_obj_t* cobj = RenderPreviewNode(lv_container, cj, depth + 1, node_count, child_flow,
+                                           child_row_all_growable);
+        ApplyColCrossLabelSizing(cobj, cj, json_container, child_flow);
         lv_n = lv_obj_get_child_count(lv_container);
         committed++;
     }
@@ -2022,8 +2119,9 @@ void PreviewSyncContainer(lv_obj_t* lv_container, const cJSON* json_container, i
     // 2) 生长边（第 n-1 个）：find-or-create，递归/原地更新/删旧重建三选一（见 SyncPreviewNode）。
     lv_obj_t* existing_edge =
         (lv_n > committed) ? lv_obj_get_child(lv_container, static_cast<uint32_t>(committed)) : nullptr;
-    SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1), depth + 1,
-                    node_count, child_flow, child_row_all_growable);
+    lv_obj_t* edge_obj = SyncPreviewNode(lv_container, existing_edge, cJSON_GetArrayItem(children, n - 1),
+                                         depth + 1, node_count, child_flow, child_row_all_growable);
+    ApplyColCrossLabelSizing(edge_obj, cJSON_GetArrayItem(children, n - 1), json_container, child_flow);
     lv_obj_set_user_data(lv_container, reinterpret_cast<void*>(static_cast<intptr_t>(committed)));
 }
 
@@ -2349,8 +2447,44 @@ struct LintState {
     int max_depth = 0;
     int primary_count = 0;
     bool has_label = false;
+    bool emoji_seen = false;        // 整卡只提示一次，别按节点刷屏
+    bool split_grids_seen = false;  // 同上：兄弟同构 grid 提示整卡一次
     std::vector<std::string>* hints = nullptr;
 };
+
+// 设备字体（puhui/mono/lucide）没有 emoji 字形，text 里的 emoji 上屏就是缺字豆腐块（sim
+// 控制中心卡的 🔊💡⚙️⏱📡🎵 全部复现）。粗扫 UTF-8 码点：补充平面 + BMP 杂项符号/技术符号
+// /箭头符号段（含变体选择符 FE0F）视为 emoji；℃(0x2103)、°(0xB0)、·(0xB7) 等正常排版符号
+// 不在范围内，不误伤。
+bool TextHasEmoji(const char* s) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p != 0) {
+        uint32_t cp = 0;
+        int len = 1;
+        if (*p < 0x80) {
+            cp = *p;
+        } else if ((*p & 0xE0) == 0xC0) {
+            cp = *p & 0x1F;
+            len = 2;
+        } else if ((*p & 0xF0) == 0xE0) {
+            cp = *p & 0x0F;
+            len = 3;
+        } else if ((*p & 0xF8) == 0xF0) {
+            cp = *p & 0x07;
+            len = 4;
+        }
+        for (int i = 1; i < len; i++) {
+            if ((p[i] & 0xC0) != 0x80) { len = i; break; }  // 截断/坏序列：按已读部分推进
+            cp = (cp << 6) | (p[i] & 0x3F);
+        }
+        p += len;
+        if (cp == 0xFE0F || cp >= 0x1F000 || (cp >= 0x2600 && cp <= 0x27BF) ||
+            (cp >= 0x2300 && cp <= 0x23FF) || (cp >= 0x2B00 && cp <= 0x2BFF)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // 粗略数一棵模板子树的节点数（不生成 hint，仅供 list 的 eff×tcount 预估用）。
 int CountTemplateNodes(const cJSON* node) {
@@ -2396,6 +2530,16 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
     LintInvokeConfirm(GetItem(node, "on_click"), st.hints);
     LintInvokeConfirm(GetItem(node, "on_change"), st.hints);
     LintInvokeConfirm(GetItem(node, "on_release"), st.hints);
+    if (!st.emoji_seen) {
+        const char* text = GetStr(node, "text");
+        if (text != nullptr && TextHasEmoji(text)) {
+            st.emoji_seen = true;
+            st.hints->push_back(
+                "Text contains emoji, but the device fonts have no emoji glyphs — they render as "
+                "missing-glyph boxes; drop them or use icon nodes / button icon (Lucide names) "
+                "instead.");
+        }
+    }
     if (std::strcmp(type, "list") == 0) {
         // list 无 "children"，其行数按 eff_max×模板节点数逼近 render 实际用量，累进
         // node_count 让 56/64 上限提示对 list 卡也生效；不深入生成行内 hint（避免同一条
@@ -2520,16 +2664,79 @@ void LintWalk(const cJSON* node, int depth, const cJSON* data, LintState& st) {
                                     "explicit w or drop grow.");
             }
         }
+        // 兄弟同构 grid（列数相同、常被 divider 隔开的"分区表"写法）各自独立量 "auto" 轨宽，
+        // 跨区列永远对不齐（真机设备全览卡复现：三段 3 列 auto grid 三种列宽）。提示合并成
+        // 一个 grid、区标题用 span 占整行——同一轨道模板天然全对齐。整卡提示一次。
+        if (!st.split_grids_seen && !is_row && children != nullptr && cJSON_IsArray(children)) {
+            int grid_n = 0, first_cols = -1;
+            bool same_cols = true;
+            const cJSON* c = nullptr;
+            cJSON_ArrayForEach(c, children) {
+                const char* ct = GetStr(c, "type");
+                if (ct == nullptr || std::strcmp(ct, "grid") != 0) continue;
+                const cJSON* gc = GetItem(c, "cols");
+                const int ncols = (gc != nullptr && cJSON_IsArray(gc)) ? cJSON_GetArraySize(gc) : 0;
+                if (first_cols < 0) first_cols = ncols;
+                else if (ncols != first_cols) same_cols = false;
+                ++grid_n;
+            }
+            if (grid_n >= 2 && same_cols) {
+                st.split_grids_seen = true;
+                st.hints->push_back(
+                    std::to_string(grid_n) +
+                    " sibling grids with the same column count size their \"auto\" tracks "
+                    "independently, so columns will NOT align across sections; merge them into one "
+                    "grid and give each section label span:<cols> to keep a single aligned table.");
+            }
+        }
         if (children != nullptr && cJSON_IsArray(children)) {
             const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) LintWalk(child, depth + 1, data, st);
+            cJSON_ArrayForEach(child, children) {
+                // row 里的容器是内容宽（SIZE_CONTENT）；嵌套 grid 若带 fr 列，fr 按"剩余空间"
+                // 分而内容宽容器没有剩余空间可言——fr 轨塌 0。提示给显式 w 或挪出 row。
+                const char* ct = GetStr(child, "type");
+                if (is_row && ct != nullptr && std::strcmp(ct, "grid") == 0 &&
+                    GridHasFrCols(child) && !HasKey(child, "w") && !HasKey(child, "grow")) {
+                    st.hints->push_back(
+                        "A grid with fr columns nested in a row is content-sized, so its fr tracks "
+                        "have no free space to share and collapse; give the grid an explicit w or "
+                        "move it out of the row.");
+                }
+                LintWalk(child, depth + 1, data, st);
+            }
         }
     } else if (std::strcmp(type, "grid") == 0) {
-        // grid 无 justify/align，只需把子节点纳入 Lint 递归（口径与渲染/校验一致）。
+        // grid 无 justify/align；子节点纳入 Lint 递归（口径与渲染/校验一致）。另提示一种退化
+        // 组合：落在 "auto" 轨上的 cell 若是"带 fr 列的嵌套 grid"——外层 auto 轨按内容量宽、
+        // 内层 fr 又等着按剩余空间分，互相等待，fr 轨塌 0（渲染侧该 cell 已按内容宽处理，
+        // 见 FLOW_GRID_AUTO 头注）。落位游标复刻渲染分支的 place_next 行主序规则。
+        const cJSON* cols = GetItem(node, "cols");
+        const int ncol = (cols != nullptr && cJSON_IsArray(cols)) ? cJSON_GetArraySize(cols) : 0;
         const cJSON* children = GetItem(node, "children");
         if (children != nullptr && cJSON_IsArray(children)) {
+            int cur = 0;
             const cJSON* child = nullptr;
-            cJSON_ArrayForEach(child, children) LintWalk(child, depth + 1, data, st);
+            cJSON_ArrayForEach(child, children) {
+                int span = GetInt(child, "span", 1);
+                if (ncol > 0) {
+                    if (span < 1) span = 1;
+                    if (span > ncol) span = ncol;
+                    if (cur + span > ncol) cur = 0;
+                    const int col_out = cur;
+                    cur += span;
+                    if (cur >= ncol) cur = 0;
+                    const char* ct = GetStr(child, "type");
+                    if (ct != nullptr && std::strcmp(ct, "grid") == 0 &&
+                        GridCellOnAutoTrack(cols, col_out, span) && GridHasFrCols(child) &&
+                        !HasKey(child, "w")) {
+                        st.hints->push_back(
+                            "A grid with fr columns placed in an \"auto\" track is content-sized, "
+                            "so its fr tracks collapse to zero width; use all-\"auto\" columns in "
+                            "the nested grid, give it an explicit w, or make the outer track fr.");
+                    }
+                }
+                LintWalk(child, depth + 1, data, st);
+            }
         }
     }
 }

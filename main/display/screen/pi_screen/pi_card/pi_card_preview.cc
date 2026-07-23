@@ -117,9 +117,10 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     RefreshPreviewDataLabels(s_preview.tree);  // data 迟到补渲已定稿的数据标签（见 render.h 头注）
     PreviewSetData(nullptr);
     // 帧内 ++node_count 只保证本帧不超预算；删除节点时不精确回补（子树带走几个节点不值得
-    // 追踪），故每帧收尾用 CountPreviewNodes 对整树重新计数一遍，做下一帧的准确起点——树很小
-    // （≤64），重算成本可忽略，比精确维护增减量更不容易出错。
-    s_preview.node_count = CountPreviewNodes(s_preview.tree);
+    // 追踪），故每帧收尾按当前快照的 JSON 树重新计数一遍，做下一帧的准确起点——树很小
+    // （≤64），重算成本可忽略，比精确维护增减量更不容易出错。口径必须数 JSON 节点而非 lv
+    // 对象，见 pi_card_render.h 的 CountSpecNodes 头注。
+    s_preview.node_count = CountSpecNodes(root_spec);
     cJSON_Delete(snap);
 }
 
