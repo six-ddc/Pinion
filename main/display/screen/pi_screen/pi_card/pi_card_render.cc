@@ -1090,6 +1090,27 @@ void FinishLeafWidget(lv_obj_t* obj, const cJSON* node, UiCard* card, int x, int
     }
 }
 
+// 行内交叉轴（竖直）居中：solver 只给 x/w（零 LVGL 依赖，§11 硬约束），不知道叶子控件的真实
+// 渲染高度（slider/switch/arc 走 LVGL 主题默认高度，label 走字体行高，都不是 solver 能猜的
+// 像素值）——所以居中只能在渲染器这一层、拿控件建完之后的真实几何来做（同 pi_card_host.cc
+// ReflowOverlay 的 lv_obj_update_layout 手法："强制布局，读到的高度才是准的"）。单叶子的行
+// （独占整行 SPAN_ALL/SQUARE，或折行后就它自己一个）y 恒为 0 == 天然居中，不需要这个函数。
+void CenterRowCross(lv_obj_t* rowobj, const std::vector<lv_obj_t*>& leaf_objs) {
+    if (leaf_objs.size() < 2) return;
+    lv_obj_update_layout(rowobj);
+    int row_h = 0;
+    for (lv_obj_t* o : leaf_objs) {
+        int h = lv_obj_get_height(o);
+        if (h > row_h) row_h = h;
+    }
+    for (lv_obj_t* o : leaf_objs) {
+        int h = lv_obj_get_height(o);
+        int y = (row_h - h) / 2;
+        if (y < 0) y = 0;
+        lv_obj_set_y(o, y);
+    }
+}
+
 // solver 内建的合成表头行（cols[].title 触发）：与真实渲染/预览渲染共用，避免两处各写一份
 // 产生行为漂移（正式渲染见 RenderGridBlock，预览见 RenderGridBlockPreview）。
 void RenderColsHeaderRow(lv_obj_t* rowobj, const std::vector<const cJSON*>& row_cells,
@@ -1197,6 +1218,7 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
             continue;
         }
 
+        std::vector<lv_obj_t*> leaf_objs;
         for (const cJSON* cellj : row_cells) {
             int ci = GetInt(cellj, "ci", -2);
             int x = GetInt(cellj, "x", 0);
@@ -1226,7 +1248,9 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
                 return nullptr;
             }
             FinishLeafWidget(leafobj, leaf, card, x, w, align_s, wrap_mode);
+            leaf_objs.push_back(leafobj);
         }
+        CenterRowCross(rowobj, leaf_objs);
     }
 
     if (owned_rows) cJSON_Delete(owned_rows);
@@ -1698,6 +1722,7 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
             continue;
         }
 
+        std::vector<lv_obj_t*> leaf_objs;
         for (const cJSON* cellj : row_cells) {
             if (node_count >= kPreviewMaxNodes) break;  // 预算耗尽：静默停止生长，不报错
             int ci = GetInt(cellj, "ci", -2);
@@ -1721,7 +1746,9 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
             if (!leafobj) continue;  // chart/stock_chart/半吐 type：跳过不建，不是错误
             ++node_count;
             FinishLeafWidgetPreview(leafobj, leaf, x, w, align_s, wrap_mode);
+            leaf_objs.push_back(leafobj);
         }
+        CenterRowCross(rowobj, leaf_objs);
     }
 
     if (owned_rows) cJSON_Delete(owned_rows);

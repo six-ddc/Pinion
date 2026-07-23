@@ -1192,6 +1192,48 @@ void DumpCardGeom(const char* tag) {
     lv_unlock();
 }
 
+// TEMP SCAFFOLD (pi_card grid 行内竖直居中取证)：递归打印 overlay 卡树里每个 lv_obj 的
+// x/y/w/h + 竖直中心线 y+h/2，用于量化验证同一行内 icon/slider/value 等控件是否真的
+// 居中对齐（肉眼看截图看不出 1px 级偏差，得读数字）。
+void DumpGeomNode(lv_obj_t* obj, int depth) {
+    if (!obj) return;
+    const char* kind = "obj";
+    if (lv_obj_check_type(obj, &lv_label_class))
+        kind = "label";
+    else if (lv_obj_check_type(obj, &lv_slider_class))
+        kind = "slider";
+    else if (lv_obj_check_type(obj, &lv_switch_class))
+        kind = "switch";
+    else if (lv_obj_check_type(obj, &lv_bar_class))
+        kind = "bar";
+    else if (lv_obj_check_type(obj, &lv_arc_class))
+        kind = "arc";
+    else if (lv_obj_check_type(obj, &lv_button_class))
+        kind = "button";
+    int x = (int)lv_obj_get_x(obj), y = (int)lv_obj_get_y(obj);
+    int w = (int)lv_obj_get_width(obj), h = (int)lv_obj_get_height(obj);
+    std::fprintf(stderr, "[sim][geomtree] %*s%s x=%d y=%d w=%d h=%d cy=%d\n", depth * 2, "", kind, x, y,
+                 w, h, y + h / 2);
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) DumpGeomNode(lv_obj_get_child(obj, i), depth + 1);
+}
+void ExecGeomTree(const char* tag) {
+    lv_lock();
+    lv_obj_t* scr = lv_screen_active();
+    uint32_t n = lv_obj_get_child_count(scr);
+    lv_obj_t* scrim = (n > 0) ? lv_obj_get_child(scr, n - 1) : nullptr;
+    lv_obj_t* wrap = (scrim && lv_obj_get_child_count(scrim) > 0) ? lv_obj_get_child(scrim, 0) : nullptr;
+    lv_obj_t* tree = (wrap && lv_obj_get_child_count(wrap) > 0) ? lv_obj_get_child(wrap, 0) : nullptr;
+    if (!tree) {
+        std::fprintf(stderr, "[sim][geomtree] %s no overlay card found\n", tag);
+        lv_unlock();
+        return;
+    }
+    std::fprintf(stderr, "[sim][geomtree] === %s ===\n", tag);
+    DumpGeomNode(tree, 0);
+    lv_unlock();
+}
+
 // TEMP SCAFFOLD: 找到 chat 的消息流容器（pi_screen 的 s_feed 是 static，外部拿不到，故按
 // 特征识别：全屏宽、竖向可滚的那个容器）。
 lv_obj_t* FindFeed(lv_obj_t* parent) {
@@ -1498,6 +1540,10 @@ void ExecCmd(const std::string& line) {
         std::string tag;
         ss >> tag;
         DumpCardGeom(tag.empty() ? "-" : tag.c_str());
+    } else if (cmd == "geomtree") {  // geomtree <tag> — dump overlay card tree x/y/w/h + center-y
+        std::string tag;
+        ss >> tag;
+        ExecGeomTree(tag.empty() ? "-" : tag.c_str());
     } else if (cmd == "hintcard") {  // TEMP SCAFFOLD（B 验收 §4 断言 7）：触发多条 Lint 规则
         RenderBadCard(kCardHints, "hints");
     } else if (cmd == "choicebind") {  // TEMP SCAFFOLD（B 验收断言 18 可写 bind 半支）
