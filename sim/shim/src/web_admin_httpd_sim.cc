@@ -1,11 +1,11 @@
-// media_admin_httpd_sim.cc — sim 端极简 POSIX socket HTTP 薄壳。
+// web_admin_httpd_sim.cc — sim 端极简 POSIX socket HTTP 薄壳。
 //
-// 挂同一套 media_admin_core + 同一份内嵌网页，监听 127.0.0.1:8080，实现与设备
-// 端 media_admin::httpd 相同的接口，供 pi_settings 文件管理页与浏览器复用。
+// 挂同一套可移植 core（web_admin_fs / web_admin_config）+ 同一份内嵌网页，监听
+// 127.0.0.1:8080，实现与设备端 web_admin::httpd 相同的接口，供 UI 与浏览器复用。
 // 只支撑本页面用到的 GET / POST（Content-Length body，含大文件流式上传）。
 // 每连接一线程 → 复用 core 的 TryBeginUpload 互斥即可复现"并发第二个 upload→429"。
 
-#include "media_admin_httpd.h"
+#include "web_admin_httpd.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -23,10 +23,11 @@
 #include <string>
 #include <thread>
 
-#include "media_admin_core.h"
-#include "media_admin_web.h"
+#include "web_admin_config.h"
+#include "web_admin_fs.h"
+#include "web_admin_web.h"
 
-namespace media_admin::httpd {
+namespace web_admin::httpd {
 namespace {
 
 constexpr int kPort = 8080;
@@ -85,7 +86,7 @@ bool QueryVal(const std::string& q, const char* key, std::string& out) {
         size_t eq = tok.find('=');
         if (eq == std::string::npos) continue;
         if (tok.substr(0, eq) == k) {
-            out = media_admin::UrlDecode(tok.substr(eq + 1));
+            out = web_admin::fs::UrlDecode(tok.substr(eq + 1));
             return true;
         }
     }
@@ -116,6 +117,18 @@ int ReadBody(BodyReader* br, char* buf, size_t max) {
     if (n <= 0) return -1;  // 断开 / 错误
     br->remaining -= n;
     return static_cast<int>(n);
+}
+
+// 把 leftover 补满 content_len，作为完整 form body 返回（mkdir/delete/config 共用）。
+std::string ReadFormBodyFull(int fd, const std::string& leftover, uint64_t content_len, char* tmp,
+                             size_t tmp_size) {
+    std::string body = leftover;
+    while (body.size() < content_len) {
+        ssize_t n = ::recv(fd, tmp, tmp_size, 0);
+        if (n <= 0) break;
+        body.append(tmp, n);
+    }
+    return body;
 }
 
 void HandleConn(int fd) {
@@ -176,52 +189,59 @@ void HandleConn(int fd) {
 
     // ---- 路由 ----
     if (method == "GET" && path == "/") {
-        SendResponse(fd, 200, "text/html; charset=utf-8", media_admin_web::Html());
+        SendResponse(fd, 200, "text/html; charset=utf-8", web_admin_web::Html());
     } else if (method == "GET" && path == "/api/list") {
         std::string dir;
         QueryVal(query, "dir", dir);
         int status = 200;
-        std::string json = media_admin::ListJson(dir, status);
+        std::string json = web_admin::fs::ListJson(dir, status);
         SendResponse(fd, status, "application/json; charset=utf-8", json);
     } else if (method == "GET" && path == "/api/space") {
-        SendResponse(fd, 200, "application/json; charset=utf-8", media_admin::SpaceJson());
+        SendResponse(fd, 200, "application/json; charset=utf-8", web_admin::fs::SpaceJson());
     } else if (method == "POST" && path == "/api/upload") {
         std::string upath, over;
         QueryVal(query, "path", upath);
         QueryVal(query, "overwrite", over);
         if (content_len == 0) {  // 无 Content-Length → 拒，勿静默落 0 字节文件（与 device 壳一致）
             SendResponse(fd, 411, "application/json; charset=utf-8", "{\"error\":\"length required\"}");
-        } else if (!media_admin::TryBeginUpload()) {
+        } else if (!web_admin::fs::TryBeginUpload()) {
             SendResponse(fd, 429, "application/json; charset=utf-8",
                          "{\"error\":\"another upload in progress\"}");
         } else {
             BodyReader br{fd, leftover, 0, content_len};
             auto reader = [&br](char* buf, size_t max) -> int { return ReadBody(&br, buf, max); };
             std::string msg;
-            int status = media_admin::Upload(upath, content_len, over == "1", reader, msg);
-            media_admin::EndUpload();
+            int status = web_admin::fs::Upload(upath, content_len, over == "1", reader, msg);
+            web_admin::fs::EndUpload();
             SendResponse(fd, status, "application/json; charset=utf-8", msg);
         }
+    } else if (method == "GET" && path == "/api/config") {
+        SendResponse(fd, 200, "application/json; charset=utf-8", web_admin::config::StatusJson());
+    } else if (method == "POST" && path == "/api/config") {
+        std::string body = ReadFormBodyFull(fd, leftover, content_len, tmp, sizeof(tmp));
+        std::string msg;
+        int status = web_admin::config::Save(body, msg);
+        SendResponse(fd, status, "application/json; charset=utf-8", msg);
+    } else if (method == "POST" && path == "/api/config/apply") {
+        // sim 不重启（进程重启会关掉窗口）：只回 200 并提示，配置已在 NVS 里，
+        // 手动重启 pi_sim 即可生效——与真机"延迟 1.5s esp_restart"的语义对齐。
+        std::printf("[web_admin] config applied; restart pi_sim to take effect\n");
+        SendResponse(fd, 200, "application/json; charset=utf-8",
+                     "{\"ok\":true,\"reboot_in_ms\":0,\"sim\":true}");
     } else if (method == "POST" && (path == "/api/mkdir" || path == "/api/delete")) {
-        // form body：把 leftover 补满 content_len。
-        std::string body = leftover;
-        while (body.size() < content_len) {
-            ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n <= 0) break;
-            body.append(tmp, n);
-        }
+        std::string body = ReadFormBodyFull(fd, leftover, content_len, tmp, sizeof(tmp));
         std::string p;
-        if (!media_admin::FormField(body, "path", p)) {
+        if (!web_admin::fs::FormField(body, "path", p)) {
             SendResponse(fd, 400, "application/json; charset=utf-8", "{\"error\":\"missing path\"}");
         } else if (path == "/api/mkdir") {
             std::string msg;
-            int status = media_admin::Mkdir(p, msg);
+            int status = web_admin::fs::Mkdir(p, msg);
             SendResponse(fd, status, "application/json; charset=utf-8", msg);
         } else {
             std::string rec;
-            media_admin::FormField(body, "recursive", rec);
+            web_admin::fs::FormField(body, "recursive", rec);
             std::string msg;
-            int status = media_admin::Delete(p, rec == "1", msg);
+            int status = web_admin::fs::Delete(p, rec == "1", msg);
             SendResponse(fd, status, "application/json; charset=utf-8", msg);
         }
     } else {
@@ -262,10 +282,18 @@ bool Start() {
         std::fprintf(stderr, "[sim][admin] bind/listen :%d failed\n", kPort);
         return false;
     }
-    media_admin::SweepOrphans();  // 清上次遗留的 .part / .old 孤儿（与 device 壳一致）
+    web_admin::fs::SweepOrphans();  // 清上次遗留的 .part / .old 孤儿（与 device 壳一致）
     s_running.store(true);
     s_accept_thread = std::thread(AcceptLoop);
-    std::fprintf(stderr, "[sim][admin] media admin server on http://127.0.0.1:%d\n", kPort);
+    // 进程退出时把 accept 线程收干净：joinable 的 std::thread 走静态析构会
+    // std::terminate（退出码 134），看起来跟真崩溃一模一样，会毒化 sim 的无人值守
+    // 截图/自测。设备端无此问题（esp_restart 直接走）。
+    static bool atexit_hooked = false;
+    if (!atexit_hooked) {
+        atexit_hooked = true;
+        std::atexit([]() { Stop(); });
+    }
+    std::fprintf(stderr, "[sim][admin] web admin server on http://127.0.0.1:%d\n", kPort);
     return true;
 }
 
@@ -278,7 +306,7 @@ void Stop() {
         s_listen_fd = -1;
     }
     if (s_accept_thread.joinable()) s_accept_thread.join();
-    std::fprintf(stderr, "[sim][admin] media admin server stopped\n");
+    std::fprintf(stderr, "[sim][admin] web admin server stopped\n");
 }
 
 bool IsRunning() { return s_running.load(); }
@@ -290,4 +318,4 @@ std::string GetUrl() {
     return buf;
 }
 
-}  // namespace media_admin::httpd
+}  // namespace web_admin::httpd

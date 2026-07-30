@@ -1,6 +1,6 @@
-// media_admin_core.cc — 见头文件。可移植核心，无 httpd 依赖。
+// web_admin_fs.cc — 见头文件。可移植核心，无 httpd 依赖。
 
-#include "media_admin_core.h"
+#include "web_admin_fs.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -18,7 +18,7 @@
 #include "esp_heap_caps.h"
 #endif
 
-namespace media_admin {
+namespace web_admin::fs {
 namespace {
 
 std::atomic<bool> s_upload_busy{false};
@@ -506,4 +506,4 @@ void SweepOrphans() {
     }
 }
 
-}  // namespace media_admin
+}  // namespace web_admin::fs

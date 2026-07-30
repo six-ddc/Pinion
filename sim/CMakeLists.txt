@@ -27,9 +27,6 @@ get_filename_component(CLAW_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/.. ABSOLUTE)
 # with components/pi_c_prebuilt/pack_pi_c.sh after any pi-c change.
 get_filename_component(PI_C_DIR ${CLAW_ROOT}/components/pi_c_prebuilt ABSOLUTE)
 
-if(NOT EXISTS ${CLAW_ROOT}/main/display/screen/pi_screen/pi_models_data.h)
-    message(FATAL_ERROR "pi_models_data.h missing (gitignored secret) — required for the real-API build")
-endif()
 if(NOT EXISTS ${CLAW_ROOT}/managed_components/lvgl__lvgl/lvgl.h)
     message(FATAL_ERROR "managed_components/lvgl__lvgl missing — run one idf.py build first (or idf.py reconfigure)")
 endif()
@@ -85,9 +82,12 @@ add_executable(pi_sim
     shim/src/audio_pipeline_shim.cc
     shim/src/mhal_shim.cc
     shim/src/net_shim.cc
-    # SD 音乐 Web 后台：可移植 core + sim POSIX socket 薄壳（复用同一份网页）
-    ${CLAW_ROOT}/components/media_admin/media_admin_core.cc
-    shim/src/media_admin_httpd_sim.cc
+    # 设备 Web 后台：可移植 core（配置 + 文件）+ sim POSIX socket 薄壳（复用同一份网页）
+    ${CLAW_ROOT}/components/web_admin/web_admin_fs.cc
+    ${CLAW_ROOT}/components/web_admin/web_admin_config.cc
+    shim/src/web_admin_httpd_sim.cc
+    # 运行期配置（NVS：大模型 / 语音密钥），双端同源
+    ${CLAW_ROOT}/components/device_config/device_config.cc
     shim/src/bt_shim.cc
     shim/src/volc_stub.cc
     # firmware UI sources, unchanged
@@ -97,6 +97,7 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_settings.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media_focus.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_guide.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_net_events.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_sleep.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_theme.cc
@@ -156,7 +157,8 @@ target_include_directories(pi_sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/include   # must precede everything ESP-flavored
     ${CLAW_ROOT}/main                          # stock/…（行情数据层）
     ${CLAW_ROOT}/main/stock
-    ${CLAW_ROOT}/components/media_admin/include # media_admin_core.h / _httpd.h / _web.h
+    ${CLAW_ROOT}/components/web_admin/include   # web_admin_fs.h / _config.h / _httpd.h / _web.h
+    ${CLAW_ROOT}/components/device_config/include # device_config.h（运行期配置：NVS）
     ${CLAW_ROOT}/main/display/screen
     ${CLAW_ROOT}/main/display/screen/pi_screen
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card

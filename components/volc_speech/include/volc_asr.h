@@ -37,7 +37,7 @@ typedef struct {
 } volc_asr_callbacks_t;
 
 // 建连 + 发送 full client request，阻塞至就绪（约数百 ms，TLS 握手）。
-// 需网络已连通、volc_keys.h 已配置。同一时刻仅允许一个会话。
+// 需网络已连通、语音密钥已注入（volc_speech_set_keys）。同一时刻仅允许一个会话。
 esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs);
 
 // 推送 mic PCM（16kHz 16bit mono）。仅把 PCM 拷入内部有界队列即返回（非阻塞、

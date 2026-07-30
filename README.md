@@ -46,37 +46,27 @@ idf.py -p /dev/ttyACM0 flash monitor  # P4 口 = "USB JTAG/serial debug unit"；
 - `sdkconfig` 不入库；`sdkconfig.defaults` 携带全部承重配置（PSRAM/DSI/压缩字体/
   ESP-Hosted 引脚等），细节与禁忌见 `CLAUDE.md`。
 
-## 密钥配置（必做，两个文件都不入库）
+## 首次配置（扫码进设备后台，不改代码不重烧）
 
-克隆后有两个含密钥的头文件必须在本地生成，否则**编译失败**。两者都已按文件名
-gitignore，**绝不入库、绝不打印进日志**；每次提交前用 `git status` 复核。
+固件里**不打包任何密钥**，克隆后直接 `idf.py build` 即可。密钥在设备上填、存 NVS：
 
-### 1. 模型目录 — `main/display/screen/pi_screen/pi_models_data.h`
+1. 新设备开机，待机页会显示一张引导卡。没连过 WiFi 就点「开始配网」（设备重启进热点，
+   扫码连热点后打开 `http://192.168.4.1` 填 WiFi）。
+2. 连上 WiFi 后引导卡显示后台地址二维码，手机扫码（或浏览器打开该地址）。
+3. 在「配置」页填两组值，点「保存并重启」：
+   - **大模型** — API Key（必填）；Base URL 可选（默认 `https://api.deepseek.com`，任何
+     兼容 OpenAI Completions 的端点都行）。想换供应商或加模型，展开「高级」粘一整份
+     pi-c 格式的 models JSON，它会完全覆盖内置模型清单。
+   - **语音（火山引擎）** — App Key + Access Key。需开通流式语音识别大模型（resource
+     `volc.seedasr.sauc.duration`）与双向流式语音合成（`seed-tts-2.0`）；缺这两项只影响
+     按住说话与朗读，对话仍可用。资源名与音色以宏硬编码在 `components/volc_speech/src/`
+     顶部，换产品改宏即可，详见 **`docs/VOLC_SPEECH.md`**。
 
-一份 pi-c 格式的 models.json，minify 后转义成 C 字符串字面量（宏名
-`PI_MODELS_JSON_TEXT`），内含 DeepSeek API key。从模板复制后把 `apiKey` 换成自己的：
+配置后随时可从快捷面板（PWR_KEY 长按或状态栏下拉）的「后台」重新进入，那页同时管理 SD
+卡音乐文件。后台只在 WiFi 下可用（4G 是运营商 NAT，手机连不进设备），10 分钟无请求自停。
 
-```sh
-cp main/display/screen/pi_screen/pi_models_data.h.example \
-   main/display/screen/pi_screen/pi_models_data.h
-```
-
-模板里有展开可读的 JSON 结构、各字段说明（哪些是承重的、缺了会怎么崩），以及换
-provider / 重新转义用的一行命令。
-
-### 2. 语音密钥 — `components/volc_speech/include/volc_keys.h`
-
-火山引擎语音（ASR + TTS）的 App ID / Access Token，从模板复制后填入：
-
-```sh
-cp components/volc_speech/include/volc_keys.h.example \
-   components/volc_speech/include/volc_keys.h
-```
-
-需在火山控制台开通：流式语音识别大模型（resource `volc.seedasr.sauc.duration`）
-与双向流式语音合成（resource `seed-tts-2.0`）。资源名与音色以宏硬编码在
-`src/volc_asr.cc` / `src/volc_tts.cc` 顶部，换产品改宏即可。详见
-**`docs/VOLC_SPEECH.md`**。
+模拟器同理：`PI_SIM_ADMIN=1 ./sim/build/pi_sim` 后开 `http://127.0.0.1:8080` 配置，值落在
+`pi_sim_settings.ini` 的 `cfg.*` 键。
 
 ## 代码结构
 

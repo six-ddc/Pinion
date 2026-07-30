@@ -1,8 +1,9 @@
-// media_admin_httpd.cc — 设备端 esp_http_server 薄壳。
-// 只负责：httpd 生命周期、URI 路由、请求参数抽取、body 流式 recv → 交给
-// media_admin_core（可移植逻辑）。10 分钟无请求自动停服，省电防长期暴露。
+// web_admin_httpd.cc — 设备端 esp_http_server 薄壳。
+// 只负责：httpd 生命周期、URI 路由、请求参数抽取、body 流式 recv → 交给可移植
+// 逻辑（web_admin_fs 文件管理 / web_admin_config 设备配置）。10 分钟无请求自动
+// 停服，省电防长期暴露。
 
-#include "media_admin_httpd.h"
+#include "web_admin_httpd.h"
 
 #include <atomic>
 #include <cstring>
@@ -11,16 +12,18 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 
-#include "media_admin_core.h"
-#include "media_admin_web.h"
+#include "web_admin_config.h"
+#include "web_admin_fs.h"
+#include "web_admin_web.h"
 #include "metalio_hal/network.h"
 
-namespace media_admin::httpd {
+namespace web_admin::httpd {
 namespace {
 
-constexpr char TAG[] = "media_admin";
+constexpr char TAG[] = "web_admin";
 constexpr int64_t kIdleStopUs = 10ll * 60 * 1000 * 1000;  // 10 分钟无请求自动停
 constexpr int64_t kIdleCheckUs = 60ll * 1000 * 1000;      // 每分钟检查一次
 constexpr int kFormRecvMaxTimeouts = 3;                   // mkdir/delete body 累计超时上限
@@ -31,6 +34,7 @@ constexpr int kUploadMaxTimeouts = 20;                    // 整个上传累计�
 // 串行化（见 Start/Stop 注释）。
 std::atomic<httpd_handle_t> s_server{nullptr};
 esp_timer_handle_t s_idle_timer = nullptr;
+esp_timer_handle_t s_reboot_timer = nullptr;  // /api/config/apply 的延迟重启
 std::atomic<int64_t> s_last_activity{0};
 std::mutex s_lifecycle_mtx;
 
@@ -76,15 +80,15 @@ std::string QueryStr(httpd_req_t* req) {
 bool QueryVal(const std::string& q, const char* key, std::string& out) {
     char val[512];
     if (httpd_query_key_value(q.c_str(), key, val, sizeof(val)) != ESP_OK) return false;
-    out = media_admin::UrlDecode(val);
+    out = web_admin::fs::UrlDecode(val);
     return true;
 }
 
-// 读 form body（路径类，2KB 足够）。
-std::string ReadFormBody(httpd_req_t* req) {
+// 读 form body。路径类 2KB 足够；配置页要粘整份 models JSON，用 max 放宽。
+std::string ReadFormBody(httpd_req_t* req, size_t max = 2048) {
     std::string body;
     size_t remaining = req->content_len;
-    if (remaining > 2048) remaining = 2048;
+    if (remaining > max) remaining = max;
     char buf[512];
     int timeouts = 0;
     while (remaining > 0) {
@@ -105,7 +109,7 @@ esp_err_t RootGet(httpd_req_t* req) {
     Touch();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, media_admin_web::Html());
+    return httpd_resp_sendstr(req, web_admin_web::Html());
 }
 
 esp_err_t ListGet(httpd_req_t* req) {
@@ -113,13 +117,13 @@ esp_err_t ListGet(httpd_req_t* req) {
     std::string dir;
     QueryVal(QueryStr(req), "dir", dir);
     int status = 200;
-    std::string json = media_admin::ListJson(dir, status);
+    std::string json = web_admin::fs::ListJson(dir, status);
     return SendJson(req, status, json);
 }
 
 esp_err_t SpaceGet(httpd_req_t* req) {
     Touch();
-    return SendJson(req, 200, media_admin::SpaceJson());
+    return SendJson(req, 200, web_admin::fs::SpaceJson());
 }
 
 esp_err_t UploadPost(httpd_req_t* req) {
@@ -133,7 +137,7 @@ esp_err_t UploadPost(httpd_req_t* req) {
     QueryVal(q, "overwrite", over);
     bool overwrite = (over == "1");
 
-    if (!media_admin::TryBeginUpload())
+    if (!web_admin::fs::TryBeginUpload())
         return SendJson(req, 429, "{\"error\":\"another upload in progress\"}");
 
     // 流式 reader：从 httpd 拉取 body，最多 content_len 字节。
@@ -166,8 +170,8 @@ esp_err_t UploadPost(httpd_req_t* req) {
     };
 
     std::string msg;
-    int status = media_admin::Upload(path, req->content_len, overwrite, reader, msg);
-    media_admin::EndUpload();
+    int status = web_admin::fs::Upload(path, req->content_len, overwrite, reader, msg);
+    web_admin::fs::EndUpload();
     if (status != 200) ESP_LOGW(TAG, "upload %s -> %d", path.c_str(), status);
     return SendJson(req, status, msg);
 }
@@ -176,10 +180,10 @@ esp_err_t MkdirPost(httpd_req_t* req) {
     Touch();
     std::string body = ReadFormBody(req);
     std::string path;
-    if (!media_admin::FormField(body, "path", path))
+    if (!web_admin::fs::FormField(body, "path", path))
         return SendJson(req, 400, "{\"error\":\"missing path\"}");
     std::string msg;
-    int status = media_admin::Mkdir(path, msg);
+    int status = web_admin::fs::Mkdir(path, msg);
     return SendJson(req, status, msg);
 }
 
@@ -187,12 +191,46 @@ esp_err_t DeletePost(httpd_req_t* req) {
     Touch();
     std::string body = ReadFormBody(req);
     std::string path, rec;
-    if (!media_admin::FormField(body, "path", path))
+    if (!web_admin::fs::FormField(body, "path", path))
         return SendJson(req, 400, "{\"error\":\"missing path\"}");
-    media_admin::FormField(body, "recursive", rec);
+    web_admin::fs::FormField(body, "recursive", rec);
     std::string msg;
-    int status = media_admin::Delete(path, rec == "1", msg);
+    int status = web_admin::fs::Delete(path, rec == "1", msg);
     return SendJson(req, status, msg);
+}
+
+// ---- 配置页（大模型 / 语音密钥）----
+esp_err_t ConfigGet(httpd_req_t* req) {
+    Touch();
+    return SendJson(req, 200, web_admin::config::StatusJson());
+}
+
+esp_err_t ConfigPost(httpd_req_t* req) {
+    Touch();
+    std::string body = ReadFormBody(req, web_admin::config::kMaxFormBytes);
+    std::string msg;
+    int status = web_admin::config::Save(body, msg);
+    if (status != 200) ESP_LOGW(TAG, "config save -> %d", status);
+    return SendJson(req, status, msg);
+}
+
+void RebootNow(void*) { esp_restart(); }
+
+// 保存后由网页显式调用：先把 200 发出去（让网页能提示"正在重启"），再延迟重启。
+esp_err_t ApplyPost(httpd_req_t* req) {
+    Touch();
+    esp_err_t err = SendJson(req, 200, R"({"ok":true,"reboot_in_ms":1500})");
+    if (s_reboot_timer == nullptr) {
+        esp_timer_create_args_t targs = {};
+        targs.callback = RebootNow;
+        targs.name = "web_admin_reboot";
+        esp_timer_create(&targs, &s_reboot_timer);
+    }
+    if (s_reboot_timer != nullptr) {
+        ESP_LOGI(TAG, "config applied, rebooting in 1.5s");
+        esp_timer_start_once(s_reboot_timer, 1500 * 1000);
+    }
+    return err;
 }
 
 void Register(const char* uri, httpd_method_t method, esp_err_t (*fn)(httpd_req_t*)) {
@@ -219,7 +257,7 @@ bool Start() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;  // 文件管理 6 + 配置 3，留余量
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;  // 大文件上传放宽
     config.send_wait_timeout = 30;
@@ -229,23 +267,26 @@ bool Start() {
         return false;
     }
     s_server.store(srv);
-    media_admin::SweepOrphans();  // 清上次崩溃/掉电遗留的 .part / .old 孤儿
+    web_admin::fs::SweepOrphans();  // 清上次崩溃/掉电遗留的 .part / .old 孤儿
     Register("/", HTTP_GET, RootGet);
     Register("/api/list", HTTP_GET, ListGet);
     Register("/api/space", HTTP_GET, SpaceGet);
     Register("/api/upload", HTTP_POST, UploadPost);
     Register("/api/mkdir", HTTP_POST, MkdirPost);
     Register("/api/delete", HTTP_POST, DeletePost);
+    Register("/api/config", HTTP_GET, ConfigGet);
+    Register("/api/config", HTTP_POST, ConfigPost);
+    Register("/api/config/apply", HTTP_POST, ApplyPost);
 
     Touch();
     if (s_idle_timer == nullptr) {
         esp_timer_create_args_t targs = {};
         targs.callback = IdleCheck;
-        targs.name = "media_admin_idle";
+        targs.name = "web_admin_idle";
         esp_timer_create(&targs, &s_idle_timer);
     }
     esp_timer_start_periodic(s_idle_timer, kIdleCheckUs);
-    ESP_LOGI(TAG, "media admin server on :80");
+    ESP_LOGI(TAG, "web admin server on :80");
     return true;
 }
 
@@ -263,7 +304,7 @@ void Stop() {
         s_server.store(nullptr);
     }
     httpd_stop(srv);
-    ESP_LOGI(TAG, "media admin server stopped");
+    ESP_LOGI(TAG, "web admin server stopped");
 }
 
 bool IsRunning() { return s_server.load() != nullptr; }
@@ -275,4 +316,4 @@ std::string GetUrl() {
     return "http://" + ip;
 }
 
-}  // namespace media_admin::httpd
+}  // namespace web_admin::httpd

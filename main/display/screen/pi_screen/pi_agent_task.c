@@ -2,18 +2,17 @@
  * on_event -> pi_ui_evt_t bridge (blueprint §2/§3 WP-B, §4 event map).
  *
  * Production talks to the real API: transport = pi_esp32_transport() (TLS via
- * esp_crt_bundle, already wired by the port) and model/provider config comes
- * from models.json — a verbatim copy of six-ddc/pi-c/models.json lives as a C
- * string literal in pi_models_data.h (PI_MODELS_JSON_TEXT), so no build-system
- * embed step or external symbol is needed. embedded_models_json_read() below
- * is a one-function pi_fs_t shim that hands that in-memory string to the
- * real PI_FEATURE_MODELS_JSON loader (pi_models_load, full catalog, keeps
+ * esp_crt_bundle, already wired by the port) and model/provider config is built
+ * at runtime from NVS by device_config (Web 后台填的 API Key 注入内置模板，或用户
+ * 自备的整份 models JSON) — 固件不打包密钥。nvs_models_json_read() below is a
+ * one-function pi_fs_t shim that hands that in-memory string to the real
+ * PI_FEATURE_MODELS_JSON loader (pi_models_load, full catalog, keeps
  * model.compat/thinking_level_map alive — unlike pi_models_json_load_first,
  * which drops compat) exactly as if it had come off a filesystem.
- * Keeping the full catalog matters here: models.json's deepseek entries carry
- * a compat override (requiresReasoningContentOnAssistantMessages/
- * thinkingFormat=deepseek) that PI_FEATURE_COMPAT needs to talk to DeepSeek
- * correctly, and that override only survives via the catalog API.
+ * Keeping the full catalog matters here: the deepseek entries carry a compat
+ * override (requiresReasoningContentOnAssistantMessages/thinkingFormat=deepseek)
+ * that PI_FEATURE_COMPAT needs to talk to DeepSeek correctly, and that override
+ * only survives via the catalog API.
  *
  * The two-turn mock script is kept in the tree as an opt-in offline-debug
  * channel (PI_AGENT_TASK_USE_MOCK, default 0) but contributes zero code to
@@ -42,13 +41,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "device_config.h"
 #include "pi/pi.h"
 #include "pi_card/pi_card_media.h"
 #include "pi_card/pi_card_tools.h"
 #include "stock/stock_tool.h"
 #include "pi_esp32.h"
 #include "pi_media_focus.h"
-#include "pi_models_data.h"
 #include "volc_tts.h"
 
 /* Offline-debug channel: flip to 1 locally (or define via the build, e.g.
@@ -76,50 +75,55 @@ static const pi_model_t MOCK_MODEL = {
 
 static const char *TAG = "pi_agent_task";
 
-/* ---------- env + real model catalog (models.json, embedded) ---------- */
+/* ---------- env + real model catalog (models.json, from NVS) ---------- */
 static pi_env_t g_env;
 static pi_agent_t *g_agent;
 static bool g_env_ready = false;
 
 #if !PI_AGENT_TASK_USE_MOCK
-/* models.json's content lives in pi_models_data.h as a C string literal
- * (PI_MODELS_JSON_TEXT — verbatim copy of six-ddc/pi-c/models.json, no build-
- * system embed step / external symbol needed). embedded_models_json_read()
- * is a one-function pi_fs_t shim that hands that in-memory string to pi-c's
- * real PI_FEATURE_MODELS_JSON loader (pi_models_load) exactly as if it had
- * come off a filesystem. */
-#define PI_MODELS_JSON_LEN (sizeof(PI_MODELS_JSON_TEXT) - 1) /* -1: exclude the literal's NUL */
-
+/* models.json 的内容来自 NVS：用户在 Web 后台填的 API Key 注入内置模型模板，或
+ * （高级模式）直接是用户粘的一整份 models JSON——两种都由
+ * device_config_build_models_json() 合成，固件里不含任何密钥。
+ * nvs_models_json_read() 是个一函数 pi_fs_t 垫片，把这份内存里的串交给 pi-c 真正的
+ * PI_FEATURE_MODELS_JSON 加载器（pi_models_load），就像它是从文件系统读来的一样。
+ * 未配置时返回 NULL → pi_models_load 失败 → agent 不启动（UI 照常跑，引导页会提示
+ * 扫码配置）。 */
 static pi_models_catalog_t *g_catalog = NULL;
 static const pi_model_t *g_model = NULL; /* borrowed from g_catalog; catalog never freed */
 
-static char *embedded_models_json_read(void *ctx, const char *path, size_t *out_len,
-                                       const pi_alloc_t *alloc) {
+static char *nvs_models_json_read(void *ctx, const char *path, size_t *out_len,
+                                  const pi_alloc_t *alloc) {
     (void)ctx;
     (void)path;
-    char *buf = (char *)pi_malloc(alloc, PI_MODELS_JSON_LEN + 1); /* pi_models_load frees this */
-    if (!buf) return NULL;
-    memcpy(buf, PI_MODELS_JSON_TEXT, PI_MODELS_JSON_LEN);
-    buf[PI_MODELS_JSON_LEN] = '\0';
-    if (out_len) *out_len = PI_MODELS_JSON_LEN;
+    char *json = device_config_build_models_json(); /* malloc'd; NULL = 未配置 */
+    if (!json) {
+        ESP_LOGE(TAG, "no LLM config in NVS (configure via the web admin)");
+        return NULL;
+    }
+    size_t len = strlen(json);
+    char *buf = (char *)pi_malloc(alloc, len + 1); /* pi_models_load frees this */
+    if (buf) {
+        memcpy(buf, json, len + 1);
+        if (out_len) *out_len = len;
+    }
+    free(json);
     return buf;
 }
 
-static const pi_fs_t EMBEDDED_MODELS_FS = {.read_file = embedded_models_json_read};
+static const pi_fs_t NVS_MODELS_FS = {.read_file = nvs_models_json_read};
 
 /* Loads the whole catalog (not pi_models_json_load_first: that convenience
  * snapshot drops model.compat, which DeepSeek needs). Picks catalog entry 0
- * (models.json's single "deepseek" provider, first model = deepseek-v4-pro). */
+ * (第一个 provider 的第一个模型，默认模板下 = deepseek-v4-pro)。 */
 static bool load_model_catalog(void) {
-    int rc = pi_models_load(&g_env, "models.json" /* ignored by the embedded fs shim */,
-                            &g_catalog);
+    int rc = pi_models_load(&g_env, "models.json" /* ignored by the NVS fs shim */, &g_catalog);
     if (rc != PI_OK || !g_catalog) {
         ESP_LOGE(TAG, "pi_models_load failed rc=%d", rc);
         return false;
     }
     g_model = pi_models_at(g_catalog, 0);
     if (!g_model) {
-        ESP_LOGE(TAG, "models.json catalog has no models");
+        ESP_LOGE(TAG, "model catalog has no models");
         return false;
     }
     ESP_LOGI(TAG, "model catalog loaded: provider=%s id=%s baseUrl=%s",
@@ -742,7 +746,7 @@ static void ensure_env(void) {
     g_env.transport = pi_mock_transport(&g_mock);
 #else
     g_env.transport = pi_esp32_transport(); /* real HTTP, TLS via esp_crt_bundle */
-    g_env.fs = &EMBEDDED_MODELS_FS;          /* only consumer: pi_models_load below */
+    g_env.fs = &NVS_MODELS_FS;               /* only consumer: pi_models_load below */
 #endif
     pi_env_init(&g_env);
     g_env_ready = true;
@@ -786,8 +790,8 @@ static void rebuild_agent(void) {
     pi_mock_init(&g_mock, g_responses, 2, 24); /* resets mock.next -> replay from turn 1 */
     g_env.transport = pi_mock_transport(&g_mock);
 #endif
-    /* models.json/catalog is not reloaded: it's an immutable embedded blob for
-     * the firmware's whole run, so a new session only needs a fresh agent. */
+    /* catalog 不重载：它在本次运行期内不变（改配置走 Web 后台保存 → 设备重启），
+     * 所以新会话只需要一个新 agent。 */
     g_agent = create_agent();
     xSemaphoreGive(g_agent_mutex);
     if (!g_agent)

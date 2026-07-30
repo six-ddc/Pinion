@@ -13,9 +13,11 @@
 #include "metalio_hal/network.h"
 #include "metalio_hal/sysmon.h"
 
+#include "device_config.h"
 #include "pi_screen/pi_screen.h"
 #include "screen_util.h"
 #include "settings.h"
+#include "volc_speech_keys.h"
 
 #define TAG "main"
 
@@ -35,6 +37,12 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(mhal::Init());
+
+    // 语音密钥来自 NVS（Web 后台的配置页写入），固件不打包。必须早于任何
+    // ASR/TTS 会话——这里就是最早的时机（NVS 已 init，UI 还没建）。未配置时
+    // 注入空值，volc_asr_start / volc_tts_speak_begin 会直接失败并 LOGE。
+    volc_speech_set_keys(device_config::GetVoiceAppKey().c_str(),
+                         device_config::GetVoiceAccessKey().c_str());
 
     // P0：开机吃 NVS——音量取 "audio"/"output_volume"（无历史值默认 70），
     // 亮度走 backlight::Restore()（内部有 NVS 默认 75%、下限 5% 逻辑，

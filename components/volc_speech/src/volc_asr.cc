@@ -15,11 +15,7 @@
 
 #include "volc_proto.h"
 
-#if __has_include("volc_keys.h")
-#include "volc_keys.h"
-#else
-#error "缺少 volc_keys.h：复制 include/volc_keys.h.example 为 include/volc_keys.h 并填入密钥"
-#endif
+#include "volc_speech_keys.h"  // 密钥运行期注入（NVS ← Web 后台），固件不打包
 
 static const char* TAG = "volc_asr";
 
@@ -313,6 +309,10 @@ static void asr_destroy_locked_out(AsrSession* s) {
 esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs) {
     if (s_asr) return ESP_ERR_INVALID_STATE;
     if (!cbs) return ESP_ERR_INVALID_ARG;
+    if (!volc_speech_keys_ready()) {
+        ESP_LOGE(TAG, "火山语音密钥未配置，请在 Web 后台的配置页填写");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     auto* s = (AsrSession*)calloc(1, sizeof(AsrSession));
     if (!s) return ESP_ERR_NO_MEM;
@@ -325,9 +325,10 @@ esp_err_t volc_asr_start(const volc_asr_callbacks_t* cbs) {
     if (!s->eg || asprintf(&s->headers,
                            "X-Api-Resource-Id: " ASR_RESOURCE_ID "\r\n"
                            "X-Api-Request-Id: %s\r\n"
-                           "X-Api-Access-Key: " VOLC_ACCESS_KEY "\r\n"
-                           "X-Api-App-Key: " VOLC_APP_KEY "\r\n",
-                           request_id) < 0) {
+                           "X-Api-Access-Key: %s\r\n"
+                           "X-Api-App-Key: %s\r\n",
+                           request_id, volc_speech_access_key(),
+                           volc_speech_app_key()) < 0) {
         if (s->eg)
             vEventGroupDelete(s->eg);
         free(s);

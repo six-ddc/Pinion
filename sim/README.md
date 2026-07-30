@@ -17,8 +17,17 @@ cmake --build sim/build -j
 
 - `managed_components/lvgl__lvgl` 存在（跑过一次 `idf.py build` 即有）——模拟器
   直接用这份源码，保证与设备**严格同版**（9.3.0）；
-- `main/display/screen/pi_screen/pi_models_data.h` 存在（gitignored 密钥文件）；
-- pi-c 仓库在兄弟目录 `../../six-ddc/pi-c`（与固件同一路径约定）。
+- pi-c 预编译宿主库在 `components/pi_c_prebuilt/lib/host-arm64/`（随仓交付）。
+
+密钥不编译进来：首跑会提示未配置、agent 不启动。配一次即可（落在
+`pi_sim_settings.ini` 的 `cfg.*`，跟着仓库根目录走）：
+
+```sh
+PI_SIM_ADMIN=1 ./sim/build/pi_sim   # 浏览器开 http://127.0.0.1:8080 → 「配置」页填 API Key
+```
+
+也可以直接 curl：`curl -X POST -d 'llm_key=sk-…&volc_app=…&volc_ak=…' \
+http://127.0.0.1:8080/api/config`。设备上这一步是待机页扫码，sim 里是同一个页面。
 
 ## 交互映射
 

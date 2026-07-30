@@ -22,11 +22,7 @@
 #include "micro_opus/ogg_opus_decoder.h"
 #include "volc_proto.h"
 
-#if __has_include("volc_keys.h")
-#include "volc_keys.h"
-#else
-#error "缺少 volc_keys.h：复制 include/volc_keys.h.example 为 include/volc_keys.h 并填入密钥"
-#endif
+#include "volc_speech_keys.h"  // 密钥运行期注入（NVS ← Web 后台），固件不打包
 
 static const char* TAG = "volc_tts";
 
@@ -497,14 +493,19 @@ static esp_err_t tts_ensure_connection(TtsState* s) {
     }
     tts_teardown_connection(s);
 
+    if (!volc_speech_keys_ready()) {
+        ESP_LOGE(TAG, "火山语音密钥未配置，请在 Web 后台的配置页填写");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     char connect_id[37];
     volc_gen_uuid(connect_id);
     if (asprintf(&s->headers,
-                 "X-Api-App-Key: " VOLC_APP_KEY "\r\n"
-                 "X-Api-Access-Key: " VOLC_ACCESS_KEY "\r\n"
+                 "X-Api-App-Key: %s\r\n"
+                 "X-Api-Access-Key: %s\r\n"
                  "X-Api-Resource-Id: " TTS_RESOURCE_ID "\r\n"
                  "X-Api-Connect-Id: %s\r\n",
-                 connect_id) < 0) {
+                 volc_speech_app_key(), volc_speech_access_key(), connect_id) < 0) {
         return ESP_ERR_NO_MEM;
     }
 

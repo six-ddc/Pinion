@@ -358,11 +358,11 @@ void BuildActionGrid(lv_obj_t* parent) {
         btn_theme, [](lv_event_t*) { pi_theme::Set(!pi_theme::IsLight()); }, LV_EVENT_CLICKED,
         nullptr);
 
-    // 「⌂ 文件管理」。仅 WiFi 已连接才能打开（4G 有运营商 NAT，外部连不
-    // 进来）；未连接点按只吐 toast，不置灰——省一份"打开时刷新按钮态"的
-    // 常驻逻辑，点按时判一次足够。
-    lv_obj_t* btn_files = MakeGridBtn(grid, "文件");
-    pi_card::MakeIcon(lv_obj_get_child(btn_files, 0), "folder", 24, Tok::Dim);
+    // 「⌂ 设备后台」（配置 + 文件两页）。仅 WiFi 已连接才能打开（4G 有运营商
+    // NAT，外部连不进来）；未连接点按只吐 toast，不置灰——省一份"打开时刷新
+    // 按钮态"的常驻逻辑，点按时判一次足够。
+    lv_obj_t* btn_files = MakeGridBtn(grid, "后台");
+    pi_card::MakeIcon(lv_obj_get_child(btn_files, 0), "globe", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_files,
         [](lv_event_t*) {

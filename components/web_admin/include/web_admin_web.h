@@ -1,11 +1,18 @@
-// media_admin_web.h — SD 音乐后台单页应用（内嵌 HTML/CSS/JS，零外部依赖）。
+// web_admin_web.h — 设备后台单页应用（内嵌 HTML/CSS/JS，零外部依赖）。
 // 视觉对齐设备 AmberGlow：深底 #141210 + 卡片 + 1px 描边 + amber #FFAE1F 点睛。
-// 功能：目录浏览 / 面包屑 / 建目录 / 删除（含递归确认）/ 上传（多选 + 目录选择 +
-// 拖拽文件夹）串行队列 / 409 冲突选择（覆盖·跳过·全部覆盖·全部跳过）/ 失败重试。
+//
+// 两个 tab：
+//   配置 — 大模型 API Key / baseUrl / 整份 models JSON（高级）、火山语音双密钥；
+//          写 NVS，保存后可一键重启生效。密钥只回掩码，永不回明文。
+//   文件 — 目录浏览 / 面包屑 / 建目录 / 删除（含递归确认）/ 上传（多选 + 目录选择 +
+//          拖拽文件夹）串行队列 / 409 冲突选择（覆盖·跳过·全部覆盖·全部跳过）/ 失败重试。
+//
+// 默认落在哪个 tab 由配置状态决定：没配全 → 配置（扫码引导页进来的场景），
+// 配全了 → 文件（快捷面板进来的场景）；URL hash #config / #files 可显式指定。
 
 #pragma once
 
-namespace media_admin_web {
+namespace web_admin_web {
 
 inline const char* Html() {
     return R"HTML(<!DOCTYPE html>
@@ -13,7 +20,7 @@ inline const char* Html() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pinion · 文件管理</title>
+<title>Pinion · 设备后台</title>
 <style>
   :root{
     --bg:#141210; --card:#1e1b17; --card2:#26221c; --line:#2f2a22;
@@ -76,10 +83,90 @@ inline const char* Html() {
          color:var(--tx);border:1px solid var(--amber);padding:10px 18px;border-radius:22px;
          opacity:0;transition:.2s;pointer-events:none;max-width:80%;z-index:30;font-size:13px}
   .toast.show{opacity:1} .toast.err{border-color:var(--red);color:var(--red)}
+  /* tab 条 */
+  .tabs{display:flex;gap:8px;margin:10px 0 16px}
+  .tab{flex:1;text-align:center;background:var(--card);border:1px solid var(--line);border-radius:10px;
+       padding:10px 0;font-size:14px;color:var(--dim);cursor:pointer}
+  .tab.on{border-color:var(--amber);color:var(--amber);background:var(--card2)}
+  .view{display:none} .view.on{display:block}
+  /* 配置页 */
+  .sec{font-size:15px;font-weight:600;margin:0 0 2px}
+  .secst{font-size:12px;margin:0 0 12px}
+  .secst.ok{color:var(--ok)} .secst.no{color:var(--red)}
+  .fld{margin-bottom:14px}
+  .fld label{display:block;font-size:13px;color:var(--dim);margin-bottom:5px}
+  .fld .hint{font-size:11px;color:var(--faint);margin-top:4px;line-height:1.5}
+  .fld input,.fld textarea{width:100%;background:var(--card2);color:var(--tx);border:1px solid var(--line);
+       border-radius:8px;padding:9px 10px;font-size:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .fld input:focus,.fld textarea:focus{outline:0;border-color:var(--amber)}
+  .fld textarea{min-height:150px;resize:vertical;font-size:12px;line-height:1.5}
+  .lbl{display:flex;justify-content:space-between;align-items:baseline}
+  .clr{color:var(--red);background:none;border:0;font-size:11px;cursor:pointer;padding:0}
+  .clr.on{color:var(--amber);text-decoration:underline}
+  details{margin-bottom:14px} details>summary{cursor:pointer;font-size:13px;color:var(--amber)}
+  .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
 </style>
 </head>
 <body>
-  <h1>Pinion <span class="mono" style="color:var(--faint);font-size:13px">/ 文件管理</span></h1>
+  <h1>Pinion <span class="mono" style="color:var(--faint);font-size:13px">/ 设备后台</span></h1>
+  <div class="tabs">
+    <div class="tab" id="tabCfg">配置</div>
+    <div class="tab" id="tabFiles">文件</div>
+  </div>
+
+  <div class="view" id="viewCfg">
+    <div class="card">
+      <p class="sec">大模型</p>
+      <p class="secst" id="llmSt">读取中…</p>
+      <div class="fld">
+        <div class="lbl"><label for="llmKey">API Key</label>
+          <button class="clr" id="clrLlmKey" style="display:none">清除</button></div>
+        <input id="llmKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+        <div class="hint">留空 = 不修改。填入后与内置模型清单合并，重启生效。</div>
+      </div>
+      <div class="fld">
+        <div class="lbl"><label for="llmBase">Base URL（可选）</label>
+          <button class="clr" id="clrLlmBase" style="display:none">清除</button></div>
+        <input id="llmBase" type="text" autocomplete="off" spellcheck="false" placeholder="https://api.deepseek.com">
+        <div class="hint">兼容 OpenAI Completions 接口的自建/代理端点。留空 = 用默认。</div>
+      </div>
+      <details>
+        <summary>高级：整份 models JSON（换供应商 / 加模型）</summary>
+        <div class="fld" style="margin-top:10px">
+          <div class="lbl"><label for="llmJson">models JSON</label>
+            <button class="clr" id="clrLlmJson" style="display:none">清除</button></div>
+          <textarea id="llmJson" spellcheck="false" placeholder='{"providers":{"deepseek":{"baseUrl":"…","api":"openai-completions","apiKey":"sk-…","models":[{"id":"…"}]}}}'></textarea>
+          <div class="hint" id="jsonHint">填了这个就完全覆盖上面两项与内置清单，直接交给 agent 运行时。</div>
+        </div>
+      </details>
+    </div>
+
+    <div class="card">
+      <p class="sec">语音（火山引擎）</p>
+      <p class="secst" id="voiceSt">读取中…</p>
+      <div class="fld">
+        <div class="lbl"><label for="volcApp">App Key</label>
+          <button class="clr" id="clrVolcApp" style="display:none">清除</button></div>
+        <input id="volcApp" type="password" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="fld">
+        <div class="lbl"><label for="volcAk">Access Key</label>
+          <button class="clr" id="clrVolcAk" style="display:none">清除</button></div>
+        <input id="volcAk" type="password" autocomplete="off" spellcheck="false">
+        <div class="hint">需开通：流式语音识别大模型 + 双向流式语音合成。缺这两项则按住说话与朗读不可用。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="acts">
+        <button class="btn amber" id="saveApply">保存并重启</button>
+        <button class="btn" id="saveOnly">只保存</button>
+      </div>
+      <div class="hint" style="margin-top:10px">配置在重启后生效。密钥只在提交时上传一次，页面永不回显明文。</div>
+    </div>
+  </div>
+
+  <div class="view" id="viewFiles">
   <p class="space mono" id="space">SD --</p>
 
   <div class="card">
@@ -114,6 +201,7 @@ inline const char* Html() {
       <button class="btn" id="cSkipAll">全部跳过</button>
     </div>
   </div>
+  </div><!-- /viewFiles -->
   <div class="toast mono" id="toast"></div>
 
 <script>
@@ -379,11 +467,153 @@ $("cSkip").onclick=function(){ resolveConflict("skip"); };
 $("cOverAll").onclick=function(){ resolveConflict("overAll"); };
 $("cSkipAll").onclick=function(){ resolveConflict("skipAll"); };
 
+// ---- tab 切换（文件页首次显示时才拉 SD 数据，未配置的设备不必为此转磁盘）----
+var filesInited = false;
+function showTab(which, fromClick){
+  var cfg = (which === "config");
+  $("viewCfg").className   = "view" + (cfg ? " on" : "");
+  $("viewFiles").className = "view" + (cfg ? "" : " on");
+  $("tabCfg").className    = "tab"  + (cfg ? " on" : "");
+  $("tabFiles").className  = "tab"  + (cfg ? "" : " on");
+  if(!cfg && !filesInited){ filesInited = true; renderCrumbs(); loadList(); loadSpace(); }
+  if(fromClick) location.hash = cfg ? "#config" : "#files";
+}
+$("tabCfg").onclick   = function(){ showTab("config", 1); };
+$("tabFiles").onclick = function(){ showTab("files", 1); };
+
+// ---- 配置页 ----
+// 输入框留空 = 该项不修改（所以密钥永不需要回显明文）；要抹掉已存的值就点「清除」，
+// 提交时该字段以空值发出。
+var CFG_FIELDS = [
+  {id:"llmKey",  name:"llm_key",  clr:"clrLlmKey"},
+  {id:"llmBase", name:"llm_base", clr:"clrLlmBase"},
+  {id:"llmJson", name:"llm_json", clr:"clrLlmJson"},
+  {id:"volcApp", name:"volc_app", clr:"clrVolcApp"},
+  {id:"volcAk",  name:"volc_ak",  clr:"clrVolcAk"}
+];
+var cleared = {};
+
+function resetClears(){
+  cleared = {};
+  CFG_FIELDS.forEach(function(f){
+    $(f.clr).className = "clr"; $(f.clr).textContent = "清除";
+  });
+}
+CFG_FIELDS.forEach(function(f){
+  $(f.clr).onclick = function(){
+    cleared[f.name] = !cleared[f.name];
+    $(f.clr).className = "clr" + (cleared[f.name] ? " on" : "");
+    $(f.clr).textContent = cleared[f.name] ? "将清除（点此取消）" : "清除";
+    if(cleared[f.name]) $(f.id).value = "";
+  };
+});
+
+function showClr(id, on){ $(id).style.display = on ? "inline" : "none"; }
+
+function renderConfig(c){
+  var l = c.llm || {}, v = c.voice || {};
+  var st = $("llmSt");
+  if(l.configured){
+    var how = l.json_override ? ("整份 JSON " + l.json_bytes + "B") : ("Key " + l.key_mask);
+    st.textContent = "✓ 已配置 · " + how + (l.model ? " · 模型 " + l.model : "");
+    st.className = "secst ok";
+  } else {
+    st.textContent = "✗ 未配置 —— 填入 API Key 并重启后即可对话";
+    st.className = "secst no";
+  }
+  var vst = $("voiceSt");
+  if(v.configured){
+    vst.textContent = "✓ 已配置 · App " + v.app_mask + " · AK " + v.ak_mask;
+    vst.className = "secst ok";
+  } else {
+    vst.textContent = "✗ 未配置 —— 按住说话与朗读不可用";
+    vst.className = "secst no";
+  }
+  $("llmKey").placeholder  = l.key_mask ? (l.key_mask + "（已配置，留空不改）") : "sk-…";
+  $("llmBase").placeholder = l.base_url ? l.base_url : "https://api.deepseek.com";
+  $("jsonHint").textContent = l.json_override
+    ? ("当前已存 " + l.json_bytes + " 字节，覆盖上面两项与内置清单。留空 = 不修改。")
+    : ("填了这个就完全覆盖上面两项与内置清单，直接交给 agent 运行时。上限 " +
+       ((c.limits && c.limits.models_json_max) || 3500) + " 字节。");
+  showClr("clrLlmKey",  !!l.key_mask);
+  showClr("clrLlmBase", !!l.base_url);
+  showClr("clrLlmJson", !!l.json_override);
+  showClr("clrVolcApp", !!v.app_mask);
+  showClr("clrVolcAk",  !!v.ak_mask);
+}
+
+function loadConfig(cb){
+  fetch("/api/config").then(function(r){ return r.json(); }).then(function(c){
+    renderConfig(c); if(cb) cb(c);
+  }).catch(function(){
+    $("llmSt").textContent = "读取配置失败"; $("llmSt").className = "secst no";
+    if(cb) cb(null);
+  });
+}
+
+// 收集要提交的字段；无改动返回 null。
+function collectConfig(){
+  var parts = [];
+  for(var i=0;i<CFG_FIELDS.length;i++){
+    var f = CFG_FIELDS[i];
+    if(cleared[f.name]){ parts.push(f.name + "="); continue; }
+    var val = $(f.id).value.trim();
+    if(val === "") continue;
+    parts.push(f.name + "=" + encodeURIComponent(val));
+  }
+  return parts.length ? parts.join("&") : null;
+}
+
+function saveConfig(then){
+  var raw = $("llmJson").value.trim();
+  if(raw !== "" && !cleared["llm_json"]){
+    try { JSON.parse(raw); } catch(e){ toast("models JSON 语法错误：" + e.message, 1); return; }
+  }
+  var body = collectConfig();
+  if(body === null){ toast("没有要保存的改动", 1); return; }
+  var btns = [$("saveApply"), $("saveOnly")];
+  btns.forEach(function(b){ b.disabled = true; });
+  fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+                        body:body})
+    .then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; },
+                                           function(){ return {s:r.status, j:{}}; }); })
+    .then(function(res){
+      btns.forEach(function(b){ b.disabled = false; });
+      if(res.s !== 200){
+        toast("保存失败：" + (res.j.field ? (res.j.field + " 内容不合法") : (res.j.error || res.s)), 1);
+        return;
+      }
+      CFG_FIELDS.forEach(function(f){ $(f.id).value = ""; });
+      resetClears();
+      loadConfig();
+      if(then) then(); else toast("已保存 · 重启后生效");
+    }).catch(function(){
+      btns.forEach(function(b){ b.disabled = false; });
+      toast("保存失败", 1);
+    });
+}
+
+$("saveOnly").onclick = function(){ saveConfig(null); };
+$("saveApply").onclick = function(){
+  saveConfig(function(){
+    fetch("/api/config/apply", {method:"POST"}).then(function(r){ return r.json(); })
+      .then(function(j){ toast(j.sim ? "已保存 · sim 需手动重启 pi_sim" : "已保存 · 设备正在重启…"); })
+      .catch(function(){ toast("已保存 · 重启请求失败，请手动重启设备", 1); });
+  });
+};
+
 // ---- init ----
-renderCrumbs(); loadList(); loadSpace();
+// 默认 tab：没配全 → 配置（扫码引导进来的场景）；配全了 → 文件（快捷面板进来的场景）。
+loadConfig(function(c){
+  var h = location.hash;
+  if(h === "#files"){ showTab("files"); return; }
+  if(h === "#config"){ showTab("config"); return; }
+  var done = c && c.llm && c.llm.configured && c.voice && c.voice.configured;
+  showTab(done ? "files" : "config");
+});
 </script>
 </body>
 </html>)HTML";
 }
 
-}  // namespace media_admin_web
+}  // namespace web_admin_web

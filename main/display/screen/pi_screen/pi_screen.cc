@@ -34,6 +34,7 @@
 #include "metalio_hal/sysmon.h"
 #include "media_player/media_player.h"  // 熄屏门控只读查询 MediaController 播放态（不调用任何变更态 API）
 #include "pi_fonts.h"
+#include "pi_guide.h"
 #include "pi_media_focus.h"
 #include "pi_net_events.h"
 #include "pi_quick_panel.h"
@@ -128,6 +129,11 @@ lv_timer_t* s_burnin_timer = nullptr;  // DIM 期间每 60s 平移时钟容器
 // ---- Phase3：常驻小组件（display:'standby'，单槽，固定 id "pin"）----
 lv_obj_t* s_pin_host = nullptr;  // pin 卡的父容器：scr 子对象，仅 Idle 可见，非 clickable/scrollable
 bool s_has_pin = false;
+
+// ---- 未配置引导卡（pi_guide）：与 pin 卡共用同一块待机区域，引导优先 ----
+// 未配置时 agent 起不来、不可能有 pin 卡，实际不会同屏；优先级只是保险。
+lv_obj_t* s_guide_host = nullptr;
+bool s_guide_on = false;
 
 // ----- P1: 状态栏网络真状态 -------------------------------------------------
 // 网络链路 UI 态。事件回调（网络栈任务线程）只写原子快照 + dirty，LVGL 侧
@@ -699,6 +705,9 @@ void NetTick(lv_timer_t*) {
     if (dirty || s_net_ticks % period == 0)
         RefreshWifiWidgets(dirty);
     RefreshBatteryWidgets();  // 键控跳过，无变化零开销
+    // 引导卡：网络状态一变就刷（拿到 IP 才有地址二维码），另每 2s 兜一次——它内部
+    // 会幂等重启 Web 后台，抵消后台的 10min 闲置自停。
+    if (s_guide_on && (dirty || s_net_ticks % 2 == 0)) pi_guide::Refresh();
 }
 
 
@@ -2429,6 +2438,8 @@ void DrainQueueTick(lv_timer_t*) {
 // ---------------------------------------------------------------------------
 // view/state machine
 // ---------------------------------------------------------------------------
+void ApplyIdleHosts();  // 定义在下方待机布局一节
+
 void Go(ViewState s) {
     s_state = s;
     lv_obj_add_flag(s_idle_view, LV_OBJ_FLAG_HIDDEN);
@@ -2438,63 +2449,80 @@ void Go(ViewState s) {
         case ViewState::Idle:
             lv_obj_remove_flag(s_idle_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
-            if (s_pin_host != nullptr) {
-                if (s_has_pin) lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
-                else lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
-            }
             break;
         case ViewState::Listen:
             s_ptt_cancel_armed = false;
             SetListenCancelState(false);  // 每次进聆听都从"松开发送"态起
             lv_obj_remove_flag(s_listen_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
-            if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
         case ViewState::Chat:
             lv_obj_remove_flag(s_chat_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_ptt_layer, LV_OBJ_FLAG_HIDDEN);
-            if (s_pin_host != nullptr) lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
             break;
     }
+    ApplyIdleHosts();  // pin / 引导卡都只在 Idle 露出（s_state 已更新）
     // 屏幕级紧凑媒体行只在 Idle 显示（Chat 的媒体行内嵌 dock、随 chat_view 显隐，
     // Listen 两处天然全隐）。
     pi_media::SetMiniBarContext(s == ViewState::Idle);
 }
 
-// pin 常驻组件的待机布局：出现时大时钟区整体隐藏（时间/日期上移到状态栏中央的迷你
-// 时钟），隐 breath、隐"按住说话"提示条——腾出的整片区域交给 pin host（flex 纵向居中
-// 承载卡片）；Idle 态下显示 pin host；消失后完全复原（D2）。
-void ApplyPinLayout(bool has) {
-    s_has_pin = has;
+// 待机页家具（大时钟区/呼吸点/"按住说话"提示条）在 pin 卡或引导卡出现时整体让位：
+// 时间/日期上移到状态栏中央的迷你时钟，腾出的整片区域交给对应 host（flex 纵向居中
+// 承载卡片）；两者都没有时完全复原（D2）。
+void ApplyIdleFurniture(bool overlay) {
     if (s_idle_mid != nullptr) {
-        if (has) lv_obj_add_flag(s_idle_mid, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_add_flag(s_idle_mid, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_mid, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_sbar_clock_lbl != nullptr) {
-        if (has) lv_obj_remove_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_remove_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(s_sbar_clock_lbl, LV_OBJ_FLAG_HIDDEN);
     }
     // 迷你时钟占据状态栏中央，待机页模型名让位（会与之重叠；左侧 pi 标识保留）。
     if (s_idle_model_lbl != nullptr) {
-        if (has) lv_obj_add_flag(s_idle_model_lbl, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_add_flag(s_idle_model_lbl, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_model_lbl, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_idle_breath != nullptr) {
-        if (has) lv_obj_add_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_add_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_breath, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_idle_hint != nullptr) {
-        if (has) lv_obj_add_flag(s_idle_hint, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_add_flag(s_idle_hint, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_hint, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_idle_hrule != nullptr) {
-        if (has) lv_obj_add_flag(s_idle_hrule, LV_OBJ_FLAG_HIDDEN);
+        if (overlay) lv_obj_add_flag(s_idle_hrule, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(s_idle_hrule, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+// 两个待机浮层 host 的显隐（都只在 Idle 可见；引导优先于 pin 卡）。
+void ApplyIdleHosts() {
+    const bool idle = (s_state == ViewState::Idle);
+    if (s_guide_host != nullptr) {
+        if (s_guide_on && idle) lv_obj_remove_flag(s_guide_host, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_guide_host, LV_OBJ_FLAG_HIDDEN);
+    }
     if (s_pin_host != nullptr) {
-        if (has && s_state == ViewState::Idle) lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
+        if (s_has_pin && idle && !s_guide_on)
+            lv_obj_remove_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+void ApplyPinLayout(bool has) {
+    s_has_pin = has;
+    ApplyIdleFurniture(s_has_pin || s_guide_on);
+    ApplyIdleHosts();
+}
+
+// 引导卡的显隐总闸：配置齐了就永久收起（配置变更要重启，本次运行不会再需要）。
+void ApplyGuide(bool on) {
+    s_guide_on = on;
+    ApplyIdleFurniture(s_has_pin || s_guide_on);
+    ApplyIdleHosts();
 }
 
 // ---------------------------------------------------------------------------
@@ -3488,6 +3516,24 @@ lv_obj_t* PiScreen::Create() {
     lv_obj_set_style_bg_opa(s_pin_host, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_add_flag(s_pin_host, LV_OBJ_FLAG_HIDDEN);
 
+    // 未配置引导卡的宿主：与 pin host 同区域同规格，但卡里有可点按钮（「开始配网」），
+    // 故 host 本身仍非 clickable，让空白区按压穿透回 s_ptt_layer。
+    s_guide_host = lv_obj_create(scr);
+    screen_strip_obj_chrome(s_guide_host);
+    lv_obj_remove_flag(s_guide_host, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_guide_host, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_guide_host, kW, kH - kSbarH);
+    lv_obj_set_pos(s_guide_host, 0, kSbarH);
+    lv_obj_set_flex_flow(s_guide_host, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_guide_host, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(s_guide_host, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(s_guide_host, LV_OBJ_FLAG_HIDDEN);
+    if (pi_guide::Needed()) {
+        pi_guide::Build(s_guide_host);
+        ApplyGuide(true);
+    }
+
     // Stage C：媒体呈现层初始化（记 screen 供全屏页 Open）+ Idle 屏幕级紧凑媒体行。
     // 该行必须建在 ptt 层/pin host 之后（z 序压过 ptt 层才能收触摸）、快捷面板/设置栈/
     // 媒体全屏页之前（那些不透明浮层自然遮住它）；位置视觉上融入底部提示带上沿，
@@ -3507,7 +3553,7 @@ lv_obj_t* PiScreen::Create() {
     // P1：「⚙ 设置」接线——面板已自行收起，这里直接推入设置 Hub（设置栈
     // 懒创建为 screen 的最后一个子对象，z 序压过 ptt 层/面板/sheet）。
     qp_hooks.on_settings = []() { pi_settings::Open(s_scr); };
-    // 「文件管理」快捷面板一步直达（跳过设置 Hub，直接推 Files 页；WiFi 门
+    // 「后台」快捷面板一步直达（跳过设置 Hub，直接推设备后台页；WiFi 门
     // 控在 pi_quick_panel 侧已做，这里回调时必已连通）。
     qp_hooks.on_files = []() { pi_settings::OpenFiles(s_scr); };
     pi_quick_panel::Create(scr, qp_hooks);

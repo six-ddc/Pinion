@@ -33,7 +33,7 @@ void SetHooks(const Hooks& hooks);
 // 子对象故 z 序最高）。重复调用是 no-op。
 void Open(lv_obj_t* parent);
 
-// 快捷面板「文件管理」入口专用：跳过 Hub，直接把「文件管理」页推成栈里唯一
+// 快捷面板「后台」入口专用：跳过 Hub，直接把「设备后台」页推成栈里唯一
 // 一页（同一个懒创建 root/tick 机制，Back() 时空栈即整体收起，与 Open() 后
 // 逐级返回体感一致）。重复调用（栈已开）是 no-op。
 void OpenFiles(lv_obj_t* parent);

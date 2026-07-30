@@ -21,13 +21,9 @@ sdkconfig.old
 tmp/
 .env
 
-# pi-c models.json copy — contains a live API key (see pi_agent_task.c /
-# pi_models_data.h header comment); pi-c's own repo gitignores the source
-# file for the same reason.
+# 误提交防护：固件已不打包密钥（都存 NVS，经 Web 后台配置），这两个文件名不再由任何
+# 流程产生；仍然忽略，是为了让本地遗留的旧真钥文件永远不可能被 git add 进来。
 main/display/screen/pi_screen/pi_models_data.h
-
-# 火山引擎语音密钥（真钥，从模板 volc_keys.h.example 复制生成）——绝不入库。
-# 全局文件名匹配：无论该头文件位于或被复制到仓库何处均被忽略。
 volc_keys.h
 
 # sim 运行产物（从仓库根目录运行 ./sim/build/pi_sim 时生成于 CWD）

@@ -1,7 +1,7 @@
-// media_admin_core.h — SD 卡音乐后台的**可移植**核心逻辑（不含任何 httpd 类型）。
+// web_admin_fs.h — SD 卡音乐后台的**可移植**核心逻辑（不含任何 httpd 类型）。
 //
-// 设备端由 esp_http_server 薄壳（media_admin_httpd.cc）调用，sim 端由 POSIX
-// socket 薄壳（sim/shim/src/media_admin_httpd_sim.cc）调用，同一套逻辑双端复用。
+// 设备端由 esp_http_server 薄壳（web_admin_httpd.cc）调用，sim 端由 POSIX
+// socket 薄壳（sim/shim/src/web_admin_httpd_sim.cc）调用，同一套逻辑双端复用。
 // 只依赖 <string> + POSIX 文件 API + mhal::storage（挂载点 / 剩余空间查询，双端均有）。
 //
 // 目录模型：SD 挂载点下两个根 Music/ 与 Podcasts/，浏览器只在这两棵子树里
@@ -15,7 +15,7 @@
 #include <functional>
 #include <string>
 
-namespace media_admin {
+namespace web_admin::fs {
 
 inline constexpr const char* kRoots[2] = {"Music", "Podcasts"};
 
@@ -72,4 +72,4 @@ void JsonEscapeInto(std::string& out, const std::string& s);
 std::string UrlDecode(const std::string& s);
 bool FormField(const std::string& body, const char* key, std::string& out);
 
-}  // namespace media_admin
+}  // namespace web_admin::fs

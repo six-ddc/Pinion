@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/volc_proto.c"
+        "src/volc_keys_store.cc"
         "src/volc_asr.cc"
         "src/volc_tts.cc"
         "src/volc_selftest.cc"

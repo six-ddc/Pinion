@@ -255,7 +255,7 @@ PSRAM 全套、MIPI-DSI、LV_COLOR_DEPTH_24、CONFIG_LV_USE_FONT_COMPRESSED=y（
 关必崩）、ESP-Hosted C5 SDIO 整块、CONFIG_PI_FEATURE_{PARTIAL_JSON,MODELS_JSON,COMPAT}=y
 （pi-c 组件 Kconfig）。分区表原样（resources 分区闲置无害）。managed_components 由
 CM 依 yml 重解析。绝不 idf.py set-target。
-`main/display/screen/pi_screen/pi_models_data.h`（gitignored 真钥）不动、不入库。
+密钥不进固件：大模型 / 语音密钥都存 NVS `"cfg"`，经设备 Web 后台配置（`components/device_config`）。
 
 ## 7. 能力对照表（验收凭证：任何一项不允许在终态固件里消失）
 

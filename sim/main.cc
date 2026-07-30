@@ -50,7 +50,8 @@
 #include "pi_card/pi_card_tools.h"
 #include "pi_ui_bridge.h"
 #include "stock/stock_tool.h"
-#include "media_admin_httpd.h"
+#include "device_config.h"
+#include "web_admin_httpd.h"
 #include "pi_screen.h"
 #include "screen_util.h"
 #include "sim_hooks.h"
@@ -1871,9 +1872,17 @@ int main() {
         return 0;
     }
 
-    // PI_SIM_ADMIN=1：起 SD 音乐 Web 后台（POSIX socket 薄壳，http://127.0.0.1:8080），
-    // 在 macOS 浏览器里真实走通整个前端；文件落到 pi_sim_sd/。
-    if (std::getenv("PI_SIM_ADMIN") != nullptr) media_admin::httpd::Start();
+    // PI_SIM_ADMIN=1：起设备 Web 后台（POSIX socket 薄壳，http://127.0.0.1:8080），
+    // 在 macOS 浏览器里真实走通整个前端（配置页 + 文件页）；文件落到 pi_sim_sd/，
+    // 配置落到 pi_sim_settings.ini 的 cfg.* 键。
+    if (std::getenv("PI_SIM_ADMIN") != nullptr) web_admin::httpd::Start();
+
+    // 密钥不再编译进来：没配过就提示一次怎么配（设备上是扫码进后台，sim 里同一个页面）。
+    if (!device_config::LlmReady()) {
+        std::fprintf(stderr,
+                     "[sim] 未配置大模型 API Key，agent 不会启动。配置方式：\n"
+                     "      PI_SIM_ADMIN=1 ./sim/build/pi_sim → 浏览器开 http://127.0.0.1:8080\n");
+    }
 
     const bool loop_debug = std::getenv("PI_SIM_TOUCH_DEBUG") != nullptr;
     uint32_t stat_loops = 0, stat_handler = 0, stat_pump = 0, stat_last = SDL_GetTicks();

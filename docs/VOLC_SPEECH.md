@@ -10,15 +10,14 @@
 协议实现字节级对齐已在生产验证过的 TS 参考实现
 （`ai-chat-esp32/service/src/asr.ts`、`tts.ts`、`volcengine/protocols.ts`）。
 
-## 密钥配置（必做，否则编译失败）
+## 密钥配置（运行期注入，固件不打包）
 
-```sh
-cp components/volc_speech/include/volc_keys.h.example \
-   components/volc_speech/include/volc_keys.h
-# 编辑填入火山控制台的 App ID / Access Token
-```
+App Key / Access Key 由用户在设备 Web 后台的「配置」页填写、存 NVS（`"cfg"` 的
+`volc_app` / `volc_ak`，见 `components/device_config`）；开机时 `main.cc` 读出来调
+`volc_speech_set_keys()`（`include/volc_speech_keys.h`）注入本组件，ASR/TTS 在每次建
+WSS 连接时取用。未注入时 `volc_asr_start` / `volc_tts_speak_begin` 直接失败并 LOGE，
+不会拿空密钥去握手。**key 值绝不打印进日志。**
 
-`volc_keys.h` 已按文件名全局 gitignore，**绝不入库、绝不打印**。
 需开通的产品：流式语音识别大模型（resource `volc.seedasr.sauc.duration`）、
 双向流式语音合成（resource `seed-tts-2.0`，音色 `zh_female_xiaohe_uranus_bigtts`；
 三者以宏硬编码在 `src/volc_asr.cc` / `src/volc_tts.cc` 顶部，换产品改宏即可）。

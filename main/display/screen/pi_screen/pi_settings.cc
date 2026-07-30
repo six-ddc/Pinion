@@ -15,10 +15,11 @@
 #include "metalio_hal/bluetooth.h"
 #include "metalio_hal/network.h"
 #include "metalio_hal/power.h"
-#include "media_admin_httpd.h"
+#include "web_admin_httpd.h"
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_net_events.h"
+#include "pi_qr.h"
 #include "pi_sleep.h"
 #include "pi_sys_info.h"
 #include "pi_theme.h"
@@ -34,7 +35,7 @@
 // 的后台任务线程触发，只写 s_mu 保护的快照 + dirty 标志；LVGL 侧由打开
 // 期间常驻的 500ms tick 定时器轮询落地（与 pi_screen 的 ASR 轮询同一套
 // 封送模式）。设置栈只随用户操作退出，绝不做无操作自动退回主屏
-// （曾有 30s 自动退栈，会打断文件管理页上传等长任务，已移除）。
+// （曾有 30s 自动退栈，会打断后台页上传等长任务，已移除）。
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -69,9 +70,10 @@ uint32_t s_ticks = 0;
 lv_obj_t* s_hub_val[6] = {};
 lv_obj_t* s_hub_batt = nullptr;
 
-// 文件管理页
+// 设备后台页
 lv_obj_t* s_file_state_lbl = nullptr;  // 运行状态 / URL
 lv_obj_t* s_file_btn_lbl = nullptr;    // 启动/停止 按钮文字
+lv_obj_t* s_file_qr = nullptr;         // 运行中显示后台地址二维码
 
 // 网络页
 lv_obj_t* s_net_seg[2] = {};
@@ -543,7 +545,7 @@ void BuildHubPage(lv_obj_t** out_page) {
     lv_obj_set_style_pad_ver(content, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_row(content, 0, LV_PART_MAIN);
 
-    // 「文件管理」不在这张 Hub 表里——单一入口在快捷面板（下拉面板一步直达
+    // 「设备后台」不在这张 Hub 表里——单一入口在快捷面板（下拉面板一步直达
     // pi_settings::OpenFiles()），设置栈保持"网络/蓝牙/声音/显示/对话/关于"六页干净。
     static const char* kIcons[6] = {"wifi", "bluetooth", "volume-2", "sun", "message-circle", "info"};
     static const char* kTitles[6] = {"网络", "蓝牙", "声音", "显示", "对话", "关于"};
@@ -1485,17 +1487,23 @@ void BuildChatPage(lv_obj_t** out_page) {
 }
 
 // ---------------------------------------------------------------------------
-// 文件管理页（SD 音乐 Web 后台的起停 + 地址显示）
+// 设备后台页（Web 后台的起停 + 地址显示 + 扫码）
 // ---------------------------------------------------------------------------
 void RefreshFilesPage() {
     if (s_file_state_lbl == nullptr)
         return;
     bool wifi_up = mhal::network::GetType() == mhal::network::Type::WiFi &&
                    mhal::network::IsConnected();
-    bool running = media_admin::httpd::IsRunning();
+    bool running = web_admin::httpd::IsRunning();
+    std::string url = running ? web_admin::httpd::GetUrl() : "";
+    pi_qr::Update(s_file_qr, url);  // 空串（未运行/没拿到 IP）自动隐藏
+    if (s_file_qr != nullptr) {     // 连同居中容器一起收起，别留一道空行
+        lv_obj_t* qr_row = lv_obj_get_parent(s_file_qr);
+        if (url.empty()) lv_obj_add_flag(qr_row, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(qr_row, LV_OBJ_FLAG_HIDDEN);
+    }
     char buf[128];
     if (running) {
-        std::string url = media_admin::httpd::GetUrl();
         std::snprintf(buf, sizeof(buf),
                       "运行中 · %s",  // "运行中 · <url>"
                       url.empty() ? "http://?" : url.c_str());
@@ -1519,26 +1527,23 @@ void RefreshFilesPage() {
 void OnFileToggleClicked(lv_event_t*) {
     bool wifi_up = mhal::network::GetType() == mhal::network::Type::WiFi &&
                    mhal::network::IsConnected();
-    if (media_admin::httpd::IsRunning()) {
-        media_admin::httpd::Stop();
+    if (web_admin::httpd::IsRunning()) {
+        web_admin::httpd::Stop();
     } else {
         if (!wifi_up)
             return;  // 未连 WiFi：按钮灰化语义，直接忽略
-        media_admin::httpd::Start();
+        web_admin::httpd::Start();
     }
     RefreshFilesPage();
     RefreshHub();
 }
 
 void BuildFilesPage(lv_obj_t** out_page) {
-    // "文件管理"
-    lv_obj_t* content = MakePage(PageId::Files,
-                                 "文件管理", out_page);
+    lv_obj_t* content = MakePage(PageId::Files, "设备后台", out_page);
 
-    lv_obj_t* card = MakeCard(content, "MEDIA WEB ADMIN");
-    // "在浏览器管理 SD 卡里 Music / Podcasts 的 MP3（列表 / 上传 / 目录 / 删除）"
+    lv_obj_t* card = MakeCard(content, "WEB ADMIN");
     lv_obj_t* desc = lv_label_create(card);
-    lv_label_set_text(desc, "在浏览器管理 SD 卡里 Music / Podcasts 的 MP3");
+    lv_label_set_text(desc, "在浏览器里配置大模型 / 语音密钥，管理 SD 卡音乐");
     SetLabelFont(desc, &font_puhui_20_4, Tok::Faint);
     lv_obj_set_width(desc, LV_PCT(100));
     lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
@@ -1548,6 +1553,20 @@ void BuildFilesPage(lv_obj_t** out_page) {
     SetLabelFont(s_file_state_lbl, &font_puhui_20_4, Tok::Dim);
     lv_obj_set_width(s_file_state_lbl, LV_PCT(100));
     lv_label_set_long_mode(s_file_state_lbl, LV_LABEL_LONG_WRAP);
+
+    // 地址二维码：手机扫一下就进后台，省得手输 IP。未运行时 Update 会隐藏它。
+    // 卡片是 flex 列 + 交叉轴 START（其余行都是 100% 宽的标签），固定尺寸的二维码
+    // 会贴左，故套一层满宽居中容器。
+    lv_obj_t* qr_row = lv_obj_create(card);
+    screen_strip_obj_chrome(qr_row);
+    lv_obj_remove_flag(qr_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(qr_row, LV_PCT(100));
+    lv_obj_set_height(qr_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(qr_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(qr_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(qr_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    s_file_qr = pi_qr::Make(qr_row, 160);
 
     // 启动/停止按钮
     lv_obj_t* btn = MakeActionBtn(card, "启动服务",
@@ -1668,6 +1687,7 @@ void PageWillClose(PageId id) {
         case PageId::Files:
             s_file_state_lbl = nullptr;
             s_file_btn_lbl = nullptr;
+            s_file_qr = nullptr;
             break;
         case PageId::Hub:
             for (auto*& o : s_hub_val)
@@ -1770,7 +1790,7 @@ void TickCb(lv_timer_t*) {
     // 网络状态卡片 5s 一刷（4G 信号走 AT 通道，别刷太勤）
     if (s_ticks % 10 == 0 && top == PageId::Network)
         RefreshNetworkPage();
-    // 文件管理页 2s 一刷（服务可能因 10min 闲置自动停 / WiFi 状态变化）
+    // 设备后台页 2s 一刷（服务可能因 10min 闲置自动停 / WiFi 状态变化）
     if (s_ticks % 4 == 0 && top == PageId::Files)
         RefreshFilesPage();
 }
@@ -1841,7 +1861,7 @@ static void OpenWith(lv_obj_t* parent, PageId first_page) {
 
 void Open(lv_obj_t* parent) { OpenWith(parent, PageId::Hub); }
 
-// 快捷面板「文件管理」一步直达：直接把 Files 页推成栈里唯一一页。
+// 快捷面板「后台」一步直达：直接把设备后台页推成栈里唯一一页。
 void OpenFiles(lv_obj_t* parent) { OpenWith(parent, PageId::Files); }
 
 void Close() { CloseAll(); }

@@ -40,11 +40,18 @@ eth-modem). Network type is persisted in NVS `"network"/"type"` (0=WiFi, 1=4G; d
   → 自研重采样归一 16k mono。宿主测试：`sim/build/ts_demux_test`（TS/HLS 解析）、
   `media_stress`（ASan 泵切换）。
 
-## Secrets — never commit
+## Secrets — none are compiled in
 
-`main/display/screen/pi_screen/pi_models_data.h` contains a **live DeepSeek API key**
-(`PI_MODELS_JSON_TEXT`). It is gitignored and must exist on disk for real-API builds. Never stage
-it, never delete it; check `git status` before every commit.
+The firmware ships **without any API key**. Both the LLM config (DeepSeek API key, optional baseUrl,
+optional whole models JSON) and the Volcengine speech keys (App Key / Access Key) live in NVS
+namespace `"cfg"` and are entered through the device's Web admin (`components/web_admin`, port 80):
+`components/device_config` is the only reader/writer. A device with nothing configured shows a QR
+code on the standby screen (`pi_guide`) — scan it, fill the form, hit 保存并重启.
+
+Consequences for anyone touching this repo: a clean checkout builds (no local secret headers to
+create), the two `.gitignore` entries for `pi_models_data.h` / `volc_keys.h` are only stale-file
+guards, and secrets must never be added back to a header. Change a key → save in the web admin →
+device reboots; the models catalog is loaded once per boot (`pi_agent_task.c`) and never hot-swapped.
 
 ## Build / flash
 

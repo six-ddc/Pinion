@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SCAN_DIRS = [REPO / "main/display/screen"]
-SKIP_FILES = {"pi_models_data.h"}  # gitignored 密钥 JSON，不是 UI 文案
+SKIP_FILES: set[str] = set()
 OUT = Path(__file__).resolve().parent / "font_puhui_24_4.c"
 
 # 源码之外的保底字符：全角标点 + 常用符号（文案里迟早会用到，一并纳入，
