@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 14 px
  * Bpp: 4
- * Opts: --font /Users/dev/Library/Fonts/JetBrainsMono-Regular.ttf --format lvgl --lv-include lvgl.h --bpp 4 --size 14 -r 0x20-0x7E -r 0xB7 -r 0xB0 -o font_pi_mono_14.c
+ * Opts: --font JetBrainsMono-Regular.ttf --format lvgl --lv-include lvgl.h --bpp 4 --size 14 -r 0x20-0x7E -r 0xB7 -r 0xB0 -o font_pi_mono_14.c
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

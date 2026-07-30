@@ -43,17 +43,21 @@ cp "$PI_C_SRC"/third_party/cJSON/cJSON.h "$PI_C_SRC"/third_party/cJSON/cJSON.c "
 cp "$PI_C_SRC/LICENSE" "$HERE/LICENSE"
 cp "$PI_C_SRC/NOTICE"  "$HERE/NOTICE"
 
-echo "==> 2/4 host archives ($HOST_ARCH)"
+echo "==> 2/5 host archives ($HOST_ARCH)"
 HB="$(mktemp -d)"
+# Release (not RelWithDebInfo): pi-c is a PRIVATE upstream and DWARF debug info
+# embeds absolute source paths — shipping it would leak the private repo's file
+# tree (src/agent/pi_loop.c, src/ai/providers/*.c, …) plus the build machine's
+# username into this public repo. Step 4/5 strips whatever survives.
 cmake -S "$PI_C_SRC" -B "$HB" -DPI_BUILD_TESTS=OFF -DPI_BUILD_EXAMPLES=OFF \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
+      -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$HB" --target pi pi_posix -j >/dev/null
 cp "$(find "$HB" -name libpi.a       | head -1)" "$HOST_LIBDIR/libpi.a"
 cp "$(find "$HB" -name libpi_posix.a | head -1)" "$HOST_LIBDIR/libpi_posix.a"
 rm -rf "$HB"
 echo "    -> $HOST_LIBDIR/{libpi.a,libpi_posix.a}"
 
-echo "==> 3/4 P4 archive (esp32p4, riscv32)"
+echo "==> 3/5 P4 archive (esp32p4, riscv32)"
 if [[ -z "${IDF_PATH:-}" ]]; then
     echo "ERROR: IDF_PATH unset — source your ESP-IDF env (.idf-env.sh) first" >&2
     exit 1
@@ -65,7 +69,24 @@ cp "$(find "$PB/build" -name libpi-c.a | head -1)" "$HERE/lib/esp32p4/libpi-c.a"
 rm -rf "$PB/build" "$PB/sdkconfig" "$PB/managed_components" "$PB/dependencies.lock"
 echo "    -> $HERE/lib/esp32p4/libpi-c.a"
 
-echo "==> 4/4 done. Vendored artefacts:"
+echo "==> 4/5 strip debug info (must not leak private pi-c paths)"
+# Keeps the symbol table (linking needs it), drops DWARF. Verified below: any
+# surviving '/Users', '/home' or 'pi-c/src' string is a hard failure — this repo
+# is public, pi-c is not.
+strip -S "$HOST_LIBDIR/libpi.a" "$HOST_LIBDIR/libpi_posix.a"
+"${IDF_TOOLCHAIN_PREFIX:-riscv32-esp-elf-}strip" --strip-debug "$HERE/lib/esp32p4/libpi-c.a"
+leaked=0
+for a in "$HERE/lib/esp32p4/libpi-c.a" "$HOST_LIBDIR"/*.a; do
+    n="$(strings -a "$a" | grep -cE '/Users/|/home/|pi-c/(src|port|include)' || true)"
+    printf '    %-16s leaked-path-strings=%s\n' "$(basename "$a")" "$n"
+    [[ "$n" == "0" ]] || leaked=1
+done
+if [[ "$leaked" != "0" ]]; then
+    echo "ERROR: private source paths survived stripping — do NOT commit these archives" >&2
+    exit 1
+fi
+
+echo "==> 5/5 done. Vendored artefacts:"
 ls -la "$HERE/lib/esp32p4/libpi-c.a" "$HOST_LIBDIR"/*.a
 echo "Reminder: P4 feature set is fixed in tools/pic_p4_build/sdkconfig.defaults;"
 echo "keep it in sync with the firmware sdkconfig's CONFIG_PI_FEATURE_* flags."

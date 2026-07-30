@@ -46,17 +46,37 @@ idf.py -p /dev/ttyACM0 flash monitor  # P4 口 = "USB JTAG/serial debug unit"；
 - `sdkconfig` 不入库；`sdkconfig.defaults` 携带全部承重配置（PSRAM/DSI/压缩字体/
   ESP-Hosted 引脚等），细节与禁忌见 `CLAUDE.md`。
 
-## models.json 配置（含密钥，不入库）
+## 密钥配置（必做，两个文件都不入库）
 
-真实 API 的模型目录来自 `main/display/screen/pi_screen/pi_models_data.h` ——
-该文件被 gitignore（内含 DeepSeek API key），构建前必须在本地生成：
+克隆后有两个含密钥的头文件必须在本地生成，否则**编译失败**。两者都已按文件名
+gitignore，**绝不入库、绝不打印进日志**；每次提交前用 `git status` 复核。
 
-1. 从 pi-c 私有上游取到 `models.json`（该文件在 pi-c 仓库里同样被 gitignore）；
-2. 把它的内容原样写成 C 字符串字面量，放进 `pi_models_data.h`，宏名为
-   `PI_MODELS_JSON_TEXT`（格式参考 `pi_agent_task.c` 文件头注释——无需任何
-   构建系统 embed 步骤）。
+### 1. 模型目录 — `main/display/screen/pi_screen/pi_models_data.h`
 
-**绝不要把该文件或任何 key 提交进 git。** 每次提交前用 `git status` 复核。
+一份 pi-c 格式的 models.json，minify 后转义成 C 字符串字面量（宏名
+`PI_MODELS_JSON_TEXT`），内含 DeepSeek API key。从模板复制后把 `apiKey` 换成自己的：
+
+```sh
+cp main/display/screen/pi_screen/pi_models_data.h.example \
+   main/display/screen/pi_screen/pi_models_data.h
+```
+
+模板里有展开可读的 JSON 结构、各字段说明（哪些是承重的、缺了会怎么崩），以及换
+provider / 重新转义用的一行命令。
+
+### 2. 语音密钥 — `components/volc_speech/include/volc_keys.h`
+
+火山引擎语音（ASR + TTS）的 App ID / Access Token，从模板复制后填入：
+
+```sh
+cp components/volc_speech/include/volc_keys.h.example \
+   components/volc_speech/include/volc_keys.h
+```
+
+需在火山控制台开通：流式语音识别大模型（resource `volc.seedasr.sauc.duration`）
+与双向流式语音合成（resource `seed-tts-2.0`）。资源名与音色以宏硬编码在
+`src/volc_asr.cc` / `src/volc_tts.cc` 顶部，换产品改宏即可。详见
+**`docs/VOLC_SPEECH.md`**。
 
 ## 代码结构
 

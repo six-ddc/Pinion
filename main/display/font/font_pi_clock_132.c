@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 132 px
  * Bpp: 2
- * Opts: --font /Users/dev/Library/Fonts/JetBrainsMono-SemiBold.ttf --format lvgl --lv-include lvgl.h --bpp 2 --size 132 --symbols 0123456789: -o font_pi_clock_132.c
+ * Opts: --font JetBrainsMono-SemiBold.ttf --format lvgl --lv-include lvgl.h --bpp 2 --size 132 --symbols 0123456789: -o font_pi_clock_132.c
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE
