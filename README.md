@@ -92,4 +92,6 @@ cp components/volc_speech/include/volc_keys.h.example \
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。上游致谢：[xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)。
+MIT，见 [LICENSE](LICENSE)。上游致谢（按血缘由近及远）：
+[MetalioClaw4](https://github.com/CloudZao/MetalioClaw4) ←
+[xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)。
