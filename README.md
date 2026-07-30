@@ -1,12 +1,16 @@
-# Metalio Claw6 — pi Agent 终端固件
+# Pinion — pi Agent 终端固件
 
 ESP32-P4 掌上设备（720×720 MIPI-DSI 触摸屏）的单一用途固件：开机直接进入
-[pi-c](../../six-ddc/pi-c) Agent 对话界面（`main/display/screen/pi_screen/`），
+[pi-c](components/pi_c_prebuilt/) Agent 对话界面（`main/display/screen/pi_screen/`），
 通过 DeepSeek API 进行流式对话。没有菜单、没有其他 App —— UI 只有这一个屏。
 
-本仓库源自 xiaozhi-esp32 的 fork（Claw4/Claw5），Claw6 重构删除了全部 xiaozhi
-业务层，硬件能力收敛为可复用组件 **`components/metalio_hal/`**。重构的权威记录
-（as-built API、旧→新映射、能力验收矩阵、资产清理清单）见 **`docs/EXTRACTION.md`**。
+除了对话，模型还能**自己画界面**：`ui_render` 工具让 LLM 吐一份声明式 UI 描述，
+设备把它求解成布局、渲染为原生 LVGL 网格卡片，并可绑定实时数据（行情、媒体、
+传感器）——设计说明见 **`docs/AI_TO_UI.md`**。
+
+本仓库源自 xiaozhi-esp32 的 fork，xiaozhi 业务层已整体删除，硬件能力收敛为可复用
+组件 **`components/metalio_hal/`**。该重构的权威记录（as-built API、旧→新映射、
+能力验收矩阵、资产清理清单）见 **`docs/EXTRACTION.md`**。
 
 ## 硬件
 
@@ -33,8 +37,10 @@ idf.py -p /dev/ttyACM0 flash monitor  # P4 口 = "USB JTAG/serial debug unit"；
   2. `cd .esp-idf && ./install.sh esp32p4`；
   3. 参照 `CLAUDE.md` 的 "Build / flash" 一节写 `.idf-env.sh`（导出 `IDF_PATH`、
      `IDF_TOOLS_PATH`、`IDF_PYTHON_ENV_PATH` 后 source `export.sh`）。
-- **兄弟仓库布局**：pi-c 是 path 依赖（`main/idf_component.yml`），两仓必须并排：
-  `Code/esp32/MetalioClaw6` ↔ `Code/six-ddc/pi-c`。
+- **pi-c 依赖**：以**预编译静态库**随仓交付（`components/pi_c_prebuilt/`，私有上游、
+  不 vendor 源码）。它是 `components/` 下的普通本地组件，无需在 `main/idf_component.yml`
+  声明，也**不需要**把 pi-c 源码仓 clone 到旁边。上游更新后用
+  `components/pi_c_prebuilt/pack_pi_c.sh` 重新打包。
 - 设备会枚举出**四个**串口，只对 *USB JTAG/serial debug unit* 烧录 P4 固件；其余三个
   （CH340K = 蓝牙音频芯片，log/at = NT26 4G 模组）属于独立子系统，不要烧。
 - `sdkconfig` 不入库；`sdkconfig.defaults` 携带全部承重配置（PSRAM/DSI/压缩字体/
@@ -45,7 +51,7 @@ idf.py -p /dev/ttyACM0 flash monitor  # P4 口 = "USB JTAG/serial debug unit"；
 真实 API 的模型目录来自 `main/display/screen/pi_screen/pi_models_data.h` ——
 该文件被 gitignore（内含 DeepSeek API key），构建前必须在本地生成：
 
-1. 准备好 `six-ddc/pi-c/models.json`（pi-c 仓库同样对其 gitignore）；
+1. 从 pi-c 私有上游取到 `models.json`（该文件在 pi-c 仓库里同样被 gitignore）；
 2. 把它的内容原样写成 C 字符串字面量，放进 `pi_models_data.h`，宏名为
    `PI_MODELS_JSON_TEXT`（格式参考 `pi_agent_task.c` 文件头注释——无需任何
    构建系统 embed 步骤）。

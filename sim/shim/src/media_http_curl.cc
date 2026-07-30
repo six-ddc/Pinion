@@ -112,7 +112,7 @@ class CurlStreamSource : public MediaSource {
             CURL* c = curl_easy_init();
             if (c != nullptr) {
                 curl_easy_setopt(c, CURLOPT_URL, url_.c_str());
-                curl_easy_setopt(c, CURLOPT_USERAGENT, "MetalioClaw/1.0");
+                curl_easy_setopt(c, CURLOPT_USERAGENT, "Pinion/1.0");
                 curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
                 curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
                 // socket idle 超时（不设总超时，别杀无限流）——curl 侧 Abort 的响应性靠

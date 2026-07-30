@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Firmware for **Metalio Claw**, a palm-size ESP32-P4 device with a 720×720 MIPI-DSI touch screen.
+Firmware for **Pinion**, a palm-size ESP32-P4 device with a 720×720 MIPI-DSI touch screen.
 The firmware is a **single-purpose pi Agent chat terminal**: it boots straight into
 `main/display/screen/pi_screen/` (a four-state conversation UI driven by the
-[pi-c](../../six-ddc/pi-c) agent runtime talking to the real DeepSeek API) — there is no menu, no
-other screens. All hardware capability lives in a reusable local component **`components/metalio_hal/`**.
+[pi-c](components/pi_c_prebuilt/) agent runtime talking to the real DeepSeek API) — there is no menu,
+no other screens. All hardware capability lives in a reusable local component
+**`components/metalio_hal/`**.
 
-History: this repo started as a fork of xiaozhi-esp32 (Claw4/Claw5). The xiaozhi business layer
+History: this repo started as a fork of xiaozhi-esp32. The xiaozhi business layer
 (Application/protocols/ota/mcp/audio sessions, 25+ app screens) was removed in the Claw6 refactor —
 everything is recoverable from git history. **`docs/EXTRACTION.md` is the authoritative record** of
 the refactor: as-built `mhal::` API (with call examples), old→new mapping, capability acceptance
@@ -76,8 +77,10 @@ idf.py -p /dev/ttyACM0 flash monitor   # P4 port = "USB JTAG/serial debug unit";
 - The device exposes **four** serial ports. Flash/monitor the P4 firmware on the *USB JTAG/serial
   debug unit* port. The other three (`CH340K USB Serial` = Bluetooth codec chip, `log` / `at` = NT26
   4G module) are for separate subsystems — do **not** flash P4 firmware to them.
-- `pi-c` is a **path dependency** (`main/idf_component.yml`): the two repos must stay siblings —
-  `Code/esp32/MetalioClaw6` ↔ `Code/six-ddc/pi-c`.
+- `pi-c` ships **in-tree as a prebuilt static library** (`components/pi_c_prebuilt/`, private
+  upstream, sources not vendored) — it is an ordinary local component, so nothing needs to be
+  declared in `main/idf_component.yml` and no sibling checkout is required. Rebuild the archives
+  with `components/pi_c_prebuilt/pack_pi_c.sh` when upstream changes.
 - Code style: `.clang-format` (Google-based, 4-space indent, 120 col). Format C/C++ before committing.
 - **格式串红线（真机 newlib-nano）**：`%zu/%lld/%llu` 不支持且**不消费变参**，后随 `%s` 会把非指针
   当地址解引用直接崩，且 sim（macOS libc）永远复现不了。一律 `%u/%d` + 显式强转。注意

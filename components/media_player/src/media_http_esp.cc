@@ -86,7 +86,7 @@ class HttpStreamSource : public MediaSource {
         client_ = esp_http_client_init(&cfg);
         if (client_ == nullptr) return false;
         // 不发 Icy-MetaData（不要元数据穿插进音频流）；不发 Connection: close（保持长连）。
-        esp_http_client_set_header(client_, "User-Agent", "MetalioClaw/1.0");
+        esp_http_client_set_header(client_, "User-Agent", "Pinion/1.0");
         esp_http_client_set_header(client_, "Icy-MetaData", "0");
         if (esp_http_client_open(client_, 0) != ESP_OK) {
             Disconnect();

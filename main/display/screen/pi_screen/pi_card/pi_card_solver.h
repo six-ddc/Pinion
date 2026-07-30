@@ -36,6 +36,7 @@ constexpr int kCardWChat = 600;      // chat 内联卡内容宽
 constexpr int kCardWOverlay = 532;   // overlay 卡内容宽
 constexpr int kStackGap = 12;        // grid 块竖排间距 / cell 间距 / 行间距（统一一个值）
 constexpr int kTouchMinH = 44;       // 交互控件所在行最小触控高度
+constexpr int kFillInset = 12;       // 带 fill/bg 底色的 grid 块的内容内边距（四周）
 
 struct Input {
     const cJSON* root = nullptr;   // 信封里的 root 数组（grid 块列表）
@@ -47,10 +48,12 @@ struct Input {
 };
 
 // 纯函数，确定性。返回新分配的 layout cJSON（调用方 cJSON_Delete）。结构见 §2.6：
-// {"grids":[ {"ncol":N,"track_w":[..],"h_hint":H,
+// {"grids":[ {"ncol":N,"track_w":[..],"h_hint":H,"inset":I,
 //             "cells":[ {"gi":..,"ci":..,"row":r,"col":c,"span":s,
 //                        "x":X,"w":W,"align":"start|center|end",
 //                        "truncate":bool,"wrap":"wrap|ellipsis|nowrap"} ] } ]}
+// inset：该 grid 声明了 fill/bg 底色时为 kFillInset，否则 0。solver 已按 viewport_w-2*inset
+// 求解该 grid 的所有几何（cell x/w 相对内容区原点）；渲染器负责给容器补同宽的 pad。
 // wrap 三态是渲染器实际消费的文本排布语义（truncate 仅兼容保留，"是否真的超宽会截断"的
 // 精确判定）：
 //   "wrap"     —— 独占一整行的正文，允许多行折行撑高，渲染器不钳单行高。

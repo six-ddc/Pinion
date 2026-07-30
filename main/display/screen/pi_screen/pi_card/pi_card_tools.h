@@ -89,9 +89,9 @@ const char *pi_card_system_prompt(void);
     "auto-attaches, choice as idx(label)). "                                                          \
     "DATA: ui_update mutates card data (set/append/remove/replace); bound bind_rows/bind_data "        \
     "re-render. Icons: Lucide names (wifi|battery|play|check|x…); unknown → dot. "                     \
-    "Limits: 64 nodes (bind_rows reserves max×row-leaf-count), 8 grids/card. Layout auto (no "        \
-    "coordinates): cells wraps by size; rows aligns to shared tracks (num=right-align,text=truncate); " \
-    "bind_rows repeats template per element. See system prompt for CHOOSE tree+example."
+    "Limits: 64 nodes (bind_rows reserves max×row-leaf-count); >8 grids->first 8 render, so prefer "  \
+    "3-5 grids/card & split big dashboards. Layout auto (no coordinates): cells wraps by size; "      \
+    "rows aligns to shared tracks. See system prompt for CHOOSE tree+example."
 
 #define PI_CARD_RENDER_SCHEMA \
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
@@ -131,8 +131,10 @@ const char *pi_card_system_prompt(void);
     "\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\"" \
     ",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
     "}}}," \
+    /* 无 maxItems：>8 grids 由 host Repair() 截断+hint（宽进严出），pi-c 层硬拒的干错误
+     * （"Expected array length…"+全量 args echo）会让弱模型连环重试越改越错。 */ \
     "\"properties\":{\"root\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/grid\"},\"minItems\"" \
-    ":1,\"maxItems\":8},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
+    ":1},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
     "},\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"typ" \
     "e\":\"object\"}},\"required\":[\"root\"]}"
 

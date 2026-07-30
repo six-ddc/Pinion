@@ -46,7 +46,7 @@ bool HttpGetToString(const char* url, size_t max_bytes, const std::atomic<bool>&
     if (h == nullptr) return false;
     FetchCtx ctx{body, max_bytes, &abort, false};
     curl_easy_setopt(h, CURLOPT_URL, url);
-    curl_easy_setopt(h, CURLOPT_USERAGENT, "MetalioClaw/1.0");
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "Pinion/1.0");
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, WriteCb);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);

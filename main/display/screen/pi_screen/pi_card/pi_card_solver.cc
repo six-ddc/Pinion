@@ -140,7 +140,7 @@ bool FmtHasNumericConv(const char* fmt) {
 
 // 静态 text 是否"看起来像数值样式"（F3 修复的第三条依据）：去首尾空白，剥掉常见单位后缀
 // （连续的字母 和/或 '%'，以及它们之间的空格），剩下的核心必须是非空且只含数字/'.'/'-'/'+'。
-// 例："42%"→核心"42"；"88 dBm"→核心"88"；"Metalio Claw"→剥到"Metalio"（不含数字）→ false。
+// 例："42%"→核心"42"；"88 dBm"→核心"88"；"Pinion Pro"→剥到"Pinion"（不含数字）→ false。
 bool TextLooksNumeric(const char* text) {
     if (!text || !*text) return false;
     std::string s(text);
@@ -254,7 +254,7 @@ Contract ContractFor(const Input& in, const cJSON* cell, int viewport_w) {
 
         // 数值 label：mono 显式声明 / 数值 bind（非 %s）/ fmt 含数值转换符 / 静态 text 本身
         // 看起来像数值样式。F3 修复：role=="value" 不再单独授予数值特权——纯文本（如
-        // "Metalio Claw" 这种品牌名）标了 role:"value" 但不满足以上任何一条时，按普通文本列
+        // "Pinion" 这种品牌名）标了 role:"value" 但不满足以上任何一条时，按普通文本列
         // 处理（可截断、单行），不强制"不截断+右对齐+mono"逼出折行。
         // has_bind_data（卡级 data 模型绑定）无 fmt 时默认按字符串对待（既有口径——见
         // S:%s/bind_data 字符串 label 走文本列 64px 兜底测试），故此处只沿用 has_bind（DataHub
@@ -1032,10 +1032,19 @@ cJSON* Solve(const Input& in) {
         int ncol = 1;
         int h_hint = 0;
 
+        // 带 fill/bg 底色的 grid：内容四周留 kFillInset 内边距——按收窄后的视口求解，渲染器
+        // 给容器补同宽 pad（否则文字贴着底色边缘画，见 fill 内边距修复）。
+        int inset = (Has(grid, "fill") || Has(grid, "bg")) ? kFillInset : 0;
+        int gvw = vw - 2 * inset;
+        if (gvw < 1) {  // 防御：视口小到塞不下内边距时放弃 inset
+            inset = 0;
+            gvw = vw;
+        }
+
         const cJSON* cells = cJSON_GetObjectItem(grid, "cells");
         if (cJSON_IsArray(cells)) {
             // cells 形态：ncol = 各行最大 cell 数，track_w 留空（渲染器按 x/w 落位）。
-            SolveCells(in, cells, gi, vw, gap, cells_out, h_hint);
+            SolveCells(in, cells, gi, gvw, gap, cells_out, h_hint);
             // 计算 ncol（各 row 最大 col+1）。
             int maxc = 1;
             const cJSON* c = nullptr;
@@ -1045,12 +1054,14 @@ cJSON* Solve(const Input& in) {
             }
             ncol = maxc;
         } else {
-            SolveRows(in, grid, gi, vw, gap, cells_out, ncol, track_out, h_hint);
+            SolveRows(in, grid, gi, gvw, gap, cells_out, ncol, track_out, h_hint);
         }
 
+        if (inset > 0) h_hint += 2 * inset;  // 上下内边距计入高度预估
         cJSON_AddNumberToObject(gout, "ncol", ncol);
         cJSON_AddItemToObject(gout, "track_w", track_out);
         cJSON_AddNumberToObject(gout, "h_hint", h_hint);
+        cJSON_AddNumberToObject(gout, "inset", inset);
         cJSON_AddItemToObject(gout, "cells", cells_out);
         cJSON_AddItemToArray(grids, gout);
         ++gi;

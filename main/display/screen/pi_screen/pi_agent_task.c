@@ -681,6 +681,14 @@ static void on_event(const pi_agent_event_t *ev, void *user) {
         const char *output =
             (ev->tool_result && ev->tool_result->output) ? ev->tool_result->output : "";
         int elapsed = (int)(now_ms() - s_tool_start_ms);
+        /* 诊断：pi-c 层的失败（参数 JSON 修不出来 / schema 校验 / 重复键）不经过工具
+         * execute，错误只回给 LLM、串口全盲——真机曾连败 5 次 ui_render 而日志零线索。
+         * 这里对一切 is_error 的工具结果打头部片段（错误 echo 可达数 KB，截断防刷屏）。 */
+        if (ev->tool_result && ev->tool_result->is_error) {
+            char head[200];
+            strlcpy(head, output, sizeof(head));
+            ESP_LOGW(TAG, "tool %s FAILED (%d ms): %s", name, elapsed, head);
+        }
         enqueue(UI_TOOL_END, strdup(name), strdup(output), elapsed, 0);
         break;
     }

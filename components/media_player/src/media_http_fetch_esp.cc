@@ -31,7 +31,7 @@ bool HttpGetToString(const char* url, size_t max_bytes, const std::atomic<bool>&
     cfg.buffer_size = 2048;
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == nullptr) return false;
-    esp_http_client_set_header(client, "User-Agent", "MetalioClaw/1.0");
+    esp_http_client_set_header(client, "User-Agent", "Pinion/1.0");
 
     bool ok = false;
     do {

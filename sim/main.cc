@@ -1813,7 +1813,7 @@ int main() {
 #endif
 
     std::fprintf(stderr,
-                 "pi_sim — Metalio Claw pi_screen simulator (LVGL %d.%d SDL2)\n"
+                 "pi_sim — Pinion pi_screen simulator (LVGL %d.%d SDL2)\n"
                  "  F1 按住   = PWR_KEY 按住说话(按住录音/松开发送; 轻点无反应; 生成中点按打断)\n"
                  "  打字      = 聆听时说话(退格删字)\n"
                  "  F9        = 渲染 pi_card 演示卡(overlay)\n"
@@ -1825,7 +1825,7 @@ int main() {
     lv_tick_set_cb(TickCb);
 
     lv_display_t* disp = lv_sdl_window_create(720, 720);
-    lv_sdl_window_set_title(disp, "Metalio Claw — pi_screen sim");
+    lv_sdl_window_set_title(disp, "Pinion — pi_screen sim");
     lv_sdl_mouse_create();
     SDL_AddEventWatch(EventWatch, nullptr);
     SDL_StartTextInput();
@@ -1856,6 +1856,20 @@ int main() {
     lv_screen_load(pi);
     if (old_scr != nullptr && old_scr != pi) lv_obj_delete(old_scr);
     lv_unlock();
+
+    // PI_SIM_DUMP_PROMPT=<file>：把与固件完全一致的 system prompt + ui_render 工具描述 + schema
+    // dump 到文件后立即退出（离线核验模型能否遵守 schema 用；boot chain 已跑完，DataHub 路径
+    // 清单已注册齐）。
+    if (const char* dp = std::getenv("PI_SIM_DUMP_PROMPT")) {
+        FILE* f = std::fopen(dp, "w");
+        if (f) {
+            std::fprintf(f, "===SYSTEM_PROMPT===\n%s\n===RENDER_DESC===\n%s\n===RENDER_SCHEMA===\n%s\n",
+                         pi_card_system_prompt(), pi_card_render_desc(), PI_CARD_RENDER_SCHEMA);
+            std::fclose(f);
+            std::fprintf(stderr, "[sim] dumped prompt+schema to %s\n", dp);
+        }
+        return 0;
+    }
 
     // PI_SIM_ADMIN=1：起 SD 音乐 Web 后台（POSIX socket 薄壳，http://127.0.0.1:8080），
     // 在 macOS 浏览器里真实走通整个前端；文件落到 pi_sim_sd/。

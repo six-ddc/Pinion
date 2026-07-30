@@ -1,6 +1,6 @@
 # AI → UI：pi_card 声明式卡片系统设计文档
 
-> 本文是 Metalio Claw（ESP32-P4，720×720 触摸屏）固件中 "AI to UI" 子系统的完整设计说明：
+> 本文是 Pinion（ESP32-P4，720×720 触摸屏）固件中 "AI to UI" 子系统的完整设计说明：
 > LLM 通过工具调用（`ui_render` / `ui_update` / `ui_close`）用一份 JSON spec 在聊天流里渲染
 > **真实可交互的 LVGL 卡片**，卡片控件可双向绑定设备硬件数据（DataHub），并带一套零回程的
 > 本地动作引擎。代码位于 `main/display/screen/pi_screen/pi_card/`（UI 层）与

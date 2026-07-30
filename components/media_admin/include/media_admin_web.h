@@ -13,7 +13,7 @@ inline const char* Html() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Metalio Claw · 文件管理</title>
+<title>Pinion · 文件管理</title>
 <style>
   :root{
     --bg:#141210; --card:#1e1b17; --card2:#26221c; --line:#2f2a22;
@@ -79,7 +79,7 @@ inline const char* Html() {
 </style>
 </head>
 <body>
-  <h1>Metalio Claw <span class="mono" style="color:var(--faint);font-size:13px">/ 文件管理</span></h1>
+  <h1>Pinion <span class="mono" style="color:var(--faint);font-size:13px">/ 文件管理</span></h1>
   <p class="space mono" id="space">SD --</p>
 
   <div class="card">

@@ -598,14 +598,15 @@ TEST_CASE("F6: all-growable 行里 side:end 的 button 退回内容宽并锚右�
 
 // ===========================================================================
 // F3: role:"value" 非数值静态文本不再被强制授予数值特权（不截断+右对齐+mono）。
-// 回归对象：23_grid_auto.json 的 "Metalio Claw"（role=value 纯品牌名文本）。
+// 回归对象：23_grid_auto.json 的 "Pinion Terminal"（role=value 纯品牌名文本）。
+// 注意 text 必须长到能在下面 80px 视口里溢出文本列，否则 truncate 断言无从成立。
 // ===========================================================================
 TEST_CASE("F3: role:value 但文本非数值样式（品牌名）→ 按文本列处理，不强制右对齐不截断") {
     Layout lo;
     cJSON* intent = SolveJson(R"({"root":[
         {"cols":[{"title":"字段"},{"title":"值"}],
          "rows":[[{"type":"label","text":"固件"},
-                  {"type":"label","role":"value","text":"Metalio Claw"}]]}
+                  {"type":"label","role":"value","text":"Pinion Terminal"}]]}
     ]})",
                               80, lo);  // 极窄视口压缩 TEXT 列到内容宽以下，逼出截断判定
     const Grid& g = lo.grids[0];

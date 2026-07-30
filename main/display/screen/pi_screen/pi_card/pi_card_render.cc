@@ -1172,6 +1172,10 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
     lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
     ApplyFill(gobj, grid_json);
+    // fill/bg 底色 grid：solver 已按 viewport_w-2*inset 求解，这里补同宽 pad，行容器同步收窄。
+    const int inset = GetInt(layout_grid, "inset", 0);
+    const int inner_w = viewport_w - 2 * inset;
+    if (inset > 0) lv_obj_set_style_pad_all(gobj, inset, LV_PART_MAIN);
 
     const cJSON* cells_json = GetItem(grid_json, "cells");
     const cJSON* rows_json = GetItem(grid_json, "rows");
@@ -1202,7 +1206,7 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
         screen_strip_obj_chrome(rowobj);
         lv_obj_remove_flag(rowobj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(rowobj, &s_transp_bg, LV_PART_MAIN);
-        lv_obj_set_width(rowobj, viewport_w);
+        lv_obj_set_width(rowobj, inner_w);
         lv_obj_set_height(rowobj, LV_SIZE_CONTENT);
 
         const bool is_header_row = has_title && seq == 0;
@@ -1214,7 +1218,7 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
             continue;
         }
         if (is_divider_row) {
-            RenderColsDividerRow(rowobj, row_cells, viewport_w);
+            RenderColsDividerRow(rowobj, row_cells, inner_w);
             continue;
         }
 
@@ -1669,6 +1673,10 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
     lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
     ApplyFill(gobj, grid_json);
+    // 与正式 RenderGridBlock 同款 fill 内边距（solver 按收窄视口求解，这里补 pad）。
+    const int inset = layout_grid ? GetInt(layout_grid, "inset", 0) : 0;
+    const int inner_w = viewport_w - 2 * inset;
+    if (inset > 0) lv_obj_set_style_pad_all(gobj, inset, LV_PART_MAIN);
 
     if (!layout_grid) {
         cJSON_Delete(layout);
@@ -1706,7 +1714,7 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
         screen_strip_obj_chrome(rowobj);
         lv_obj_remove_flag(rowobj, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(rowobj, &s_transp_bg, LV_PART_MAIN);
-        lv_obj_set_width(rowobj, viewport_w);
+        lv_obj_set_width(rowobj, inner_w);
         lv_obj_set_height(rowobj, LV_SIZE_CONTENT);
 
         const bool is_header_row = has_title && seq == 0;
@@ -1718,7 +1726,7 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
             continue;
         }
         if (is_divider_row) {
-            RenderColsDividerRow(rowobj, row_cells, viewport_w);
+            RenderColsDividerRow(rowobj, row_cells, inner_w);
             continue;
         }
 
@@ -2314,6 +2322,16 @@ bool Repair(cJSON* envelope, std::string& err, std::vector<std::string>* notes) 
 
     if (cJSON_IsArray(root)) {
         int n = cJSON_GetArraySize(root);
+        // 宽进严出：>kMaxGrids 不再硬拒（弱模型拿到 pi-c/Validate 的干拒绝后往往越改越错、
+        // 连环重试），截到上限渲染 + note 告知——LLM 下一张自然学会拆卡。
+        if (n > kMaxGrids) {
+            for (int i = n - 1; i >= kMaxGrids; --i) cJSON_DeleteItemFromArray(root, i);
+            if (notes)
+                notes->push_back("root had " + std::to_string(n) + " grids; only the first " +
+                                 std::to_string(kMaxGrids) +
+                                 " were rendered — split into multiple cards");
+            n = kMaxGrids;
+        }
         for (int i = 0; i < n; ++i) {
             cJSON* grid = cJSON_GetArrayItem(root, i);
             cJSON* fixed = RepairGrid(grid, notes);

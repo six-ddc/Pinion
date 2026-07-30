@@ -867,7 +867,8 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     // 已整删，§3 决策 A）当场拒绝、不再往下跑 Validate。args 是本次调用独占的解析树，就地
     // 改写安全。
     std::string rerr;
-    if (!Repair(const_cast<cJSON*>(args), rerr, nullptr)) {
+    std::vector<std::string> repair_notes;  // 修复动作（如 >8 grids 截断）随 hints 回给 LLM
+    if (!Repair(const_cast<cJSON*>(args), rerr, &repair_notes)) {
         return reject("repair", rerr);
     }
     const cJSON* root = cJSON_GetObjectItem(args, "root");
@@ -917,9 +918,11 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         return reject("queue-full", "UI busy (event queue full), retry shortly");
     }
     // state 在入队之后才读：让快照尽量贴近真正建控件的时刻。
-    // hints：非阻断设计建议（Validate 已通过），为空则不带该键。
+    // hints：非阻断设计建议（Validate 已通过），为空则不带该键。Repair 的修复动作排最前
+    // ——它们描述的是「你给的和实际渲染的不一样」，比 Lint 的风格建议优先级高。
     std::string hints_json;
     std::vector<std::string> hints = Lint(root, data);
+    hints.insert(hints.begin(), repair_notes.begin(), repair_notes.end());
     if (!hints.empty()) {
         cJSON* arr = cJSON_CreateArray();
         for (const std::string& h : hints) cJSON_AddItemToArray(arr, cJSON_CreateString(h.c_str()));
