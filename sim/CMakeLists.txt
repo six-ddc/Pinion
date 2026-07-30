@@ -20,7 +20,12 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 get_filename_component(CLAW_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/.. ABSOLUTE)
-get_filename_component(PI_C_DIR ${CLAW_ROOT}/../../six-ddc/pi-c ABSOLUTE)
+# pi-c ships as a PREBUILT static library (private upstream, not vendored). The
+# host archives + headers live under components/pi_c_prebuilt, mirroring the pi-c
+# source subtree layout so every ${PI_C_DIR}/include, /port/posix and
+# /third_party/cJSON reference below resolves unchanged. Regenerate the archives
+# with components/pi_c_prebuilt/pack_pi_c.sh after any pi-c change.
+get_filename_component(PI_C_DIR ${CLAW_ROOT}/components/pi_c_prebuilt ABSOLUTE)
 
 if(NOT EXISTS ${CLAW_ROOT}/main/display/screen/pi_screen/pi_models_data.h)
     message(FATAL_ERROR "pi_models_data.h missing (gitignored secret) — required for the real-API build")
@@ -39,10 +44,36 @@ add_subdirectory(${CLAW_ROOT}/managed_components/lvgl__lvgl lvgl EXCLUDE_FROM_AL
 find_package(SDL2 REQUIRED)
 target_link_libraries(lvgl PUBLIC SDL2::SDL2)
 
-# ---- pi-c host libs (dual-mode CMake: non-ESP path) ----
-set(PI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(PI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(${PI_C_DIR} pi_c EXCLUDE_FROM_ALL)
+# ---- pi-c host libs: PREBUILT static archives (was add_subdirectory of source) ----
+# Expose IMPORTED targets named `pi` and `pi_posix` so the rest of this file is
+# unchanged. The archives are produced by pack_pi_c.sh; on any pi-c change rerun
+# it to refresh components/pi_c_prebuilt/lib/host-arm64/*.a.
+set(PI_C_LIBDIR ${PI_C_DIR}/lib/host-arm64)
+if(NOT EXISTS ${PI_C_LIBDIR}/libpi.a)
+    message(FATAL_ERROR "prebuilt ${PI_C_LIBDIR}/libpi.a missing — run components/pi_c_prebuilt/pack_pi_c.sh")
+endif()
+find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(pi STATIC IMPORTED)
+set_target_properties(pi PROPERTIES
+    IMPORTED_LOCATION ${PI_C_LIBDIR}/libpi.a
+    INTERFACE_INCLUDE_DIRECTORIES "${PI_C_DIR}/include;${PI_C_DIR}/third_party/cJSON")
+# libpi.a is built with pi-c's host defaults (all B-tier features ON). Re-declare
+# them so caller TUs (pi_agent_task.c, pi_card_*) expand the pi-c headers exactly
+# as the archive was compiled — a mismatch is silent struct-layout UB.
+target_compile_definitions(pi INTERFACE
+    PI_FEATURE_IMAGES=1 PI_FEATURE_SESSION=1 PI_FEATURE_PARTIAL_JSON=1
+    PI_FEATURE_MODELS_JSON=1 PI_FEATURE_COMPAT=1 PI_FEATURE_PARALLEL_TOOLS=1
+    PI_FEATURE_COMPACTION=1 PI_FEATURE_SKILLS_IGNORE=1 PI_FEATURE_HARNESS_TOOLS=1
+    PI_FEATURE_HARNESS_EXEC=1 PI_FEATURE_SUBAGENT=1 PI_FEATURE_OAUTH=1)
+
+add_library(pi_posix STATIC IMPORTED)
+set_target_properties(pi_posix PROPERTIES
+    IMPORTED_LOCATION ${PI_C_LIBDIR}/libpi_posix.a
+    INTERFACE_INCLUDE_DIRECTORIES "${PI_C_DIR}/port/posix")
+# libpi_posix.a's transport_curl.c pulls libcurl; pi provides the core symbols.
+target_link_libraries(pi_posix INTERFACE pi Threads::Threads CURL::libcurl)
 
 # ---- the simulator ----
 add_executable(pi_sim
@@ -135,7 +166,9 @@ target_include_directories(pi_sim PRIVATE
     ${CLAW_ROOT}/components/media_player/src     # minimp3.h / media_resampler.h / media_internal.h（私有）
 )
 
-target_link_libraries(pi_sim PRIVATE lvgl pi pi_posix SDL2::SDL2 iconv "-framework AudioToolbox" "-framework CoreFoundation")
+# pi_posix INTERFACE-links pi (correct static-lib order), so listing pi again
+# here would make ld warn about a duplicate archive — link pi_posix only.
+target_link_libraries(pi_sim PRIVATE lvgl pi_posix SDL2::SDL2 iconv "-framework AudioToolbox" "-framework CoreFoundation")
 
 # Offline deterministic replay of the two-turn mock script (pi_scr_mock.h)
 # instead of the real API -- markdown-rendering fixture included. Usage:

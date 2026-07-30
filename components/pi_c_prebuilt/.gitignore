@@ -1,0 +1,7 @@
+# The P4 library build project is a throwaway ESP-IDF build; only its output
+# archive (../../lib/esp32p4/libpi-c.a) is vendored. Ignore all build state.
+tools/pic_p4_build/build/
+tools/pic_p4_build/sdkconfig
+tools/pic_p4_build/sdkconfig.old
+tools/pic_p4_build/managed_components/
+tools/pic_p4_build/dependencies.lock

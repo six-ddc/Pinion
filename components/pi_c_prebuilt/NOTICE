@@ -1,0 +1,44 @@
+pi-c — attribution notice
+
+Semantics, architecture and algorithms are a C translation of "pi"
+(https://github.com/earendil-works/pi, MIT License, Copyright (c) 2025
+Mario Zechner), pinned at upstream commit
+5bc1c2c0a6f07e00e8c240304182f213ab8d311f (2026-07-25) — specifically the
+@earendil-works/pi-ai and @earendil-works/pi-agent-core packages: the unified
+message/tool/model types, assistant-message and agent event models, the SSE
+parsing approach (anthropic-messages.ts), the agent loop control flow
+(agent-loop.ts), the SKILL.md progressive-disclosure format (harness/skills.ts)
+and the harness tool set (harness/tools/{read,write,edit,bash}.ts) with its
+ExecutionEnv contract (harness/env/nodejs.ts).
+
+Selected implementation techniques were cross-referenced against "ESP-Claw"
+(https://github.com/espressif/esp-claw, Apache License 2.0, Copyright
+Espressif Systems): growable response buffering and abort-flag placement
+(claw_llm_http_transport.c), provider vtable registration (claw_llm_runtime.h),
+Anthropic message-conversion edge cases (claw_llm_backend_anthropic.c),
+dual-source skill directories (claw_skill) and the PSRAM-first allocation
+strategy. No source files were copied verbatim.
+
+The in-process subagent module (include/pi/pi_subagent.h, src/agent/
+pi_subagent.c) is original pi-c code with no upstream-pi counterpart; its
+tool-surface lifecycle protocol (spawn_agent / send_input / wait_agent /
+close_agent semantics, previous-status reporting, depth/concurrency wording)
+was cross-referenced against the multi-agent subsystem of "Codex CLI"
+(https://github.com/openai/codex, Apache License 2.0, Copyright OpenAI).
+No source files were copied verbatim.
+
+Bundled third-party code:
+  third_party/cJSON — cJSON v1.7.19 (MIT License, Copyright (c) 2009-2017
+  Dave Gamble and cJSON contributors). Vendored verbatim: no source file is
+  patched. The build defines ENABLE_LOCALES for it, which is a compile-time
+  option cJSON itself provides.
+
+  examples/host_coder/linenoise.{c,h} — linenoise (BSD-2-Clause, Copyright
+  (c) 2010-2023 Salvatore Sanfilippo, Copyright (c) 2010-2013 Pieter
+  Noordhuis), vendored at upstream commit a473823 (2026-05-01). Two deliberate
+  patches (marked "pi-c patch" in linenoise.c): enable/disableRawMode use
+  TCSADRAIN instead of TCSAFLUSH, so type-ahead queued across the REPL's
+  per-command editor stop/restart is not silently discarded; and raw mode
+  keeps OPOST set, so the agent thread's streamed "\n" output renders
+  correctly while the editor is active. Used only by the host_coder example;
+  not part of the pi-c library.

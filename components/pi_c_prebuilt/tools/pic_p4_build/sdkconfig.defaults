@@ -1,0 +1,9 @@
+# Target + pi-c feature set for the standalone P4 library build. These MUST
+# match the feature macros the firmware's sdkconfig enables, so the vendored
+# libpi-c.a is ABI-compatible with the headers the firmware compiles against.
+# (Firmware sdkconfig: PARTIAL_JSON + MODELS_JSON + COMPAT on; the rest off.)
+CONFIG_IDF_TARGET="esp32p4"
+
+CONFIG_PI_FEATURE_PARTIAL_JSON=y
+CONFIG_PI_FEATURE_MODELS_JSON=y
+CONFIG_PI_FEATURE_COMPAT=y

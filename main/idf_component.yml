@@ -1,10 +1,9 @@
 ## IDF Component Manager Manifest File
 ## main 只剩 pi UI；硬件依赖全部由 components/metalio_hal 自己声明。
 dependencies:
-  # pi-c: local path dependency（兄弟仓库布局：Code/esp32/MetalioClaw6 ↔
-  # Code/six-ddc/pi-c，勿破坏相对路径）。
-  pi-c:
-    path: ../../../six-ddc/pi-c
+  # pi-c: 以预编译静态库形式随本仓交付，见 components/pi_c_prebuilt/（私有上游，
+  # 不 vendor 源码）。它是 components/ 下的本地组件，main 自动 REQUIRES 所有组件，
+  # 故此处无需声明——删掉了原先的 ../../../six-ddc/pi-c 兄弟目录 path 依赖。
   # pi_screen 直接引用 LVGL 与 font_puhui_20_4/30_4
   lvgl/lvgl: ~9.3.0
   78/xiaozhi-fonts: ~1.5.5

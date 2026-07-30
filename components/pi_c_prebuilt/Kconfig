@@ -1,0 +1,40 @@
+menu "pi-c agent library"
+
+config PI_FEATURE_IMAGES
+    bool "Image / redacted-thinking block passthrough"
+    default n
+config PI_FEATURE_SESSION
+    bool "Session persistence (jsonl via pi_fs)"
+    default n
+config PI_FEATURE_PARTIAL_JSON
+    bool "Incremental (partial) tool-argument JSON parsing"
+    default n
+config PI_FEATURE_MODELS_JSON
+    bool "models.json catalog loader"
+    default n
+config PI_FEATURE_COMPAT
+    bool "Provider compat detection + request shaping"
+    default n
+config PI_FEATURE_PARALLEL_TOOLS
+    bool "Parallel (concurrent) tool-call batch execution"
+    default n
+config PI_FEATURE_COMPACTION
+    bool "Context summarization / compaction"
+    depends on PI_FEATURE_SESSION
+    default n
+config PI_FEATURE_SKILLS_IGNORE
+    bool "Skill scanning honours .gitignore/.ignore/.fdignore"
+    default n
+config PI_FEATURE_SUBAGENT
+    bool "In-process multi-threaded subagent pool + LLM tools"
+    # default n deliberately: every live child costs a >=32 KiB worker stack plus
+    # its own transcript heap; enable per-project after budgeting RAM
+    default n
+config PI_FEATURE_OAUTH
+    bool "Anthropic subscription OAuth (PKCE + Claude Code wire identity)"
+    # default n deliberately: a device normally ships a static key in NVS. The login
+    # flow is interactive (browser + paste) and lives in the host example, so on-target
+    # this only buys the wire identity plus a refresh call the app must drive itself.
+    default n
+
+endmenu
