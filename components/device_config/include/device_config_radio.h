@@ -1,30 +1,31 @@
-// radio_stations.h — 内置网络电台表（全 HLS/m3u8，AAC-LC 192–258kbps）。
+// device_config_radio.h — 内置网络电台默认种子（**出厂预置 / 网页示例 / NVS 为空时回落**）。
 //
-// 每台 = 名称 + 分组 + m3u8 URL（media_pump 按 .m3u8 后缀路由到 HLS 源 + AAC 解码，
-// 见 media_hls.h；master→variant 一跳与防盗链 token 均已支持）。三个网关：
+// 全 HLS/m3u8，AAC-LC 192–258kbps。每台 = 名称 + 分组 + m3u8 URL（media_pump 按 .m3u8
+// 后缀路由到 HLS 源 + AAC 解码；非 .m3u8 的 http(s) 流按 MP3 直播处理）。三个网关：
 //   - ngcdn0xx.cnr.cn      央广直连（单层 media playlist，10s 分片，192k）
 //   - sk.cri.cn            国广 CRI（258k）
 //   - satellitepull.cnr.cn 省市台卫星拉流（master+token 会话，3s 分片，194k）
-// 旧蜻蜓 lhttp 64kbps MP3 表已整体废弃（源质量太差，编码毛刺固有）。
 // 表内每一台都经实测通过（playlist→分片→ffprobe AAC 核验，2026-07-22）。
-// header-only constexpr 表，device/sim 同源，无 .cc、无链接项。
 //
-// 用途：media 工具 mode:"radio" 列表 / mode:"play" 起播；station 的稳定标识是它在
-// 本表中的下标（kRadioStations 的 index），play 用 station_indices 引用它。
+// 电台列表现由 Web 后台配置（NVS namespace "cfg" / key "radio_json"，见 device_config.cc）：
+// 有合法覆盖用覆盖，否则回落这份种子。种子只是"默认值 + 网页恢复默认的来源 + 示例"，
+// 运行时真正生效的列表由 device_config::RadioStations() 给出。此表 constexpr、无 .cc。
+
 #pragma once
 
 #include <cstddef>
 
-namespace media {
+namespace device_config {
 
-struct RadioStation {
-    const char* name;   // 电台名（展示 + 模糊匹配）
-    const char* genre;  // 分组：新闻 / 交通 / 音乐 / 综合
-    const char* url;    // HLS m3u8 URL
+// 编译期种子条目（const char*，指向字面量）；运行时列表用 RadioStation（std::string）。
+struct RadioSeed {
+    const char* name;
+    const char* genre;
+    const char* url;
 };
 
 // 32 台，覆盖 央广·CRI/主要省市 的 新闻·交通·音乐·综合。全部实测通过。
-inline constexpr RadioStation kRadioStations[] = {
+inline constexpr RadioSeed kRadioDefaults[] = {
     // —— 新闻 ——
     {"中国之声", "新闻", "https://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
     {"经济之声", "新闻", "https://ngcdn002.cnr.cn/live/jjzs/index.m3u8"},
@@ -63,6 +64,6 @@ inline constexpr RadioStation kRadioStations[] = {
     {"珠江经济台", "综合", "https://satellitepull.cnr.cn/live/wxgdzjjjt/playlist.m3u8"},
 };
 
-inline constexpr size_t kRadioStationCount = sizeof(kRadioStations) / sizeof(kRadioStations[0]);
+inline constexpr size_t kRadioDefaultCount = sizeof(kRadioDefaults) / sizeof(kRadioDefaults[0]);
 
-}  // namespace media
+}  // namespace device_config

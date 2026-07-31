@@ -12,9 +12,9 @@
 
 #include "esp_log.h"
 
+#include "device_config.h"  // 运行时网络电台列表（Web 后台可配，NVS 覆盖 or 内置种子）
 #include "media_player/media_id3.h"
 #include "media_player/media_player.h"
-#include "media_player/radio_stations.h"
 #include "metalio_hal/storage.h"
 
 #include "pi_card_cmd.h"
@@ -185,13 +185,14 @@ char* RunRadio(const cJSON* args, bool* is_error) {
     cJSON_AddBoolToObject(out, "ok", true);
     cJSON_AddStringToObject(out, "kind", "radio");
     cJSON* stations = cJSON_AddArrayToObject(out, "stations");
-    for (size_t i = 0; i < media::kRadioStationCount; i++) {
-        const media::RadioStation& s = media::kRadioStations[i];
+    const std::vector<device_config::RadioStation>& list = device_config::RadioStations();
+    for (size_t i = 0; i < list.size(); i++) {
+        const device_config::RadioStation& s = list[i];
         if (query != nullptr && !CaseInStr(s.name, query) && !CaseInStr(s.genre, query)) continue;
         cJSON* o = cJSON_CreateObject();
         cJSON_AddNumberToObject(o, "index", static_cast<double>(i));
-        cJSON_AddStringToObject(o, "name", s.name);
-        cJSON_AddStringToObject(o, "genre", s.genre);
+        cJSON_AddStringToObject(o, "name", s.name.c_str());
+        cJSON_AddStringToObject(o, "genre", s.genre.c_str());
         cJSON_AddItemToArray(stations, o);
     }
     cJSON_AddStringToObject(out, "hint",
@@ -244,8 +245,9 @@ char* RunPlay(const cJSON* args, bool* is_error) {
     const cJSON* jpaths = cJSON_GetObjectItemCaseSensitive(args, "paths");
 
     if (cJSON_IsArray(jstations) && cJSON_GetArraySize(jstations) > 0) {
-        auto station_item = [](int i) {
-            const media::RadioStation& s = media::kRadioStations[i];
+        const std::vector<device_config::RadioStation>& list = device_config::RadioStations();
+        auto station_item = [&list](int i) {
+            const device_config::RadioStation& s = list[i];
             MediaItem m;
             m.title = s.name;
             m.subtitle = s.genre;
@@ -260,7 +262,7 @@ char* RunPlay(const cJSON* args, bool* is_error) {
             if (idxs.size() >= kMaxPlaylist) break;
             if (!cJSON_IsNumber(el)) continue;
             int i = static_cast<int>(el->valuedouble);
-            if (i < 0 || i >= static_cast<int>(media::kRadioStationCount)) continue;
+            if (i < 0 || i >= static_cast<int>(list.size())) continue;
             idxs.push_back(i);
         }
         if (idxs.empty()) return Fail(is_error, "no valid station_indices (0-based into the radio list)");
@@ -268,7 +270,7 @@ char* RunPlay(const cJSON* args, bool* is_error) {
         // 单台兜底：只点一个台时把播放列表扩成全部电台（自然序）、从所点台起播——
         // 保证 Next/Prev 永远有台可切（收音机换台语义），不受模型是否传多台影响。
         if (idxs.size() == 1) {
-            for (size_t i = 0; i < media::kRadioStationCount && items.size() < kMaxPlaylist; i++) {
+            for (size_t i = 0; i < list.size() && items.size() < kMaxPlaylist; i++) {
                 items.push_back(station_item(static_cast<int>(i)));
             }
             return BuildPlayResult(is_error, items, idxs[0], "radio");

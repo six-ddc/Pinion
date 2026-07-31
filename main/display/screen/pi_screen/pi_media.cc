@@ -26,7 +26,6 @@
 #include "esp_log.h"
 #include "media_player/media_id3.h"
 #include "media_player/media_player.h"
-#include "media_player/radio_stations.h"  // 电台续播：station index -> 名称/URL
 #include "metalio_hal/audio.h"         // Now-Playing 页音量条
 #include "metalio_hal/network.h"       // 电台续播的联网判定
 #include "pi_card_icons.h"
@@ -439,14 +438,6 @@ void ApplyId3(std::string& title, std::string& sub, const std::string& path) {
     else if (!t.artist.empty())
         sub = t.artist;
 }
-// url -> kRadioStations 下标；找不到返回 -1。
-int StationIndexOfUrl(const std::string& url) {
-    for (size_t i = 0; i < media::kRadioStationCount; i++) {
-        if (url == media::kRadioStations[i].url) return static_cast<int>(i);
-    }
-    return -1;
-}
-
 // 序列化当前 MediaController 播放态为 JSON；空列表返回 ""。
 std::string BuildLastJson() {
     media::MediaController& mc = media::MediaController::Instance();
@@ -461,13 +452,44 @@ std::string BuildLastJson() {
     if (root == nullptr) return {};
 
     if (cur.is_stream) {
+        // 电台：存 name/genre/url 快照，不再存全局 index——电台列表现由 Web 后台运行时
+        // 可配（device_config），index 会漂/越界；URL 快照让续播完全脱离当前电台表（改表
+        // 删台也能恢复原播的台）。以当前台为中心按字节预算对称扩窗（同 file 路径）。
+        std::vector<media::MediaItem> its;
+        its.reserve(n);
+        for (int i = 0; i < n; i++) its.push_back(mc.item_at(i));
+        auto cost = [](const media::MediaItem& m) {
+            return m.path_or_url.size() + m.title.size() + m.subtitle.size() + 32;  // + JSON 键名/引号
+        };
+        int lo = idx, hi = idx;
+        size_t used = cost(its[idx]);
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            if (hi + 1 < n && (hi - lo + 1) < kMaxTracks && used + cost(its[hi + 1]) <= kPathBudget) {
+                used += cost(its[++hi]);
+                grew = true;
+            }
+            if (lo - 1 >= 0 && (hi - lo + 1) < kMaxTracks && used + cost(its[lo - 1]) <= kPathBudget) {
+                used += cost(its[--lo]);
+                grew = true;
+            }
+        }
+        if (lo > 0 || hi < n - 1) {
+            ESP_LOGW(TAG, "media last: radio windowed [%d,%d]/%d (dropped head=%d tail=%d)", lo, hi, n,
+                     lo, n - 1 - hi);
+        }
         cJSON_AddStringToObject(root, "type", "radio");
-        cJSON_AddNumberToObject(root, "index", idx);
-        cJSON_AddNumberToObject(root, "pos_s", 0);  // 直播无位置
+        cJSON_AddNumberToObject(root, "index", idx - lo);  // 窗内相对下标
+        cJSON_AddNumberToObject(root, "pos_s", 0);         // 直播无位置
         cJSON* arr = cJSON_AddArrayToObject(root, "stations");
-        for (int i = 0; i < n; i++) {
-            int sidx = StationIndexOfUrl(mc.item_at(i).path_or_url);
-            if (sidx >= 0) cJSON_AddItemToArray(arr, cJSON_CreateNumber(sidx));
+        for (int i = lo; i <= hi; i++) {
+            cJSON* o = cJSON_CreateObject();
+            if (o == nullptr) continue;
+            cJSON_AddStringToObject(o, "name", its[i].title.c_str());
+            cJSON_AddStringToObject(o, "genre", its[i].subtitle.c_str());
+            cJSON_AddStringToObject(o, "url", its[i].path_or_url.c_str());
+            cJSON_AddItemToArray(arr, o);
         }
     } else {
         std::vector<std::string> paths;
@@ -1647,19 +1669,22 @@ ResumeResult ResumeLast() {
             cJSON_Delete(root);
             return ResumeResult::NoNetwork;
         }
+        // 快照记录：每台 {name,genre,url}。旧格式存的是数字 index（!IsObject）→ 全部跳过
+        // → items 空 → 返回 NoRecord（优雅失效，不崩）。
         cJSON* arr = cJSON_GetObjectItem(root, "stations");
         int cnt = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
         std::vector<media::MediaItem> items;
         for (int i = 0; i < cnt; i++) {
             cJSON* e = cJSON_GetArrayItem(arr, i);
-            if (!cJSON_IsNumber(e)) continue;
-            int sidx = e->valueint;
-            if (sidx < 0 || sidx >= static_cast<int>(media::kRadioStationCount)) continue;
-            const media::RadioStation& rs = media::kRadioStations[sidx];
+            if (!cJSON_IsObject(e)) continue;
+            cJSON* ju = cJSON_GetObjectItem(e, "url");
+            if (!cJSON_IsString(ju) || ju->valuestring == nullptr || ju->valuestring[0] == '\0') continue;
+            cJSON* jn = cJSON_GetObjectItem(e, "name");
+            cJSON* jg = cJSON_GetObjectItem(e, "genre");
             media::MediaItem m;
-            m.title = rs.name;
-            m.subtitle = rs.genre;
-            m.path_or_url = rs.url;
+            m.title = (cJSON_IsString(jn) && jn->valuestring != nullptr) ? jn->valuestring : "电台";
+            m.subtitle = (cJSON_IsString(jg) && jg->valuestring != nullptr) ? jg->valuestring : "";
+            m.path_or_url = ju->valuestring;
             m.is_stream = true;
             m.duration_s = 0;
             items.push_back(m);

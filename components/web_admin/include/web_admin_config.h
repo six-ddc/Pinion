@@ -14,9 +14,9 @@
 
 namespace web_admin::config {
 
-// POST /api/config 的 body 上限。llm_json 入库上限 3500B，urlencoded 最坏膨胀约
-// 3 倍（每字节 %XX），再留余量。
-inline constexpr size_t kMaxFormBytes = 16384;
+// POST /api/config 的 body 上限。llm_json(3500B) + radio_json(3960B) 可能同批提交，
+// urlencoded 最坏膨胀约 3 倍（每字节 %XX），再留余量。
+inline constexpr size_t kMaxFormBytes = 32768;
 
 // GET /api/config 的 body：配置状态 + 密钥掩码，**不含明文密钥**。
 std::string StatusJson();

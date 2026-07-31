@@ -7,11 +7,13 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "cJSON.h"
 #include "esp_log.h"
 
 #include "device_config_models.h"
+#include "device_config_radio.h"
 #include "settings.h"
 
 #define TAG "device_config"
@@ -29,6 +31,7 @@ const char* KeyOf(Field f) {
         case Field::LlmModelsJson: return "llm_json";
         case Field::VoiceAppKey: return "volc_app";
         case Field::VoiceAccessKey: return "volc_ak";
+        case Field::RadioList: return "radio_json";
     }
     return "";
 }
@@ -127,6 +130,106 @@ bool CheckModelsJson(const std::string& v, std::string* normalized) {
     return true;
 }
 
+// ---- 网络电台列表（JSON 数组，覆盖内置种子）--------------------------------
+// 单字段体积上限，防单台把预算吃光；控制字符一律拒（会被原样拼进 HTTP 请求头）。
+constexpr size_t kMaxRadioName = 64;
+constexpr size_t kMaxRadioGenre = 32;
+constexpr size_t kMaxRadioUrl = 512;
+
+bool IsRadioUrl(const std::string& v) {
+    if (v.empty() || v.size() > kMaxRadioUrl || !IsCleanSecret(v)) return false;
+    return v.rfind("http://", 0) == 0 || v.rfind("https://", 0) == 0;
+}
+
+const char* RadioStr(const cJSON* obj, const char* key) {
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return (cJSON_IsString(it) && it->valuestring != nullptr) ? it->valuestring : "";
+}
+
+// 解析一份电台 JSON 数组 → out。strict=true：任一条目非法即整体失败（保存路径）；
+// strict=false：跳过坏条目、保留合法项（加载路径，覆盖串已在保存时校验过）。
+bool ParseRadioArray(const std::string& json, std::vector<RadioStation>* out, bool strict) {
+    cJSON* root = cJSON_Parse(json.c_str());
+    if (root == nullptr || !cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+    bool ok = true;
+    const cJSON* el = nullptr;
+    cJSON_ArrayForEach(el, root) {
+        std::string name = RadioStr(el, "name");
+        std::string genre = RadioStr(el, "genre");
+        std::string url = RadioStr(el, "url");
+        bool valid = cJSON_IsObject(el) && !name.empty() && IsCleanSecret(name) &&
+                     name.size() <= kMaxRadioName && genre.size() <= kMaxRadioGenre &&
+                     IsCleanSecret(genre) && IsRadioUrl(url);
+        if (!valid) {
+            if (strict) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        out->push_back({std::move(name), std::move(genre), std::move(url)});
+    }
+    cJSON_Delete(root);
+    return ok && !out->empty();
+}
+
+// 规范化：只保留 name/genre/url 三键、固定次序、minify 单行——保证"内容相同 → 字节相同"
+// （网页端字段次序无关），既规避 sim settings shim 的换行截断，也让"覆盖==默认"可比。
+std::string BuildRadioJson(const std::vector<RadioStation>& list) {
+    cJSON* arr = cJSON_CreateArray();
+    if (arr == nullptr) return "";
+    for (const RadioStation& s : list) {
+        cJSON* o = cJSON_CreateObject();
+        if (o == nullptr) break;
+        cJSON_AddStringToObject(o, "name", s.name.c_str());
+        cJSON_AddStringToObject(o, "genre", s.genre.c_str());
+        cJSON_AddStringToObject(o, "url", s.url.c_str());
+        cJSON_AddItemToArray(arr, o);
+    }
+    std::string out;
+    char* min = cJSON_PrintUnformatted(arr);
+    if (min != nullptr) {
+        out.assign(min);
+        cJSON_free(min);
+    }
+    cJSON_Delete(arr);
+    return out;
+}
+
+// 校验产物（规范化单行串）会被 Set 复用；同 CheckModelsJson 的套路。
+bool CheckRadioJson(const std::string& v, std::string* normalized) {
+    if (v.size() > kMaxRadioJsonBytes * 3) return false;  // 早退
+    std::vector<RadioStation> list;
+    if (!ParseRadioArray(v, &list, /*strict=*/true)) return false;
+    std::string norm = BuildRadioJson(list);
+    if (norm.empty() || norm.size() > kMaxRadioJsonBytes) return false;
+    if (normalized != nullptr) *normalized = norm;
+    return true;
+}
+
+std::vector<RadioStation> DefaultStations() {
+    std::vector<RadioStation> out;
+    out.reserve(kRadioDefaultCount);
+    for (size_t i = 0; i < kRadioDefaultCount; i++) {
+        out.push_back({kRadioDefaults[i].name, kRadioDefaults[i].genre, kRadioDefaults[i].url});
+    }
+    return out;
+}
+
+// 生效列表（未缓存）：覆盖串能解析出 ≥1 台就用它，否则回落种子。
+std::vector<RadioStation> LoadEffectiveRadio() {
+    std::string override_json = GetRaw(Field::RadioList);
+    if (!override_json.empty()) {
+        std::vector<RadioStation> list;
+        if (ParseRadioArray(override_json, &list, /*strict=*/false)) return list;
+        ESP_LOGW(TAG, "stored radio json is corrupt, falling back to defaults");
+    }
+    return DefaultStations();
+}
+
 }  // namespace
 
 const char* FieldName(Field f) { return KeyOf(f); }
@@ -143,6 +246,7 @@ bool Validate(Field f, const std::string& v) {
             if (!IsCleanSecret(v) || v.size() > kMaxBaseUrlBytes) return false;
             return v.rfind("http://", 0) == 0 || v.rfind("https://", 0) == 0;
         case Field::LlmModelsJson: return CheckModelsJson(v, nullptr);
+        case Field::RadioList: return CheckRadioJson(v, nullptr);
     }
     return false;
 }
@@ -158,10 +262,25 @@ bool Set(Field f, const std::string& v) {
         Put(f, norm);  // 入库存规范化后的单行串
         return true;
     }
+    if (f == Field::RadioList) {
+        std::string norm;
+        if (!CheckRadioJson(v, &norm)) return false;
+        // 覆盖==默认：不入库，回落种子——网页「恢复默认」保存后 is_custom 干净归零。
+        Put(f, norm == DefaultRadioJson() ? std::string() : norm);
+        return true;
+    }
     if (!Validate(f, v)) return false;
     Put(f, v);
     return true;
 }
+
+const std::vector<RadioStation>& RadioStations() {
+    // magic static：开机首次调用解析并缓存，运行期不可变（Web 后台保存即重启后重载）。
+    static const std::vector<RadioStation> cache = LoadEffectiveRadio();
+    return cache;
+}
+
+std::string DefaultRadioJson() { return BuildRadioJson(DefaultStations()); }
 
 std::string GetVoiceAppKey() { return GetRaw(Field::VoiceAppKey); }
 std::string GetVoiceAccessKey() { return GetRaw(Field::VoiceAccessKey); }
@@ -210,6 +329,27 @@ std::string StatusJson() {
     cJSON_AddBoolToObject(voice, "configured", VoiceReady());
     cJSON_AddStringToObject(voice, "app_mask", MaskSecret(app).c_str());
     cJSON_AddStringToObject(voice, "ak_mask", MaskSecret(ak).c_str());
+
+    // 电台：当前生效列表（覆盖 or 默认，供编辑器载入）+ 默认种子（供「恢复默认」）。
+    const std::string rjson = GetRaw(Field::RadioList);
+    const std::vector<RadioStation> eff = LoadEffectiveRadio();
+    cJSON* radio = cJSON_AddObjectToObject(root, "radio");
+    cJSON_AddBoolToObject(radio, "is_custom", !rjson.empty());
+    cJSON_AddNumberToObject(radio, "count", static_cast<double>(eff.size()));
+    cJSON_AddNumberToObject(radio, "bytes", static_cast<double>(rjson.size()));
+    cJSON_AddNumberToObject(radio, "max_bytes", static_cast<double>(kMaxRadioJsonBytes));
+    auto add_stations = [](cJSON* parent, const char* key, const std::vector<RadioStation>& list) {
+        cJSON* arr = cJSON_AddArrayToObject(parent, key);
+        for (const RadioStation& s : list) {
+            cJSON* o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "name", s.name.c_str());
+            cJSON_AddStringToObject(o, "genre", s.genre.c_str());
+            cJSON_AddStringToObject(o, "url", s.url.c_str());
+            cJSON_AddItemToArray(arr, o);
+        }
+    };
+    add_stations(radio, "stations", eff);
+    add_stations(radio, "defaults", DefaultStations());
 
     cJSON* limits = cJSON_AddObjectToObject(root, "limits");
     cJSON_AddNumberToObject(limits, "key_max", static_cast<double>(kMaxKeyBytes));

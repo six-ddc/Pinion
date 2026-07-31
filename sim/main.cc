@@ -40,8 +40,8 @@
 #include "IOExpander.hpp"
 #include "settings.h"  // P1 grid rehydrate 测试：直写 standby pin 封套
 #include "pi_theme.h"  // T1 主题往返测试：pi_theme::Set
+#include "device_config.h"  // mediastage 测试命令：运行时电台列表（Web 后台可配 or 种子）
 #include "media_player/media_player.h"
-#include "media_player/radio_stations.h"  // mediastage 测试命令：不起播灌电台列表
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
@@ -1400,12 +1400,13 @@ void ExecCmd(const std::string& line) {
                                        // 供 tracks 兜底注入（MaybeFillTracks）验收用
         int n = 0;
         ss >> n;
+        const std::vector<device_config::RadioStation>& stations = device_config::RadioStations();
         std::vector<media::MediaItem> items;
-        for (int i = 0; i < n && i < static_cast<int>(media::kRadioStationCount); i++) {
+        for (int i = 0; i < n && i < static_cast<int>(stations.size()); i++) {
             media::MediaItem m;
-            m.title = media::kRadioStations[i].name;
-            m.subtitle = media::kRadioStations[i].genre;
-            m.path_or_url = media::kRadioStations[i].url;
+            m.title = stations[i].name;
+            m.subtitle = stations[i].genre;
+            m.path_or_url = stations[i].url;
             m.is_stream = true;
             items.push_back(std::move(m));
         }

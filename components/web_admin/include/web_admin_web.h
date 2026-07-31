@@ -105,6 +105,15 @@ inline const char* Html() {
   .clr.on{color:var(--amber);text-decoration:underline}
   details{margin-bottom:14px} details>summary{cursor:pointer;font-size:13px;color:var(--amber)}
   .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+  /* 电台编辑行 */
+  .rrow{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px;background:var(--card2)}
+  .rrow .r1{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+  .rrow input{background:var(--bg);color:var(--tx);border:1px solid var(--line);border-radius:6px;
+       padding:7px 8px;font-size:13px;width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .rrow input:focus{outline:0;border-color:var(--amber)}
+  .rrow .rname{flex:1;min-width:0}
+  .rrow .rgenre{width:84px;flex:none}
+  .rrow .rdel{color:var(--red);background:none;border:0;font-size:12px;cursor:pointer;padding:4px 4px;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -155,6 +164,18 @@ inline const char* Html() {
         <input id="volcAk" type="password" autocomplete="off" spellcheck="false">
         <div class="hint">需开通：流式语音识别大模型 + 双向流式语音合成。缺这两项则按住说话与朗读不可用。</div>
       </div>
+    </div>
+
+    <div class="card">
+      <p class="sec">网络电台</p>
+      <p class="secst" id="radioSt">读取中…</p>
+      <div id="radioRows"></div>
+      <div class="acts">
+        <button class="btn amber" id="radioAdd">+ 添加电台</button>
+        <button class="btn" id="radioReset">恢复默认</button>
+      </div>
+      <div class="hint" style="margin-top:8px">名称 + 播放地址（HLS <span class="mono">.m3u8</span> 或 http(s) 直播流），分组可留空。
+        留着不动 = 不修改；改过后在保存并重启后生效。与内置默认完全一致时按默认存储。</div>
     </div>
 
     <div class="card">
@@ -510,6 +531,76 @@ CFG_FIELDS.forEach(function(f){
 
 function showClr(id, on){ $(id).style.display = on ? "inline" : "none"; }
 
+// ---- 网络电台编辑器 ----
+// 与密钥字段同约定：留着不动 = 不提交（radioDirty=false）；改过才作为 radio_json 提交。
+var radioDefaults = [];      // 内置默认（「恢复默认」的来源）
+var radioDirty = false;      // 有无编辑
+var radioMax = 3960;
+
+function radioRowEl(s){
+  var d=document.createElement("div"); d.className="rrow";
+  var r1=document.createElement("div"); r1.className="r1";
+  var nm=document.createElement("input"); nm.className="rname"; nm.placeholder="电台名"; nm.value=(s&&s.name)||"";
+  var ge=document.createElement("input"); ge.className="rgenre"; ge.placeholder="分组"; ge.value=(s&&s.genre)||"";
+  var del=document.createElement("button"); del.className="rdel"; del.textContent="删除";
+  del.onclick=function(){ d.remove(); radioDirty=true; updateRadioMeter(); };
+  r1.appendChild(nm); r1.appendChild(ge); r1.appendChild(del);
+  var url=document.createElement("input"); url.className="rurl"; url.placeholder="https://….m3u8"; url.value=(s&&s.url)||"";
+  [nm,ge,url].forEach(function(i){ i.oninput=function(){ radioDirty=true; updateRadioMeter(); }; });
+  d.appendChild(r1); d.appendChild(url);
+  return d;
+}
+function renderRadioRows(list){
+  var box=$("radioRows"); box.innerHTML="";
+  (list||[]).forEach(function(s){ box.appendChild(radioRowEl(s)); });
+}
+function readRadioRows(){
+  var rows=[], box=$("radioRows");
+  for(var i=0;i<box.children.length;i++){
+    var d=box.children[i];
+    var name=d.querySelector(".rname").value.trim();
+    var genre=d.querySelector(".rgenre").value.trim();
+    var url=d.querySelector(".rurl").value.trim();
+    if(name==="" && url==="") continue;   // 完全空行：忽略
+    rows.push({name:name, genre:genre, url:url});
+  }
+  return rows;
+}
+function updateRadioMeter(){
+  var rows=readRadioRows();
+  var bytes = rows.length ? new Blob([JSON.stringify(rows)]).size : 0;  // 估算入库体积
+  var st=$("radioSt"), over=bytes>radioMax;
+  st.textContent = rows.length + " 台（未保存）· 约 " + bytes + "/" + radioMax + "B" +
+                   (over ? " —— 超出上限，请删减" : "");
+  st.className = "secst" + (over ? " no" : (rows.length ? " ok" : " no"));
+}
+// 服务端权威状态（未编辑时显示）。
+function renderRadio(r){
+  if(!r) return;
+  radioDefaults = r.defaults || [];
+  radioMax = r.max_bytes || 3960;
+  renderRadioRows(r.stations);
+  radioDirty = false;
+  var st=$("radioSt");
+  st.textContent = (r.is_custom ? "✓ 自定义 " : "内置默认 ") + (r.count||0) + " 台" +
+                   (r.is_custom ? (" · " + (r.bytes||0) + "/" + radioMax + "B") : "");
+  st.className = "secst" + ((r.count||0) ? " ok" : " no");
+}
+$("radioAdd").onclick = function(){ $("radioRows").appendChild(radioRowEl(null)); radioDirty=true; updateRadioMeter(); };
+$("radioReset").onclick = function(){ renderRadioRows(radioDefaults); radioDirty=true; updateRadioMeter(); };
+
+// 收集电台字段：无编辑 -> {body:null}；有编辑做客户端校验，返回 {body} 或 {err}。
+function collectRadio(){
+  if(!radioDirty) return {body:null};
+  var rows=readRadioRows();
+  if(rows.length===0) return {err:"电台列表不能为空（保留至少一个台，或点「恢复默认」）"};
+  for(var i=0;i<rows.length;i++){
+    if(!rows[i].name) return {err:"第 "+(i+1)+" 个电台缺名称"};
+    if(!/^https?:\/\//i.test(rows[i].url)) return {err:"第 "+(i+1)+" 个电台地址需以 http:// 或 https:// 开头"};
+  }
+  return {body:"radio_json="+encodeURIComponent(JSON.stringify(rows))};
+}
+
 function renderConfig(c){
   var l = c.llm || {}, v = c.voice || {};
   var st = $("llmSt");
@@ -540,6 +631,7 @@ function renderConfig(c){
   showClr("clrLlmJson", !!l.json_override);
   showClr("clrVolcApp", !!v.app_mask);
   showClr("clrVolcAk",  !!v.ak_mask);
+  renderRadio(c.radio);
 }
 
 function loadConfig(cb){
@@ -569,8 +661,14 @@ function saveConfig(then){
   if(raw !== "" && !cleared["llm_json"]){
     try { JSON.parse(raw); } catch(e){ toast("models JSON 语法错误：" + e.message, 1); return; }
   }
-  var body = collectConfig();
-  if(body === null){ toast("没有要保存的改动", 1); return; }
+  var radio = collectRadio();
+  if(radio.err){ toast(radio.err, 1); return; }
+  var parts = [];
+  var fields = collectConfig();
+  if(fields !== null) parts.push(fields);
+  if(radio.body !== null) parts.push(radio.body);
+  if(parts.length === 0){ toast("没有要保存的改动", 1); return; }
+  var body = parts.join("&");
   var btns = [$("saveApply"), $("saveOnly")];
   btns.forEach(function(b){ b.disabled = true; });
   fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
@@ -580,7 +678,9 @@ function saveConfig(then){
     .then(function(res){
       btns.forEach(function(b){ b.disabled = false; });
       if(res.s !== 200){
-        toast("保存失败：" + (res.j.field ? (res.j.field + " 内容不合法") : (res.j.error || res.s)), 1);
+        var FLD = {llm_key:"API Key", llm_base:"Base URL", llm_json:"models JSON",
+                   volc_app:"App Key", volc_ak:"Access Key", radio_json:"电台列表（名称/地址/体积超限）"};
+        toast("保存失败：" + (res.j.field ? ((FLD[res.j.field]||res.j.field) + " 内容不合法") : (res.j.error || res.s)), 1);
         return;
       }
       CFG_FIELDS.forEach(function(f){ $(f.id).value = ""; });
