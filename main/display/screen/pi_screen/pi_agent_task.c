@@ -876,14 +876,15 @@ void pi_agent_task_start(void) {
      * sim 的 "budget" 命令是本地核验；这里在真机启动路径上补一道只告警不 fail 的信号，
      * 免得越界只能靠人工偶尔想起来去跑 sim 才发现。 */
     {
-        /* 预算基线 P4 上调 8192->9216：P4-a/b 有意扩容数据面（新增 ~20 条遥测/传感器
-         * 只读路径，域 battery / net / storage / sys / bt / imu / power），READ-ONLY 清单
-         * 随之长约 600B，并给 P4-c 的 gps 域预留头寸。仍是软告警不 fail，越过新线即提示
-         * 该重新审视路径清单是否需要收敛。 */
+        /* 预算基线 9216->11264：弱模型鲁棒性批次给 system prompt 补了五个 few-shot 示例
+         *（cells 控制/rows 表格/bind_rows 列表/toggle 显隐复合/overlay 确认复合）+ NEVER
+         * 负面清单（真机实录：模型没见过的形态永远写不对，一维 rows 连拒两次；示例是最强
+         * 的格式教学，~1.6KB 换首错率）。仍是软告警不 fail，越过新线即提示该重新审视示例/
+         * 路径清单是否需要收敛。 */
         size_t sys_len = strlen(pi_card_system_prompt());
         size_t desc_len = strlen(pi_card_render_desc());
-        if (sys_len + desc_len > 9216) {
-            ESP_LOGW(TAG, "pi_card system_prompt(%u)+ui_render desc(%u)=%u bytes, over 9216 budget",
+        if (sys_len + desc_len > 11264) {
+            ESP_LOGW(TAG, "pi_card system_prompt(%u)+ui_render desc(%u)=%u bytes, over 11264 budget",
                      (unsigned)sys_len, (unsigned)desc_len, (unsigned)(sys_len + desc_len));
         }
     }

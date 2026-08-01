@@ -925,6 +925,11 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
     std::vector<std::string> hints = Lint(root, data);
     hints.insert(hints.begin(), repair_notes.begin(), repair_notes.end());
     if (!hints.empty()) {
+        // 首条固定压舱：弱模型会把 hints 当失败去整卡重渲（真机实录：收到 hints 后 2s 重画
+        // 一张近似卡，聊天流里留双卡）——明说卡已在屏上、hints 只面向下一张卡。
+        hints.insert(hints.begin(),
+                     "note: this card IS rendered on screen; hints below are advice for your NEXT "
+                     "card — do not re-render this one");
         cJSON* arr = cJSON_CreateArray();
         for (const std::string& h : hints) cJSON_AddItemToArray(arr, cJSON_CreateString(h.c_str()));
         if (char* s = cJSON_PrintUnformatted(arr)) {
@@ -1056,7 +1061,7 @@ extern "C" const char* pi_card_render_desc(void) {
         " COMMANDS (invoke cmd): " + BuildCommandsClause(true) +
         ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (replaces any prior "
         "pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an on-screen ✕ also removes "
-        "it).";
+        "it; ≤3KB spec+data).";
     return s.c_str();
 }
 
@@ -1093,8 +1098,9 @@ extern "C" const char* pi_card_system_prompt(void) {
         "forms/dashboards.\n"
         "- \"item\":[leaf,...],\"bind_rows\":\"key\",max?,empty? -- repeat item once per data[\"key\"] "
         "element; strings use {i}/{n}/{item.FIELD}. Row taps: report/set/close only.\n\n"
-        "LEAVES: label{text,role,bind,fmt,mono,tone} - button{text,icon,variant,on_click} - slider/"
-        "arc/bar/switch/choice{bind/value/options,on_change} - icon - divider - qrcode{text} - "
+        "LEAVES: label{text,role,bind,bind_data,fmt,mono} - button{text,icon,variant,on_click} - "
+        "slider/arc/bar/switch/choice{bind/value/options,on_change} - icon(decor; tappable="
+        "button{icon}) - divider - qrcode{text} - "
         "chart{bind_history} - stock_chart{symbol}. role ramp: eyebrow|kicker|section|title|heading|"
         "label|value|caption. Header = eyebrow+title in one cells grid. Big number = role:value "
         "(mono, right-aligned in tables). Controls carry their own state -- don't restate it in "
@@ -1102,10 +1108,12 @@ extern "C" const char* pi_card_system_prompt(void) {
         "STYLE: lean on pi's look. tone/fill = semantic tokens (accent/ok/err/tx/dim/faint/card2/"
         "line...), never hex. ONE primary(amber) button/card, rest ghost/plain/default. "
         "\"side\":\"end\" pushes a cell to the row's right edge. Grid \"fill\":\"card2\" gives a "
-        "background box. Labels 1-3 words; num columns don't truncate, text columns do.\n\n"
+        "background box. Labels 1-3 words; num columns don't truncate, text columns do. Max 8 "
+        "grids/64 leaves per card; split big dashboards.\n\n"
         "CHOOSE: SET something -> a control grid that binds the path (writes hardware directly). "
         "STATUS -> a rows table binding the paths. CHOICE/CONFIRM/FORM/MENU -> render it, the tap "
-        "rides back on report. Chit-chat -> just text. Prefer display:'chat'; \"overlay\" only for a "
+        "rides back on report. Chit-chat -> just text. Playback UI is built-in — never render "
+        "player/media cards. Prefer display:'chat'; \"overlay\" only for a "
         "modal moment (auto-closes).\n\n"
         "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
         "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
@@ -1125,11 +1133,44 @@ extern "C" const char* pi_card_system_prompt(void) {
         "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
         BuildCommandsClause(false) +
         ".\n\n"
-        "Example (chat, device control card = two cells grids): {\"root\":[{\"cells\":[{\"type\":"
+        // 示例必须无瑕疵——弱模型照抄它们（真机实录：没在示例里见过的形态它永远写不对，
+        // 一维 rows 连拒两次后才补的 Ex2/Ex3）。Ex1=cells 控制卡（switch 绑真实可写 bool
+        // 路径，纯 bind 即生效无需 handler）；Ex2=rows 表格，肉眼可见二维嵌套 + num 列；
+        // Ex3=bind_rows 行模板 + report 行点按 + data。NEVER 清单收拢实录过的高频错型。
+        "Example 1, control card (two cells grids): {\"root\":[{\"cells\":[{\"type\":"
         "\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio.volume\"},{\"type\":"
         "\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},{\"cells\":[{"
-        "\"type\":\"icon\",\"icon\":\"wifi\"},{\"type\":\"label\",\"text\":\"网络\"},{\"type\":"
-        "\"switch\",\"checked\":true,\"side\":\"end\"}]}]}";
+        "\"type\":\"icon\",\"icon\":\"sun\"},{\"type\":\"label\",\"text\":\"浅色\"},{\"type\":"
+        "\"switch\",\"bind\":\"ui.theme\",\"side\":\"end\"}]}]}\n"
+        "Example 2, status TABLE — rows is 2-D, each row an ARRAY: {\"root\":[{\"cells\":[{\"type\":"
+        "\"label\",\"role\":\"eyebrow\",\"text\":\"状态\"}]},{\"cols\":[{},{\"num\":true}],\"rows\":"
+        "[[{\"type\":\"label\",\"text\":\"电量\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":"
+        "\"battery.level\",\"fmt\":\"%d%%\",\"mono\":true}],[{\"type\":\"label\",\"text\":\"信号\"},"
+        "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.rssi\",\"fmt\":\"%d\",\"mono\":true}]"
+        "]}]}\n"
+        "Example 3, tap-a-row menu (bind_rows + data): {\"root\":[{\"item\":[{\"type\":\"button\","
+        "\"text\":\"{item.title}\",\"variant\":\"ghost\",\"on_click\":[{\"do\":\"report\",\"text\":"
+        "\"选了{item.title}\"}]}],\"bind_rows\":\"tracks\",\"max\":8,\"empty\":\"暂无\"}],\"data\":"
+        "{\"tracks\":[{\"title\":\"七里香\"},{\"title\":\"花海\"}]}}\n"
+        // Ex4/Ex5：复合示例——把动作系统串起来（toggle 显隐零往返、id 值随 report 自动上送、
+        // overlay+ttl、primary/ghost 纪律）。hidden/id 只在叶子级生效（grid 不注册 id），
+        // 故折叠目标是整行独占的 chart 叶子。
+        "Example 4, expandable detail — local toggle, ZERO round-trip: {\"root\":[{\"cells\":[{"
+        "\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"电量\"},{\"type\":\"label\",\"role\":"
+        "\"title\",\"bind\":\"battery.level\",\"fmt\":\"%d%%\"},{\"type\":\"button\",\"icon\":"
+        "\"chevron-down\",\"variant\":\"ghost\",\"side\":\"end\",\"on_click\":[{\"do\":\"toggle\","
+        "\"target\":\"hist\"}]}]},{\"fill\":\"card2\",\"cells\":[{\"type\":\"chart\","
+        "\"bind_history\":\"battery.level\",\"id\":\"hist\",\"hidden\":true}]}]}\n"
+        "Example 5, overlay confirm — id'd control value auto-attaches to report: {\"display\":"
+        "\"overlay\",\"ttl_ms\":30000,\"root\":[{\"cells\":[{\"type\":\"label\",\"role\":\"title\","
+        "\"text\":\"睡眠定时\"},{\"type\":\"choice\",\"options\":[\"15分\",\"30分\",\"60分\"],"
+        "\"id\":\"dur\"}]},{\"cells\":[{\"type\":\"button\",\"text\":\"取消\",\"variant\":\"ghost\","
+        "\"on_click\":[{\"do\":\"close\"}]},{\"type\":\"button\",\"text\":\"开始\",\"variant\":"
+        "\"primary\",\"side\":\"end\",\"on_click\":[{\"do\":\"report\",\"text\":\"开始睡眠定时\"},"
+        "{\"do\":\"close\"}]}]}]}\n"
+        "NEVER: a bare leaf as a root block (wrap it: {\"cells\":[leaf]}); rows as a flat leaf "
+        "list (always [[…],[…]]); on_click on a grid block (leaves only); media.* player cards; "
+        "emoji in text (no glyphs on device).";
     return s.c_str();
 }
 

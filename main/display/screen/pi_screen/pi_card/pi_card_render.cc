@@ -1999,6 +1999,14 @@ bool ValidateLeaf(const cJSON* node, const std::set<std::string>& node_ids, std:
     // bind 路径必须已注册（或命中动态 provider 的合法模式）
     if (const char* path = GetStr(node, "bind")) {
         if (!DataHub::Instance().Has(path)) {
+            // media.* 已整体注销（播控只走内置播放器，见 pi_card_media/host Init 注释）：给
+            // 弱模型一条有出路的拒绝——generic "unknown bind path" 只会让它换个路径名连环
+            // 重试，drain 侧 SpecUsesMedia 的话术又因 worker 先拒而永远到不了。
+            if (std::strncmp(path, "media.", 6) == 0) {
+                err = "media.* paths don't exist — never render player UI, the built-in player "
+                      "appears automatically; confirm playback in plain text instead";
+                return false;
+            }
             err = std::string("unknown bind path: ") + path;
             if (const char* h = DataHub::Instance().HintFor(path)) err += std::string("; ") + h;
             return false;
@@ -2137,6 +2145,37 @@ bool Validate(const cJSON* root_node, const cJSON* data, std::string& err) {
         return false;
     }
     RenderLimits limits;
+    // 预统计整卡节点数（与下方逐叶校验完全同口径：cells/rows 按叶子数、bind_rows 按
+    // EffMax×模板 cell 数预留）——超限时把「实际声明了多少」带给模型。只回 "too many nodes
+    // (max 64)" 弱模型无从校准该砍多少，会盲目微调连环重试（serial_ppa_on.log 三连拒实录）；
+    // 带上具体数字一步收敛。逐叶的 ++count 护栏保留作兜底。
+    int declared = 0;
+    const cJSON* pg = nullptr;
+    cJSON_ArrayForEach(pg, root_node) {
+        if (!cJSON_IsObject(pg)) continue;
+        if (const cJSON* cells = GetItem(pg, "cells"); cJSON_IsArray(cells)) {
+            declared += cJSON_GetArraySize(cells);
+        } else if (const cJSON* rows = GetItem(pg, "rows"); cJSON_IsArray(rows)) {
+            const cJSON* row = nullptr;
+            cJSON_ArrayForEach(row, rows) {
+                if (cJSON_IsArray(row)) declared += cJSON_GetArraySize(row);
+            }
+        } else if (HasKey(pg, "bind_rows")) {
+            const cJSON* item = GetItem(pg, "item");
+            int tmpl = cJSON_IsArray(item) ? cJSON_GetArraySize(item) : 1;
+            if (tmpl < 1) tmpl = 1;
+            const char* key = GetStr(pg, "bind_rows");
+            const cJSON* arr = (data && key) ? GetItem(data, key) : nullptr;
+            declared += EffMax(pg, cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0) * tmpl;
+        }
+    }
+    if (declared > limits.max_nodes) {
+        err = "card declares " + std::to_string(declared) + " nodes (max " +
+              std::to_string(limits.max_nodes) + "); cut at least " +
+              std::to_string(declared - limits.max_nodes) +
+              " leaves — split into multiple cards, or lower bind_rows max";
+        return false;
+    }
     std::set<std::string> node_ids;
     CollectNodeIdsV2(root_node, node_ids);  // 两遍：target 可以前向引用数组里靠后声明的 grid
     int count = 0;
@@ -2232,6 +2271,9 @@ cJSON* RepairGrid(cJSON* grid, std::vector<std::string>* notes) {
     if (!cJSON_IsObject(grid)) return grid;
 
     // 旧 v1 "list" 节点（type:"list", item, bind_data, max?, empty?）→ 改写成 bind_rows 形态。
+    // 注意不能在此 cJSON_Delete(grid)：grid 仍挂在 root 数组里，调用方 Repair() 拿到新指针后
+    // 走 cJSON_ReplaceItemInArray，由它解链并删除旧节点——这里先删会让替换沿着已释放节点的
+    // prev/next 走（UAF + double-free）。
     if (const char* t = GetStr(grid, "type"); t && !std::strcmp(t, "list")) {
         cJSON* item = cJSON_DetachItemFromObject(grid, "item");
         const char* bind_data = GetStr(grid, "bind_data");
@@ -2240,12 +2282,58 @@ cJSON* RepairGrid(cJSON* grid, std::vector<std::string>* notes) {
         cJSON_AddStringToObject(out, "bind_rows", bind_data ? bind_data : "");
         if (HasKey(grid, "max")) cJSON_AddNumberToObject(out, "max", GetInt(grid, "max", 8));
         if (const char* empty = GetStr(grid, "empty")) cJSON_AddStringToObject(out, "empty", empty);
-        cJSON_Delete(grid);
         if (notes) notes->push_back("legacy list node rewritten to bind_rows");
         return out;
     }
 
+    // 叶子被直接当块用：{"type":"divider"}（裸叶子，可带完整叶子属性）或速记 {"divider":null}/
+    // {"divider":{}}（真机实录 2026-08-01：root 末尾塞 {"divider":null} 被零形态拒绝、白烧一轮
+    // 重试）。包成单叶 cells 块 + note。必须在块级事件剥除之前做——裸叶子的 on_click 属于
+    // 叶子，要保留。真零形态/未知键仍落到函数末尾 return，由 Validate 给可修复错误。
+    if (!HasKey(grid, "cells") && !HasKey(grid, "rows") && !HasKey(grid, "bind_rows")) {
+        cJSON* leaf = nullptr;
+        const char* t = GetStr(grid, "type");
+        cJSON* only = grid->child;
+        if (t && IsLeafType(t)) {
+            leaf = cJSON_Duplicate(grid, 1);
+        } else if (only && only->next == nullptr && only->string && IsLeafType(only->string) &&
+                   (cJSON_IsNull(only) || cJSON_IsTrue(only) || cJSON_IsObject(only))) {
+            leaf = cJSON_IsObject(only) ? cJSON_Duplicate(only, 1) : cJSON_CreateObject();
+            cJSON_DeleteItemFromObject(leaf, "type");  // 防 value 对象里也带 type 撞车
+            cJSON_AddStringToObject(leaf, "type", only->string);
+        }
+        if (leaf) {
+            StripStaleKeys(leaf);
+            cJSON* out = cJSON_CreateObject();
+            cJSON* cells = cJSON_AddArrayToObject(out, "cells");
+            cJSON_AddItemToArray(cells, leaf);
+            if (notes) {
+                notes->push_back("a bare leaf was used as a grid block — wrapped into a one-cell "
+                                 "cells block (every grid needs cells/rows/bind_rows)");
+            }
+            return out;
+        }
+    }
+
     StripStaleKeys(grid);  // grid 块级旧属性
+
+    // 实测弱模型会把 on_click 挂到 grid 块上（对 "row tap" 的误读）——渲染器只认叶子事件，
+    // 静默忽略等于交互悄悄丢失且无从得知。剥掉并 note 告知正确挂法（宽进严出，不硬拒）。
+    {
+        bool had_evt = false;
+        for (const char* k : {"on_click", "on_change", "on_release"}) {
+            if (HasKey(grid, k)) {
+                cJSON_DeleteItemFromObject(grid, k);
+                had_evt = true;
+            }
+        }
+        if (had_evt && notes) {
+            notes->push_back(
+                "grid-level on_click/on_change/on_release were ignored — attach events to a leaf "
+                "inside cells/rows/item instead");
+        }
+    }
+
     const bool is_cells_form = HasKey(grid, "cells");
     StripStaleColsIfLegacy(grid, is_cells_form);
 
@@ -2254,17 +2342,35 @@ cJSON* RepairGrid(cJSON* grid, std::vector<std::string>* notes) {
         return grid;
     }
     if (cJSON* rows = cJSON_GetObjectItem(grid, "rows"); cJSON_IsArray(rows)) {
-        // 逐行剥属性/spacer 修复。
+        // 逐行剥属性/spacer 修复。裸叶子对象（模型忘了 rows 是二维、写成一维叶子数组——真机
+        // 实录连续两次原样重试）包成单格行；schema 已放开 rows 内层约束让它到得了这里。
         int nrows = cJSON_GetArraySize(rows);
         cJSON* fixed_rows = cJSON_CreateArray();
         int max_cells = 0;
+        bool wrapped_bare = false;
         for (int i = 0; i < nrows; ++i) {
             cJSON* row = cJSON_GetArrayItem(rows, i);
             bool changed = false;
-            cJSON* fixed_row = cJSON_IsArray(row) ? RepairCellArray(row, &changed) : cJSON_Duplicate(row, 1);
+            cJSON* fixed_row;
+            if (cJSON_IsArray(row)) {
+                fixed_row = RepairCellArray(row, &changed);
+            } else if (cJSON_IsObject(row)) {
+                cJSON* leaf = cJSON_Duplicate(row, 1);
+                StripStaleKeys(leaf);
+                fixed_row = cJSON_CreateArray();
+                cJSON_AddItemToArray(fixed_row, leaf);
+                wrapped_bare = true;
+            } else {
+                fixed_row = cJSON_Duplicate(row, 1);
+            }
             int rc = cJSON_IsArray(fixed_row) ? cJSON_GetArraySize(fixed_row) : 0;
             if (rc > max_cells) max_cells = rc;
             cJSON_AddItemToArray(fixed_rows, fixed_row);
+        }
+        if (wrapped_bare && notes) {
+            notes->push_back(
+                "rows must be 2-D (each row an ARRAY of leaves); bare leaf objects were wrapped "
+                "into single-cell rows");
         }
         cJSON_ReplaceItemInObject(grid, "rows", fixed_rows);
         // cols 长度纠偏（§6.2）：更短则补空列，更长则截断。
@@ -2459,6 +2565,22 @@ void LintLeaf(const cJSON* leaf, const cJSON* data, LintState& st) {
         } else {
             st.has_label = true;
         }
+        // mono/value 走数字等宽字体，无 CJK 字形——fmt 里夹中文单位（"%d分钟"）上屏就是
+        // 豆腐块（Haiku 实测踩中）。单位放行首的文字 label 里才安全。
+        const char* fmt = GetStr(leaf, "fmt");
+        const cJSON* mono = GetItem(leaf, "mono");
+        const char* role = GetStr(leaf, "role");
+        if (fmt != nullptr && (cJSON_IsTrue(mono) || (role && std::strcmp(role, "value") == 0))) {
+            for (const unsigned char* p = reinterpret_cast<const unsigned char*>(fmt); *p; ++p) {
+                if (*p >= 0x80) {
+                    st.hints->push_back(std::string("fmt '") + fmt +
+                                        "' has non-ASCII text but mono/value cells use the number "
+                                        "font (no CJK glyphs — renders as boxes); keep fmt ASCII "
+                                        "and put the unit in the row's text label.");
+                    break;
+                }
+            }
+        }
     }
 
     if (std::strcmp(type, "chart") == 0) {
@@ -2510,20 +2632,27 @@ void LintLeaf(const cJSON* leaf, const cJSON* data, LintState& st) {
                                 " reports on every change and costs an LLM round-trip each time; "
                                 "use on_release or a local patch/set/toggle instead.");
         }
+        // 与渲染器 FinishLeafWidget 的 live 判定同口径：bind（可写路径 AttachWriteback 直控
+        // 硬件；只读路径是刻意的置灰仪表）或有 id（值随 report 自动上送）都不是死控件。
+        // 系统提示词的标准音量卡就是纯 bind 无 handler——之前不认 bind，每张标准控制卡都被
+        // 误报 dead control，弱模型会画蛇添足加 on_change 或整卡重渲。
         const bool has_handler = HasKey(leaf, "on_click") || HasKey(leaf, "on_change") ||
-                                 HasKey(leaf, "on_release");
+                                 HasKey(leaf, "on_release") || HasKey(leaf, "bind") ||
+                                 GetStr(leaf, "id") != nullptr;
         if (!has_handler) {
             st.hints->push_back(std::string("This ") + type +
-                                " has no on_click/on_change/on_release — a dead control that does "
-                                "nothing when the user interacts with it.");
+                                " has no bind and no on_click/on_change/on_release — a dead control "
+                                "that does nothing when the user interacts with it.");
         }
     }
 
     if (std::strcmp(type, "choice") == 0) {
+        // choice 没有 on_release——别给弱模型指一条不存在的路（旧文案 "use on_release" 的坑）。
+        // 一次性选单用 report 是正路，只提醒常驻选择器的往返成本。
         if (ActionsHaveReport(GetItem(leaf, "on_change"))) {
             st.hints->push_back(
-                "The on_change of this choice reports on every change and costs an LLM round-trip "
-                "each time; use on_release or a local patch/set/toggle instead.");
+                "This choice reports on every tap (one LLM round-trip each) — fine for a one-shot "
+                "pick; for a persistent selector prefer a local set/patch instead.");
         }
         const bool has_id = GetStr(leaf, "id") != nullptr;
         const bool has_outlet = ActionsHaveOutlet(GetItem(leaf, "on_change"));

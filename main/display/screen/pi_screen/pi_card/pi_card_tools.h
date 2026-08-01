@@ -51,24 +51,28 @@ const char *pi_card_system_prompt(void);
  * preset/slots/column/row/旧grid/justify/align/grow/gap/pad/w/h/size/color/bg/span/children
  * 全部删除（docs/CARD_V2.md §1）。 */
 #define PI_CARD_DESC_HEAD                                                                            \
-    "Render an interactive UI card. Args ARE the card spec: {display?:'chat'|"                        \
-    "'overlay'|'standby', ttl_ms?:int, card?:'id', data?:{key:scalar|array}, root:[grid,…]}. root: "  \
+    "Render an interactive UI card. Args ARE the card spec: {root:[grid,…], data?:{key:scalar|"       \
+    "array}, display?:'chat'|'overlay'|'standby', ttl_ms?:int, card?:'id'} — emit root before "      \
+    "data. root: "                                                                                    \
     "ARRAY of grid blocks, top-to-bottom. ONLY container is grid (no nesting; depth fixed "           \
     "card->grid->leaf); no x/y/w/h/gaps/grow/justify/align. Returns "                                 \
     "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = every hardware path this " \
-    "card binds (this IS your device read); hints = non-blocking tips. "                              \
+    "card binds (this IS your device read); hints = advice for FUTURE cards — the card IS on "        \
+    "screen, never re-render because of a hint. "                                                     \
     "Invalid input returns a fixable error; overlays auto-close (ttl_ms) and are capped. "            \
     "Each grid has exactly one of: "                                                                  \
     "cells:[leaf,…] (size-wrapped flow; divider/chart/choice/qrcode get their own line); "            \
-    "cols?:[{title?,num?}],rows:[[leaf,…],…] (aligned TABLE, shared tracks; num:true=right-align "    \
-    "mono; 1 cell/row=vertical menu); "                                                               \
+    "cols?:[{title?,num?}],rows:[[leaf,…],…] (aligned TABLE, 2-D: each row is an ARRAY of leaves; "   \
+    "shared tracks; num:true=right-align mono; 1 cell/row=vertical menu); "                           \
     "item:<leaf>|[leaf,…],bind_rows:'key',max?,empty? (repeats item per data[key] elem; "             \
-    "{i}=idx0,{n}=idx1,{item.FIELD}; row taps: report/set/close only). "                               \
+    "{i}=idx0,{n}=idx1,{item.FIELD}; row tap = on_click on an item leaf (not the grid), "          \
+    "report/set/close only). "                                                                     \
     "Leaves (12, exactly these, never nested): label{text?,role?,bind?,fmt?,mono?,bind_data?}; "      \
     "button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,on_release?}; " \
     "arc{like slider}(round dial); switch{checked,bind?,id?,on_change?}; bar{min,max,value,bind?}; "  \
     "choice{options:[2-6],value?,id?,bind?,on_change?}(picker; reports idx+label); "                   \
-    "icon{icon:'name'}; divider; qrcode{text}; chart{bind_history:'path',points?}(LINE chart, fixed " \
+    "icon{icon:'name'}(decor; tappable=button{icon}); divider; qrcode{text}; "                     \
+    "chart{bind_history:'path',points?}(LINE chart, fixed " \
     "height); stock_chart{symbol,name?,mode?}(live CN/HK/US chart, self-refreshing, timeframe "        \
     "buttons, hold-to-inspect; symbol from stock tool). "                                              \
     "role ramp: eyebrow|kicker|section|title|heading|label|value|caption (header=eyebrow+title; "     \
@@ -82,7 +86,8 @@ const char *pi_card_system_prompt(void);
     "Bound label fmt: ONE placeholder matching the type — number->%d/\"%d%%\", string->%s (%s on a "  \
     "number path crashes); mono:true for numbers. bind_data label shows card data[key] ({value} in "  \
     "its text inlines it). "                                                                          \
-    "EVENTS: action arrays, zero round-trip — close | set,path,value? | toggle/show/hide,target "     \
+    "EVENTS: action arrays, zero round-trip — close | set,path,value?(number, or '{i}' in a row "     \
+    "template) | toggle/show/hide,target "     \
     "(hidden:true block) | patch,target,props:{text?,value?,checked?,hidden?,tone?} ({v} in "         \
     "props.text=trigger value) | invoke,cmd (safe cmds run at once, else confirm). report,text only " \
     "when you must generate text ({v}=value,{label}=choice's text; every id'd control's value "      \
@@ -97,7 +102,10 @@ const char *pi_card_system_prompt(void);
     "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
     ":\"string\",\"enum\":[\"close\",\"set\",\"report\",\"toggle\",\"show\",\"hide\",\"patch\",\"invo" \
     "ke\"]},\"pa" \
-    "th\":{\"type\":\"string\"},\"value\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"},\"targ" \
+    /* action.value 允许 string：行模板 set 的 value:"{i}"（渲染期替换成行号）是文档教的合法
+     * 用法，schema 只写 number 会误导照 schema 写卡的模型。 */ \
+    "th\":{\"type\":\"string\"},\"value\":{\"type\":[\"number\",\"string\"]},\"text\":{\"type\":\"st" \
+    "ring\"},\"targ" \
     "et\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"},\"cmd\":{\"type\":\"string\"}},\"req" \
     "uired\":[\"do\"]}," \
     "\"leaf\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"label\"" \
@@ -107,11 +115,14 @@ const char *pi_card_system_prompt(void);
     "},\"role\":{\"type\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"headin" \
     "g\",\"label\",\"value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"g" \
     "host\",\"plain\",\"default\"]},\"bind\":{\"type\":\"string\"},\"bind_data\":{\"type\":\"string\"" \
-    "},\"bind_history\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"},\"empty\":{\"type\":\"" \
-    "string\"},\"fmt\":{\"type\":\"string\"},\"icon\":{\"type\":\"string\"},\"value\":{\"type\":\"nu" \
+    /* "empty" 是 grid（bind_rows 形态）的属性，之前误混进 leaf——已移回 grid 独有。 */ \
+    "},\"bind_history\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"}" \
+    ",\"fmt\":{\"type\":\"string\"},\"icon\":{\"type\":\"string\"},\"value\":{\"type\":\"nu" \
     "mber\"},\"min\":{\"type\":\"number\"},\"max\":{\"type\":\"number\"},\"checked\":{\"type\":\"boo" \
-    "lean\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":2,\"maxIte" \
-    "ms\":6},\"mono\":{\"type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"acc" \
+    /* options 无 minItems/maxItems：rows 一维失败实证 pi-c 解析 $ref 并强制内联约束，7 个
+     * 选项会在 pi-c 层吃 "Expected array length" 干拒绝；host 侧有友好的 2-6 校验。 */ \
+    "lean\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}" \
+    "},\"mono\":{\"type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"acc" \
     "ent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
     ",\"id\":{\"type\":\"string\"},\"side\":{\"type\":\"string\",\"enum\":[\"end\"]},\"hidden\":{\"ty" \
     "pe\":\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on" \
@@ -122,8 +133,10 @@ const char *pi_card_system_prompt(void);
     "\"grid\":{\"type\":\"object\",\"properties\":{" \
     "\"cells\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/leaf\"}}," \
     "\"cols\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/col\"}}," \
-    "\"rows\":{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/leaf\"" \
-    "}}}," \
+    /* rows 不写内层 items 约束：真机实录弱模型把 rows 写成一维叶子数组，被 pi-c 的内联
+     * type:"array" 硬拒（"Expected array"+截断echo）后原样重试两次——$defs 引用内部 pi-c
+     * 不查，但内联约束查。形状修复交给 host Repair（裸叶子包成单格行）。 */ \
+    "\"rows\":{\"type\":\"array\"}," \
     "\"item\":{\"oneOf\":[{\"$ref\":\"#/$defs/leaf\"},{\"type\":\"array\",\"items\":{\"$ref\":\"#/$d" \
     "efs/leaf\"}}]}," \
     "\"bind_rows\":{\"type\":\"string\"},\"max\":{\"type\":\"number\"},\"empty\":{\"type\":\"string\"" \
@@ -131,10 +144,11 @@ const char *pi_card_system_prompt(void);
     "\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\"" \
     ",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
     "}}}," \
-    /* 无 maxItems：>8 grids 由 host Repair() 截断+hint（宽进严出），pi-c 层硬拒的干错误
-     * （"Expected array length…"+全量 args echo）会让弱模型连环重试越改越错。 */ \
-    "\"properties\":{\"root\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/grid\"},\"minItems\"" \
-    ":1},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
+    /* 无 maxItems/minItems：>8 grids 由 host Repair() 截断+hint、空 root 由 Validate 给可修复
+     * 错误（宽进严出），pi-c 层硬拒的干错误（"Expected array length…"+全量 args echo）会让
+     * 弱模型连环重试越改越错。 */ \
+    "\"properties\":{\"root\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/grid\"}" \
+    "},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
     "},\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"typ" \
     "e\":\"object\"}},\"required\":[\"root\"]}"
 
@@ -155,8 +169,10 @@ const char *pi_card_system_prompt(void);
     "\":\"string\"},\"value\":{\"type\":\"number\"},\"checked\":{\"type\":\"boolean\"},\"hidden\":{\"" \
     "type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"e" \
     "rr\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]},\"color\":{\"type\"" \
+    /* patches 无 maxItems：>16 由 worker 侧 pi_card_tool_update 给可修复错误（同 root 无
+     * maxItems 的理由——pi-c 层硬拒会引发弱模型重试螺旋）。 */ \
     ":\"string\"}}}},\"properties\":{\"card\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"pr" \
-    "ops\":{\"$ref\":\"#/$defs/props\"},\"patches\":{\"type\":\"array\",\"maxItems\":16,\"items\":{\"" \
+    "ops\":{\"$ref\":\"#/$defs/props\"},\"patches\":{\"type\":\"array\",\"items\":{\"" \
     "type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"props\":{\"$ref\":\"#/$defs/pr" \
     "ops\"}},\"required\":[\"id\",\"props\"]}},\"data\":{\"type\":\"object\",\"properties\":{\"set\"" \
     ":{\"type\":\"object\"},\"append\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"stri" \

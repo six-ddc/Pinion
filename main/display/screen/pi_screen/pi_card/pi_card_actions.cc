@@ -376,6 +376,13 @@ bool ValidateActions(const cJSON* arr, const std::set<std::string>& node_ids, st
         if (k == ActionKind::Invoke) {
             const cJSON* cmdj = cJSON_GetObjectItem(item, "cmd");
             if (!cJSON_IsString(cmdj) || !CommandRegistry::Instance().Has(cmdj->valuestring)) {
+                // media.* 命令已随媒体卡整体注销：同 ValidateLeaf 的 media bind 拒绝口径，
+                // 给弱模型一条有出路的话术，否则它会换着命令名连环重试。
+                if (cJSON_IsString(cmdj) && std::strncmp(cmdj->valuestring, "media.", 6) == 0) {
+                    err = "media.* commands don't exist — never render player UI, the built-in "
+                          "player handles playback; confirm in plain text instead";
+                    return false;
+                }
                 std::string avail;
                 for (const auto& m : CommandRegistry::Instance().ListCommands()) {
                     if (!avail.empty()) avail += ", ";

@@ -564,7 +564,8 @@ v1「迟到属性只在 adopt 那刻生效」的整类问题（role/tone/justify
 - 树深恒 2：任何叶子的属性里出现 `children` → 拒绝。
 
 叶子（保留 v1 校验，逐条不变）：
-- `bind` 路径必须已注册（`DataHub::Has`），附 `HintFor` 提示。
+- `bind` 路径必须已注册（`DataHub::Has`），附 `HintFor` 提示；`media.*` 前缀单独给「播控 UI 内置、
+  勿画播放器卡」话术（invoke 的 `media.*` 命令同口径），防弱模型换名连环重试。
 - label `fmt` 与 bind 类型相容（`FmtSafeForType`，数值路径 `%s` → 拒绝，防真机 newlib 崩溃）。
 - 数值控件 slider/arc/bar/switch/choice 不得 bind String 路径。
 - qrcode text 非空 ≤256 字节；choice options 2-6 字符串；chart bind_history 须有历史；
@@ -572,7 +573,8 @@ v1「迟到属性只在 adopt 那刻生效」的整类问题（role/tone/justify
 - action 合法性（in-list-row 拒 toggle/patch/show/hide）。
 
 限额：≤64 节点（bind_rows 按 max×行 cell 数预留）、grid 数 ≤8。深度检查退化为「root 是数组、
-grid 无 children」两条即可。
+grid 无 children」两条即可。超节点上限时 Validate 先整卡预统计（与逐叶校验同口径），错误里带
+「实际声明 N 节点、至少砍 N−64」的具体数字——弱模型拿不到数字只会盲目微调连环重试。
 
 ### 6.2 自动 repair 规则（模型常见错误，能修则修不重试）
 
@@ -585,6 +587,8 @@ grid 无 children」两条即可。
 | 数值列忘标 `num` | solver 按数值列门槛（mono/数值 bind/fmt 数值转换/静态数值文本，§2.2）**自动推断** | 修（无需模型标） |
 | 旧 `list` 节点 | **改写为 `bind_rows`**（list.bind_data→bind_rows，list.item 原样） | 修 |
 | 旧 `spacer` 节点 | **删除**，若其后有 cell 则给该 cell 补 `side:"end"`（仅当 spacer 在两 cell 之间） | 修（启发式，提示） |
+| grid 块级挂 `on_click/on_change/on_release` | **剥除 + note**（渲染器只认叶子事件，静默忽略=交互悄悄丢失） | 修（提示挂到叶子上） |
+| `rows` 写成一维叶子数组（忘二维） | **裸叶子包成单格行 + note**；schema 侧放开 rows 内层约束（pi-c 只查内联约束不查 `$defs` 内部，内联 `type:"array"` 会硬拒） | 修（提示 rows 是 2-D） |
 | `preset`/`slots` 键 | 顶层出现 → **拒绝**，回错误串「preset 已移除，请直接给 root grid 数组，示例见 system prompt」 | 拒绝 |
 | bind 路径不存在 / fmt 类型不符 / 数值控件绑 string / 嵌套 grid / choice<2 / qr>256 | **拒绝重试**（正确性/安全底线，不能猜） | 拒绝 |
 
