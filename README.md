@@ -54,9 +54,10 @@ idf.py -p /dev/ttyACM0 flash monitor  # P4 口 = "USB JTAG/serial debug unit"；
    扫码连热点后打开 `http://192.168.4.1` 填 WiFi）。
 2. 连上 WiFi 后引导卡显示后台地址二维码，手机扫码（或浏览器打开该地址）。
 3. 在「配置」页填两组值，点「保存并重启」：
-   - **大模型** — API Key（必填）；Base URL 可选（默认 `https://api.deepseek.com`，任何
-     兼容 OpenAI Completions 的端点都行）。想换供应商或加模型，展开「高级」粘一整份
-     pi-c 格式的 models JSON，它会完全覆盖内置模型清单。
+   - **大模型** — API Key + 模型 ID（都必填，如 `deepseek-v4-flash`）；Base URL 可选
+     （默认 `https://api.deepseek.com`，任何兼容 OpenAI Completions 的端点都行）。想换
+     供应商或精确控制模型参数，展开「高级」粘一整份 pi-c 格式的 models JSON，它会完全
+     覆盖上面三项。
    - **语音（火山引擎）** — App Key + Access Key。需开通流式语音识别大模型（resource
      `volc.seedasr.sauc.duration`）与双向流式语音合成（`seed-tts-2.0`）；缺这两项只影响
      按住说话与朗读，对话仍可用。资源名与音色以宏硬编码在 `components/volc_speech/src/`

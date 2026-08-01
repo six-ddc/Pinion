@@ -15,9 +15,10 @@ namespace {
 
 using device_config::Field;
 
-constexpr std::array<Field, 6> kFields = {Field::LlmApiKey,     Field::LlmBaseUrl,
-                                          Field::LlmModelsJson, Field::VoiceAppKey,
-                                          Field::VoiceAccessKey, Field::RadioList};
+constexpr std::array<Field, 7> kFields = {Field::LlmApiKey,      Field::LlmBaseUrl,
+                                          Field::LlmModelId,     Field::LlmModelsJson,
+                                          Field::VoiceAppKey,    Field::VoiceAccessKey,
+                                          Field::RadioList};
 
 // 粘贴密钥常带首尾空白/换行——裁掉，否则会被原样拼进 HTTP 头（IsCleanSecret 会拒
 // 换行，用户只会看到一句"非法"而不知为何）。

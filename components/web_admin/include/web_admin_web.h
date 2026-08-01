@@ -131,7 +131,13 @@ inline const char* Html() {
         <div class="lbl"><label for="llmKey">API Key</label>
           <button class="clr" id="clrLlmKey" style="display:none">清除</button></div>
         <input id="llmKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
-        <div class="hint">留空 = 不修改。填入后与内置模型清单合并，重启生效。</div>
+        <div class="hint">留空 = 不修改。重启生效。</div>
+      </div>
+      <div class="fld">
+        <div class="lbl"><label for="llmModel">模型</label>
+          <button class="clr" id="clrLlmModel" style="display:none">清除</button></div>
+        <input id="llmModel" type="text" autocomplete="off" spellcheck="false" placeholder="如 deepseek-v4-flash">
+        <div class="hint">你要用的模型 ID，与 API Key 一起为必填。留空 = 不修改。</div>
       </div>
       <div class="fld">
         <div class="lbl"><label for="llmBase">Base URL（可选）</label>
@@ -140,7 +146,7 @@ inline const char* Html() {
         <div class="hint">兼容 OpenAI Completions 接口的自建/代理端点。留空 = 用默认。</div>
       </div>
       <details>
-        <summary>高级：整份 models JSON（换供应商 / 加模型）</summary>
+        <summary>高级：整份 models JSON（换供应商 / 精确控制模型参数）</summary>
         <div class="fld" style="margin-top:10px">
           <div class="lbl"><label for="llmJson">models JSON</label>
             <button class="clr" id="clrLlmJson" style="display:none">清除</button></div>
@@ -506,11 +512,12 @@ $("tabFiles").onclick = function(){ showTab("files", 1); };
 // 输入框留空 = 该项不修改（所以密钥永不需要回显明文）；要抹掉已存的值就点「清除」，
 // 提交时该字段以空值发出。
 var CFG_FIELDS = [
-  {id:"llmKey",  name:"llm_key",  clr:"clrLlmKey"},
-  {id:"llmBase", name:"llm_base", clr:"clrLlmBase"},
-  {id:"llmJson", name:"llm_json", clr:"clrLlmJson"},
-  {id:"volcApp", name:"volc_app", clr:"clrVolcApp"},
-  {id:"volcAk",  name:"volc_ak",  clr:"clrVolcAk"}
+  {id:"llmKey",   name:"llm_key",   clr:"clrLlmKey"},
+  {id:"llmModel", name:"llm_model", clr:"clrLlmModel"},
+  {id:"llmBase",  name:"llm_base",  clr:"clrLlmBase"},
+  {id:"llmJson",  name:"llm_json",  clr:"clrLlmJson"},
+  {id:"volcApp",  name:"volc_app",  clr:"clrVolcApp"},
+  {id:"volcAk",   name:"volc_ak",   clr:"clrVolcAk"}
 ];
 var cleared = {};
 
@@ -609,7 +616,7 @@ function renderConfig(c){
     st.textContent = "✓ 已配置 · " + how + (l.model ? " · 模型 " + l.model : "");
     st.className = "secst ok";
   } else {
-    st.textContent = "✗ 未配置 —— 填入 API Key 并重启后即可对话";
+    st.textContent = "✗ 未配置 —— 填入 API Key 与模型并重启后即可对话";
     st.className = "secst no";
   }
   var vst = $("voiceSt");
@@ -620,15 +627,17 @@ function renderConfig(c){
     vst.textContent = "✗ 未配置 —— 按住说话与朗读不可用";
     vst.className = "secst no";
   }
-  $("llmKey").placeholder  = l.key_mask ? (l.key_mask + "（已配置，留空不改）") : "sk-…";
-  $("llmBase").placeholder = l.base_url ? l.base_url : "https://api.deepseek.com";
+  $("llmKey").placeholder   = l.key_mask ? (l.key_mask + "（已配置，留空不改）") : "sk-…";
+  $("llmModel").placeholder = l.model_id ? (l.model_id + "（已配置，留空不改）") : "如 deepseek-v4-flash";
+  $("llmBase").placeholder  = l.base_url ? l.base_url : "https://api.deepseek.com";
   $("jsonHint").textContent = l.json_override
-    ? ("当前已存 " + l.json_bytes + " 字节，覆盖上面两项与内置清单。留空 = 不修改。")
-    : ("填了这个就完全覆盖上面两项与内置清单，直接交给 agent 运行时。上限 " +
+    ? ("当前已存 " + l.json_bytes + " 字节，覆盖上面三项。留空 = 不修改。")
+    : ("填了这个就完全覆盖上面三项，直接交给 agent 运行时。上限 " +
        ((c.limits && c.limits.models_json_max) || 3500) + " 字节。");
-  showClr("clrLlmKey",  !!l.key_mask);
-  showClr("clrLlmBase", !!l.base_url);
-  showClr("clrLlmJson", !!l.json_override);
+  showClr("clrLlmKey",   !!l.key_mask);
+  showClr("clrLlmModel", !!l.model_id);
+  showClr("clrLlmBase",  !!l.base_url);
+  showClr("clrLlmJson",  !!l.json_override);
   showClr("clrVolcApp", !!v.app_mask);
   showClr("clrVolcAk",  !!v.ak_mask);
   renderRadio(c.radio);
@@ -678,7 +687,7 @@ function saveConfig(then){
     .then(function(res){
       btns.forEach(function(b){ b.disabled = false; });
       if(res.s !== 200){
-        var FLD = {llm_key:"API Key", llm_base:"Base URL", llm_json:"models JSON",
+        var FLD = {llm_key:"API Key", llm_model:"模型", llm_base:"Base URL", llm_json:"models JSON",
                    volc_app:"App Key", volc_ak:"Access Key", radio_json:"电台列表（名称/地址/体积超限）"};
         toast("保存失败：" + (res.j.field ? ((FLD[res.j.field]||res.j.field) + " 内容不合法") : (res.j.error || res.s)), 1);
         return;

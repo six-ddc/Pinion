@@ -5,9 +5,12 @@
 //     maxTokens,input,reasoning,cost,compat}]}}}
 // provider 级 baseUrl/api/apiKey 是该 provider 下所有 model 的默认值。
 //
-// 常规配置模式：device_config::BuildModelsJson() 把用户在 Web 后台填的 API Key
-// （及可选的 baseUrl 覆盖）注入本模板的**第一个 provider**，产出交给 pi_models_load。
-// 想换供应商 / 加模型走后台的「高级」模式，粘一整份 JSON 存 NVS 覆盖本模板。
+// 常规配置模式：device_config::BuildModelsJson() 把用户在 Web 后台填的 API Key、
+// 模型 ID（及可选的 baseUrl 覆盖）注入本模板的**第一个 provider**——模型 ID 没有
+// 默认值，用户填什么用什么：命中下面清单的条目就把它排到第一位（agent 只用第一个
+// 模型），没命中就按第一个条目的参数克隆一条。下面的清单只是已知模型的元数据
+// （成本/上下文窗），不是"可选模型列表"。想换供应商 / 精确控制元数据走后台的
+// 「高级」模式，粘一整份 JSON 存 NVS 覆盖本模板。
 //
 // 单行（无换行）不是必需的——这份只在内存里被 cJSON 解析，不进 NVS。
 

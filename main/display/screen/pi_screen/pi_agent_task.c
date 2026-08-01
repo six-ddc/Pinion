@@ -114,7 +114,8 @@ static const pi_fs_t NVS_MODELS_FS = {.read_file = nvs_models_json_read};
 
 /* Loads the whole catalog (not pi_models_json_load_first: that convenience
  * snapshot drops model.compat, which DeepSeek needs). Picks catalog entry 0
- * (第一个 provider 的第一个模型，默认模板下 = deepseek-v4-pro)。 */
+ * (第一个 provider 的第一个模型 = 用户在后台「模型」框填的那个，device_config
+ * 合成时已把它排到第一位)。 */
 static bool load_model_catalog(void) {
     int rc = pi_models_load(&g_env, "models.json" /* ignored by the NVS fs shim */, &g_catalog);
     if (rc != PI_OK || !g_catalog) {

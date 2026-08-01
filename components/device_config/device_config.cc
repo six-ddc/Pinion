@@ -28,6 +28,7 @@ const char* KeyOf(Field f) {
     switch (f) {
         case Field::LlmApiKey: return "llm_key";
         case Field::LlmBaseUrl: return "llm_base";
+        case Field::LlmModelId: return "llm_model";
         case Field::LlmModelsJson: return "llm_json";
         case Field::VoiceAppKey: return "volc_app";
         case Field::VoiceAccessKey: return "volc_ak";
@@ -77,8 +78,35 @@ std::string NormalizeModelsJson(const std::string& raw) {
     return out;
 }
 
-// 取模板并注入 API Key（及可选 baseUrl 覆盖）到**第一个 provider**。
-std::string TemplateWithKey(const std::string& api_key, const std::string& base_url) {
+// agent 只用清单第一个模型（pi_agent_task 取 catalog[0]），所以"选模型"= 把选中项
+// 排到 models 数组第一位。模板里没有的 ID 按第一个模型的参数克隆（DeepSeek 的
+// compat/thinkingFormat 必须带上，否则流式直接失败）。
+void ApplyModelChoice(cJSON* provider, const std::string& model_id) {
+    cJSON* models = cJSON_GetObjectItem(provider, "models");
+    if (!cJSON_IsArray(models) || models->child == nullptr) return;
+    int idx = 0;
+    for (cJSON* m = models->child; m != nullptr; m = m->next, idx++) {
+        const cJSON* id = cJSON_GetObjectItem(m, "id");
+        if (cJSON_IsString(id) && model_id == id->valuestring) {
+            if (idx > 0) {
+                cJSON* picked = cJSON_DetachItemFromArray(models, idx);
+                cJSON_InsertItemInArray(models, 0, picked);
+            }
+            return;
+        }
+    }
+    cJSON* clone = cJSON_Duplicate(models->child, /*recurse=*/1);
+    if (clone == nullptr) return;
+    cJSON_DeleteItemFromObject(clone, "id");
+    cJSON_AddStringToObject(clone, "id", model_id.c_str());
+    cJSON_DeleteItemFromObject(clone, "name");
+    cJSON_AddStringToObject(clone, "name", model_id.c_str());
+    cJSON_InsertItemInArray(models, 0, clone);
+}
+
+// 取模板并注入 API Key（及可选 baseUrl / 模型 ID 覆盖）到**第一个 provider**。
+std::string TemplateWithKey(const std::string& api_key, const std::string& base_url,
+                            const std::string& model_id) {
     cJSON* root = cJSON_Parse(ModelsTemplateJson());
     if (root == nullptr) {
         ESP_LOGE(TAG, "built-in models template is not valid JSON");  // 只可能是改坏了模板
@@ -94,6 +122,7 @@ std::string TemplateWithKey(const std::string& api_key, const std::string& base_
             cJSON_DeleteItemFromObject(provider, "baseUrl");
             cJSON_AddStringToObject(provider, "baseUrl", base_url.c_str());
         }
+        if (!model_id.empty()) ApplyModelChoice(provider, model_id);
         char* min = cJSON_PrintUnformatted(root);
         if (min != nullptr) {
             out.assign(min);
@@ -245,6 +274,7 @@ bool Validate(Field f, const std::string& v) {
         case Field::LlmBaseUrl:
             if (!IsCleanSecret(v) || v.size() > kMaxBaseUrlBytes) return false;
             return v.rfind("http://", 0) == 0 || v.rfind("https://", 0) == 0;
+        case Field::LlmModelId: return IsCleanSecret(v) && v.size() <= kMaxModelIdBytes;
         case Field::LlmModelsJson: return CheckModelsJson(v, nullptr);
         case Field::RadioList: return CheckRadioJson(v, nullptr);
     }
@@ -286,7 +316,8 @@ std::string GetVoiceAppKey() { return GetRaw(Field::VoiceAppKey); }
 std::string GetVoiceAccessKey() { return GetRaw(Field::VoiceAccessKey); }
 
 bool LlmReady() {
-    return !GetRaw(Field::LlmModelsJson).empty() || !GetRaw(Field::LlmApiKey).empty();
+    if (!GetRaw(Field::LlmModelsJson).empty()) return true;
+    return !GetRaw(Field::LlmApiKey).empty() && !GetRaw(Field::LlmModelId).empty();
 }
 
 bool VoiceReady() { return !GetVoiceAppKey().empty() && !GetVoiceAccessKey().empty(); }
@@ -299,8 +330,9 @@ std::string BuildModelsJson() {
         ESP_LOGW(TAG, "stored models json is corrupt, falling back to template");
     }
     std::string key = GetRaw(Field::LlmApiKey);
-    if (key.empty()) return "";
-    return TemplateWithKey(key, GetRaw(Field::LlmBaseUrl));
+    std::string model = GetRaw(Field::LlmModelId);
+    if (key.empty() || model.empty()) return "";  // 模型无默认值：不知道用户用什么模型
+    return TemplateWithKey(key, GetRaw(Field::LlmBaseUrl), model);
 }
 
 std::string MaskSecret(const std::string& v) {
@@ -312,6 +344,7 @@ std::string MaskSecret(const std::string& v) {
 std::string StatusJson() {
     const std::string key = GetRaw(Field::LlmApiKey);
     const std::string base = GetRaw(Field::LlmBaseUrl);
+    const std::string model_id = GetRaw(Field::LlmModelId);
     const std::string json = GetRaw(Field::LlmModelsJson);
     const std::string app = GetVoiceAppKey();
     const std::string ak = GetVoiceAccessKey();
@@ -321,6 +354,7 @@ std::string StatusJson() {
     cJSON_AddBoolToObject(llm, "configured", LlmReady());
     cJSON_AddStringToObject(llm, "key_mask", MaskSecret(key).c_str());
     cJSON_AddStringToObject(llm, "base_url", base.c_str());
+    cJSON_AddStringToObject(llm, "model_id", model_id.c_str());
     cJSON_AddBoolToObject(llm, "json_override", !json.empty());
     cJSON_AddNumberToObject(llm, "json_bytes", static_cast<double>(json.size()));
     cJSON_AddStringToObject(llm, "model", FirstModelId(BuildModelsJson()).c_str());
@@ -354,6 +388,7 @@ std::string StatusJson() {
     cJSON* limits = cJSON_AddObjectToObject(root, "limits");
     cJSON_AddNumberToObject(limits, "key_max", static_cast<double>(kMaxKeyBytes));
     cJSON_AddNumberToObject(limits, "base_url_max", static_cast<double>(kMaxBaseUrlBytes));
+    cJSON_AddNumberToObject(limits, "model_max", static_cast<double>(kMaxModelIdBytes));
     cJSON_AddNumberToObject(limits, "models_json_max", static_cast<double>(kMaxModelsJsonBytes));
 
     std::string out;

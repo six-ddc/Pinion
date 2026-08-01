@@ -42,7 +42,7 @@ eth-modem). Network type is persisted in NVS `"network"/"type"` (0=WiFi, 1=4G; d
 
 ## Secrets — none are compiled in
 
-The firmware ships **without any API key**. Both the LLM config (DeepSeek API key, optional baseUrl,
+The firmware ships **without any API key**. Both the LLM config (API key + model id, optional baseUrl,
 optional whole models JSON) and the Volcengine speech keys (App Key / Access Key) live in NVS
 namespace `"cfg"` and are entered through the device's Web admin (`components/web_admin`, port 80):
 `components/device_config` is the only reader/writer. A device with nothing configured shows a QR

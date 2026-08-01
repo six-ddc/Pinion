@@ -25,6 +25,7 @@ namespace device_config {
 // NVS 单值上限 4000B。models JSON 覆盖留足余量（与 pi_card 的 ui/pin 3072B 同量级）。
 inline constexpr size_t kMaxKeyBytes = 512;
 inline constexpr size_t kMaxBaseUrlBytes = 256;
+inline constexpr size_t kMaxModelIdBytes = 128;
 inline constexpr size_t kMaxModelsJsonBytes = 3500;
 // 电台列表（JSON 数组）入库上限。默认 32 台约 3.6KB，留到 NVS 4000B 上限附近——
 // 想加更多台需删减默认台（网页有实时字节计与超限报错）。
@@ -33,6 +34,7 @@ inline constexpr size_t kMaxRadioJsonBytes = 3960;
 enum class Field {
     LlmApiKey,       // 大模型 API Key
     LlmBaseUrl,      // 可选：覆盖模板里的 baseUrl（须 http(s)://）
+    LlmModelId,      // 可选：默认模型 ID（agent 用清单第一个模型，此项把它排到第一）
     LlmModelsJson,   // 可选：整份 models JSON，覆盖内置模板（高级模式）
     VoiceAppKey,     // 火山语音 App Key
     VoiceAccessKey,  // 火山语音 Access Key
@@ -61,11 +63,13 @@ bool Set(Field f, const std::string& v);
 std::string GetVoiceAppKey();
 std::string GetVoiceAccessKey();
 
-bool LlmReady();    // 有整份 JSON 覆盖，或有 API Key
+bool LlmReady();    // 有整份 JSON 覆盖，或 API Key + 模型 ID 都已填（模型无内置默认）
 bool VoiceReady();  // 两个火山密钥都非空
 
 // 合成交给 pi-c 的 models JSON（单行）。优先整份覆盖；否则内置模板注入 API Key /
-// baseUrl。未配置 → 空串。覆盖串解析失败只告警并回落模板路径（坏配置不能卡开机）。
+// baseUrl，并按 LlmModelId 把选中模型排到第一位（模板里没有的 ID 则按第一个模型的
+// 参数克隆出新条目）。未配置 → 空串。覆盖串解析失败只告警并回落模板路径（坏配置
+// 不能卡开机）。
 std::string BuildModelsJson();
 
 // 运行时生效的网络电台列表：NVS "radio_json" 有合法覆盖则解析它，否则回落内置种子
