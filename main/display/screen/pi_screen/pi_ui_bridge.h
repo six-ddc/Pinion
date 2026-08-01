@@ -90,6 +90,12 @@ bool pi_agent_task_is_running(void);
    裸 volc_tts_stop()——否则 TTS pump 会继续念缓冲里的旧文本。 */
 void pi_agent_task_tts_cancel(void);
 
+/* TTS 是否还有活没干完：开关开着，且（待喂文本未排空 / pump 正在喂 / volc 会话
+   在播或排空中）三者任一。UI 用它在 UI_DONE 后决定 STOP 按钮是否续命——LLM 流
+   结束了但余音还在播时短按仍是"停"。非阻塞（只短暂拿 g_tts_lock），LVGL 线程
+   定时器轮询用。 */
+bool pi_agent_task_tts_active(void);
+
 /* TTS 朗读文本的生命周期由 UI 侧驱动（UI 侧才有 markdown 解析上下文，能把回复剥
    成纯文本再喂，使朗读内容 == 屏幕显示内容）。三者都非阻塞（会阻塞的 volc_tts
    调用在内部 pump 任务上执行），从 LVGL 线程调用即可：

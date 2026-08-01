@@ -58,6 +58,7 @@ constexpr int64_t kVoiceHangoverMs = 1000;  // typing pause that reads as VAD si
 
 std::mutex g_tts_mu;
 bool g_tts_open = false;
+bool g_tts_draining = false;  // speak_end 后延迟 on_finished 的"余音在播"窗口
 std::string g_tts_text;
 pid_t g_say_pid = -1;
 volc_tts_callbacks_t g_tts_cbs{};
@@ -188,6 +189,7 @@ esp_err_t volc_tts_speak_begin(const volc_tts_callbacks_t* cbs) {
     std::lock_guard<std::mutex> lk(g_tts_mu);
     if (g_tts_open) return ESP_ERR_INVALID_STATE;
     g_tts_open = true;
+    g_tts_draining = false;  // 新会话顶掉旧余音窗口（旧延迟线程 gen 不匹配不会再清）
     g_tts_text.clear();
     g_tts_cbs = (cbs != nullptr) ? *cbs : volc_tts_callbacks_t{};
     g_tts_audio_started = false;
@@ -224,6 +226,9 @@ esp_err_t volc_tts_speak_end(void) {
         text = g_tts_text;
         cbs = g_tts_cbs;
         my_gen = g_tts_session_gen;
+        // 与 g_tts_open=false 同锁段置位：分开写会给 is_speaking 留"两者皆 false"
+        // 的空窗，真机 volc_tts.cc 的 SESSION_FINISHED 同理（先 pending 后 active）。
+        if (cbs.on_finished != nullptr) g_tts_draining = true;
     }
     if (!text.empty()) {
         fprintf(stderr, "[sim][TTS] %s\n", text.c_str());
@@ -245,6 +250,7 @@ esp_err_t volc_tts_speak_end(void) {
             {
                 std::lock_guard<std::mutex> lk(g_tts_mu);
                 if (g_tts_session_gen != my_gen) return;  // 已被新会话/stop 顶掉
+                g_tts_draining = false;
             }
             cbs.on_finished(cbs.ctx);
         }).detach();
@@ -260,12 +266,16 @@ esp_err_t volc_tts_wait_done(uint32_t timeout_ms) {
 void volc_tts_stop(void) {
     std::lock_guard<std::mutex> lk(g_tts_mu);
     g_tts_open = false;
+    g_tts_draining = false;
     g_tts_text.clear();
     g_tts_session_gen++;  // 让任何在途的 on_finished 延迟线程放弃（会话已被打断收尾）
     SayKillLocked();
 }
 
-bool volc_tts_is_speaking(void) { return false; }
+bool volc_tts_is_speaking(void) {
+    std::lock_guard<std::mutex> lk(g_tts_mu);
+    return g_tts_open || g_tts_draining;
+}
 
 void volc_tts_shutdown(void) { volc_tts_stop(); }
 

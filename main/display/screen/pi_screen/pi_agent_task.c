@@ -197,6 +197,9 @@ static size_t g_tts_pending_cap = 0;
 static uint32_t g_tts_run_gen = 0;      /* 每个新 run 与每次 cancel 都 ++ */
 static bool g_tts_run_ended = false;    /* 当前 gen 是否已 AGENT_END */
 static bool g_tts_overflow_warned = false; /* 每 run 只告警一次溢出 */
+/* pump 正拿着一段文本在喂（含 speak_begin 的 WSS 握手窗口——那段时间
+ * volc_tts_is_speaking() 还是 false，靠它补上，见 pi_agent_task_tts_active）。 */
+static volatile bool g_tts_pump_busy = false;
 
 static void tts_cancel_run(void);
 
@@ -362,6 +365,7 @@ static void tts_pump(void *arg) {
             g_tts_pending_cap = 0;
             g_tts_pending_len = 0;
         }
+        g_tts_pump_busy = (chunk != NULL);
         xSemaphoreGive(g_tts_lock);
 
         /* 代次变化（新 run 或被 cancel）：放弃旧会话本地态；旧会话由 cancel 的
@@ -407,6 +411,7 @@ static void tts_pump(void *arg) {
             if (session_open) volc_tts_feed_text(chunk); /* 阻塞点落在 pump，不碰读循环 */
         }
         free(chunk);
+        g_tts_pump_busy = false;
 
         /* 收尾：本 run 已结束且缓冲排空、代次未变 → FinishSession，余音继续播完。
          * 在锁下复查（feed_text 阻塞期间可能又来了新 delta 或发生了 cancel）。 */
@@ -971,6 +976,18 @@ void pi_agent_task_inject(const char *text) {
 }
 
 void pi_agent_task_tts_cancel(void) { tts_cancel_run(); }
+
+bool pi_agent_task_tts_active(void) {
+    if (!g_tts_enabled) return false;
+    if (g_tts_pump_busy || volc_tts_is_speaking()) return true;
+    bool pending = false;
+    if (g_tts_lock) {
+        xSemaphoreTake(g_tts_lock, portMAX_DELAY);
+        pending = g_tts_pending_len > 0;
+        xSemaphoreGive(g_tts_lock);
+    }
+    return pending;
+}
 
 bool pi_agent_task_tts_take_cut(void) {
     bool v = g_tts_cut_pending;

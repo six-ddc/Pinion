@@ -381,8 +381,11 @@ static void tts_handle_frame(TtsState* s, const uint8_t* data, size_t len) {
             break;
         case VOLC_EVT_SESSION_FINISHED:
             ESP_LOGI(TAG, "session finished");
-            s->session_active = false;
+            // 先置 pending_finish 再清 session_active：反过来写会给并发的
+            // volc_tts_is_speaking() 留一个两者皆 false 的空窗（UI 在 UI_DONE
+            // 采样它决定 STOP 按钮是否续命，采到空窗会误判"已播完"）。
             s->pending_finish = true;
+            s->session_active = false;
             xEventGroupSetBits(s->eg, BIT_SESS_FINISHED);
             // 音频帧先于本事件到达（同一 socket 顺序），此刻 audio_rb 里才是
             // 完整音频。交给搬运任务在 audio_rb 排空后再挂 OnPlaybackDrained，

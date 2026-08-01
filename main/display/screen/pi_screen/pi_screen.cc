@@ -252,6 +252,7 @@ lv_timer_t* s_tool_running_timer = nullptr;
 lv_timer_t* s_cursor_blink_timer = nullptr;
 lv_timer_t* s_drain_timer = nullptr;
 lv_timer_t* s_pickup_timer = nullptr;  // P4-b 拿起唤醒：息屏时轮询 imu 检测运动
+lv_timer_t* s_tts_tail_timer = nullptr;  // UI_DONE 后余音未播完：轮询 TTS 排空再把 STOP 切回 TALK
 
 // P4-b 拿起唤醒：仅在息屏（非 Awake）时看加速度计，检测到明显运动即像 PWR_KEY 一样唤醒。
 // imu 未焊/未采到（GetSnapshot 返回 false）时空转，绝不误唤醒（优雅降级）。阈值需真机整定。
@@ -1601,6 +1602,45 @@ void OnPttReleased(lv_event_t* e) {
     s_ptt_cancel_armed = false;
 }
 
+void ShowTalkBtn();  // 定义在 BuildDock 之后
+
+void StopTtsTailWait() {
+    if (s_tts_tail_timer != nullptr) {
+        lv_timer_delete(s_tts_tail_timer);
+        s_tts_tail_timer = nullptr;
+    }
+}
+
+// UI_DONE 后余音未播完（TTS 尾播窗口）：保住 STOP 按钮，轮询到 TTS 排空/被打断
+// 再切回 TALK。新一轮已开跑（s_agent_busy）时按钮归回合状态机管，本 timer 退位。
+void StartTtsTailWait() {
+    StopTtsTailWait();
+    s_tts_tail_timer = lv_timer_create(
+        [](lv_timer_t*) {
+            if (s_agent_busy) {
+                StopTtsTailWait();
+                return;
+            }
+            if (!pi_agent_task_tts_active()) {
+                StopTtsTailWait();
+                ShowTalkBtn();
+            }
+        },
+        250, nullptr);
+}
+
+// STOP 的两段语义（dock 按钮点击与 PWR_KEY 短按共用）：生成中 = 打断 LLM
+//（abort 内部顺带停 TTS）；生成已完但余音在播 = 只停播报，立即切回 TALK。
+void OnStopAction() {
+    if (s_agent_busy) {
+        pi_agent_task_abort();
+        return;
+    }
+    pi_agent_task_tts_cancel();
+    StopTtsTailWait();
+    ShowTalkBtn();
+}
+
 void BuildDock(lv_obj_t* parent) {
     lv_obj_t* dock = lv_obj_create(parent);
     screen_strip_obj_chrome(dock);
@@ -1669,7 +1709,7 @@ void BuildDock(lv_obj_t* parent) {
     SetLabelFont(stop_lbl, &font_puhui_24_4, Tok::Tx);
     lv_obj_set_style_text_letter_space(stop_lbl, 1, LV_PART_MAIN);
     lv_obj_add_event_cb(
-        s_stop_btn, [](lv_event_t*) { pi_agent_task_abort(); }, LV_EVENT_CLICKED, nullptr);
+        s_stop_btn, [](lv_event_t*) { OnStopAction(); }, LV_EVENT_CLICKED, nullptr);
 
     // TALK button (post-done): press-and-hold re-enters listen, same as the
     // idle screen's PTT gesture.
@@ -2359,7 +2399,12 @@ void DrainQueueTick(lv_timer_t*) {
                 // no-op（gen 已前进或 state 已是 Playing）。
                 pi_media_focus_turn_ended();
                 s_agent_busy = false;
-                ShowTalkBtn();
+                // 余音在播（TTS 尾播窗口）：STOP 续命，短按=停播；排空后 timer 自动切 TALK。
+                if (pi_agent_task_tts_active()) {
+                    StartTtsTailWait();
+                } else {
+                    ShowTalkBtn();
+                }
                 s_zen_turn_done = true;
                 StopBreath(s_act_dot);
                 pi_theme::ApplyBg(s_act_dot, Tok::Ok);
@@ -2950,6 +2995,7 @@ void NewSession() {
     if (s_state == ViewState::Listen)
         CancelListen();
     pi_agent_task_new_session();
+    StopTtsTailWait();  // 新会话已停播，尾播窗口作废
     ClearFeed();
     ResetTurnState();
     ApplyCtxUnknown();
@@ -3354,12 +3400,14 @@ void OnKeyPressAsync(void*) {
         return;
     }
     // 生成中按下即打断（轻触，无需按住）；随后的 hold/release 作废。
-    if (s_state == ViewState::Chat && s_stop_btn != nullptr &&
-        !lv_obj_has_flag(s_stop_btn, LV_OBJ_FLAG_HIDDEN)) {
+    if (s_state == ViewState::Chat && s_agent_busy) {
         pi_agent_task_abort();
         s_key_ignore_until_release = true;
         return;
     }
+    // TTS 尾播窗口（LLM 已完、余音在播、STOP 仍在）：按下先不动作——按住达阈值走
+    // OnKeyHoldAsync 进聆听（VoiceCmd::Start 自带 barge-in 停播 = 新一轮说话），
+    // 快速短按在 OnKeyReleaseAsync 里停播。
     // 其余情况：不在按下时进聆听——等 OnKeyHoldAsync 的按住判定，快速单击无反应。
 }
 
@@ -3376,6 +3424,13 @@ void OnKeyHoldAsync(void*) {
 void OnKeyReleaseAsync(void*) {
     if (s_state == ViewState::Listen && s_listen_owner == ListenOwner::Key) {
         FinishListenSend();  // 松开发送（本次聆听是键触发的）
+    } else if (!s_key_ignore_until_release && s_state == ViewState::Chat && !s_agent_busy &&
+               s_stop_btn != nullptr && !lv_obj_has_flag(s_stop_btn, LV_OBJ_FLAG_HIDDEN)) {
+        // TTS 尾播窗口的快速短按（未达按住阈值）：结束播放。仍置 finish_pending：
+        // 万一 hold 事件已越阈值只是 async 迟到（极端调度），迟到的 StartListen
+        // 会被它立即收掉，不留一个没人按着的悬空聆听。
+        OnStopAction();
+        s_key_finish_pending = true;
     } else if (s_listen_owner != ListenOwner::Key && !s_key_ignore_until_release) {
         // 聆听尚未起来（hold async 还没执行）：标记待收，OnKeyHoldAsync 消费。
         s_key_finish_pending = true;
@@ -3430,6 +3485,7 @@ void OnScreenUnloaded(lv_event_t*) {
     }
     if (s_drain_timer != nullptr) { lv_timer_delete(s_drain_timer); s_drain_timer = nullptr; }
     if (s_pickup_timer != nullptr) { lv_timer_delete(s_pickup_timer); s_pickup_timer = nullptr; }
+    StopTtsTailWait();
 
     // Drain and free anything still in flight so agent-thread mallocs never
     // leak just because the screen went away mid-turn.
