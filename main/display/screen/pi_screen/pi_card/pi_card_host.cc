@@ -240,8 +240,8 @@ void Init() {
     DataHub::Instance().RegisterBuiltins();
     CommandRegistry::Instance().RegisterBuiltins();
     pi_card_stock::RegisterBindProvider();  // stock.<symbol>.<field> 动态绑定（Phase4）
-    pi_card_media::RegisterDataPaths();     // media.* 播放态路径（Stage B）
-    pi_card_media::RegisterCommands();      // media.* invoke 命令（Stage B）
+    // media.* 数据路径/invoke 命令已随媒体卡一起删除：播控 UI 只走内置播放器
+    //（Now-Playing 页 + dock 迷你条），LLM 侧不再渲染任何播放器卡片（拦截见 OnRenderEvent）。
 }
 
 void SetFeedHooks(const FeedHooks& hooks) { s_feed = hooks; }
@@ -355,8 +355,18 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
     // 媒体卡兜底：LLM 渲控件卡时常忘把 play 返回的 tracks 复制进 data，list 会空渲成占位
     // 白块。设备侧直接从 MediaController 补齐（与全屏抽屉同源），数据永远真实。
     pi_card_media::MaybeFillTracks(root, card->data);
-    // 媒体卡标记：聊天流里同类只保留最新一张（渲染成功后关旧卡，见下）。
-    card->is_media = pi_card_media::SpecUsesMedia(root);
+    // 媒体卡不存在了：播控 UI 只走内置播放器（Now-Playing 页 + dock 迷你条），LLM 渲染
+    // 播放器卡片没有意义（重复入口 + 1Hz 实时绑定刷新的重绘负载）。工具 desc 与 play 结果
+    // hint 已不再引导画卡，这里是防 LLM 不听话的最后闸门（media.* 路径/命令也已注销，
+    // 即便漏拦也只会渲出空绑定）。
+    if (pi_card_media::SpecUsesMedia(root)) {
+        ESP_LOGW(TAG, "media card blocked (built-in player only)");
+        ReportAsyncError(
+            "播放器卡片不可用：设备内置播放器界面会自动出现，请勿渲染任何 media.* 卡片，"
+            "也不要重试；用文字确认播放状态即可");
+        cJSON_Delete(root);
+        return;
+    }
 
     lv_obj_t* delete_root = nullptr;
     lv_obj_t* render_parent = nullptr;
@@ -464,15 +474,6 @@ void OnRenderEvent(const char* spec_json, const char* card_id, int display_mode,
         // 像全新卡片一样往上滑一截，那样反而显得预览白长了。
         bool adopted = s_feed.last_row_adopted && s_feed.last_row_adopted();
         PlayCardEntrance(tree, adopted);
-        // 媒体控件卡全局唯一：新卡渲染成功即静默关掉聊天流里其它媒体卡（旧控件停留无意义，
-        // 且堆积会把 feed 撑满）。async 删除，清理统一走 OnRootDeleted；overlay/pin 不参与。
-        if (card->is_media) {
-            for (auto& [cid, other] : s_cards) {
-                if (other->is_media && other->display == Display::Chat && other->root) {
-                    lv_obj_delete_async(other->root);
-                }
-            }
-        }
     }
 
     s_last_id = id;

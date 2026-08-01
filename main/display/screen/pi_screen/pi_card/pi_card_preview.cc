@@ -7,6 +7,7 @@
 
 #include "cJSON.h"
 #include "pi_card_host.h"
+#include "pi_card_media.h"  // SpecUsesMedia：媒体卡实验屏蔽，预览期即拦
 #include "pi_card_preview_sig.h"
 #include "pi_card_render.h"
 #include "pi_card_solver.h"
@@ -96,6 +97,17 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     if (!cJSON_IsArray(root_spec)) {
         cJSON_Delete(snap);
         return;  // v2：root 是 grid 块数组，还没吐出来（或压根不是数组）时安静等下一帧
+    }
+
+    // 播放器卡片已整体删除（播控只走内置播放器 UI，见 pi_card_host 的正式渲染拦截）：
+    // spec 一旦出现 media.* 即整场放弃预览——媒体卡的重绘负载正是发生在流式预览期，只拦
+    // 正式渲染等于没拦。partial parser 只补全字符串值不发明内容，"media." 前缀一旦出现
+    // 不会回退，永久 disqualify 是安全的。
+    if (pi_card_media::SpecUsesMedia(root_spec)) {
+        s_preview.disqualified = true;
+        if (s_preview.active) PreviewTeardownInternal();
+        cJSON_Delete(snap);
+        return;
     }
 
     if (!s_preview.active) {

@@ -30,6 +30,7 @@
 #include "metalio_hal/network.h"       // 电台续播的联网判定
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
+#include "pi_media_focus.h"            // X 停播须同步作废排队中的起播意图
 #include "pi_theme.h"
 #include "pi_ui_bridge.h"              // pi_agent_task_note：关闭播放器静默告知模型
 #include "screen_util.h"
@@ -220,6 +221,7 @@ struct InlineBar {
     bool shown = false;          // 当前实际可见（用于淡入触发一次）
     int cache_state = -1;
     std::string cache_line;
+    int32_t cache_prog_w = -1;   // 已应用的进度线宽；lv_obj_set_width 同值也会标脏父链
 };
 std::vector<InlineBar> s_bars;
 bool s_mini_ctx = true;  // 屏幕级实例是否允许显示（Go 设置；仅 Idle 为 true）
@@ -229,7 +231,23 @@ constexpr int32_t kInlineGlyph = 22; // play/pause 图元边长
 
 lv_timer_t* s_timer = nullptr;
 
-void OnInlineToggle(lv_event_t*) { MediaController::Instance().Toggle(); }
+// 播放键共享语义（迷你条 + Now-Playing 页）：LLM 回合中排队的起播意图在场时，用户按播放
+// =「别等了现在就放」，直接播点名那首——Toggle 的 Stopped 分支只会从 index 0 起播，不是
+// 用户要的那首。哨兵（resume/next/prev）取走后落回 Toggle 即等效；Playing 态是暂停语义，
+// 不消费意图（意图由回合结束裁决）。原先挂在媒体卡 media.toggle 命令上，卡片删除后挪到这里。
+void ToggleConsumingQueuedIntent() {
+    MediaController& mc = MediaController::Instance();
+    if (mc.state() != MediaState::Playing) {
+        int pending = pi_media_focus_take_queued_play();
+        if (pending >= 0) {
+            mc.PlayIndex(pending);
+            return;
+        }
+    }
+    mc.Toggle();
+}
+
+void OnInlineToggle(lv_event_t*) { ToggleConsumingQueuedIntent(); }
 void OnInlineBody(lv_event_t*) { pi_media::Open(); }
 
 // play/pause 图元：clear host 后按 playing 重建（play=填充三角，pause=双竖条）。
@@ -365,7 +383,11 @@ void RefreshInline() {
         }
         // 行宽随宿主布局而变（dock 列 flex / Idle 定宽），每 tick 现取
         int32_t w = lv_obj_get_width(b.root);
-        lv_obj_set_width(b.prog, (pct < 0 || w <= 0) ? 0 : w * pct / 100);
+        int32_t prog_w = (pct < 0 || w <= 0) ? 0 : w * pct / 100;
+        if (prog_w != b.cache_prog_w) {
+            b.cache_prog_w = prog_w;
+            lv_obj_set_width(b.prog, prog_w);
+        }
     }
 }
 
@@ -1276,6 +1298,9 @@ void OnBackBtn(lv_event_t*) { pi_media::Back(); }
 // "nothing playing"。
 void OnStopBtn(lv_event_t*) {
     MediaItem cur = MediaController::Instance().current();
+    // 回合中 LLM 可能排了新的起播意图——用户此刻叉掉播放器＝"都别放了"，一并作废，
+    // 否则回合结束意图落地，音乐在用户刚关完播放器后反而响起。
+    pi_media_focus_clear_queued_play();
     MediaController::Instance().Stop();
     pi_media::Close();
     std::string note = "「播放器」用户手动关闭了播放器，停止播放";
@@ -1285,7 +1310,7 @@ void OnStopBtn(lv_event_t*) {
 }
 void OnPrev(lv_event_t*) { MediaController::Instance().Prev(); }
 void OnNext(lv_event_t*) { MediaController::Instance().Next(); }
-void OnPlay(lv_event_t*) { MediaController::Instance().Toggle(); }
+void OnPlay(lv_event_t*) { ToggleConsumingQueuedIntent(); }
 
 // 音量条（任务C）：拖动即时生效，NVS 持久化收敛到松手 + 拖动中按 kVolApplyGapMs
 // 节流（mhal::audio::SetVolume 内部永远持久化，语义同快捷面板 VOL 滑条）。

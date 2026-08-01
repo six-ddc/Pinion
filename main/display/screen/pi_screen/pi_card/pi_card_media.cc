@@ -17,9 +17,9 @@
 #include "media_player/media_player.h"
 #include "metalio_hal/storage.h"
 
-#include "pi_card_cmd.h"
-#include "pi_card_data.h"
 #include "pi_media.h"
+#include "pi_media_focus.h"  // 回合中起播排队（TTS 优先）
+#include "pi_ui_bridge.h"    // pi_agent_task_is_running / pi_agent_tts_enabled
 
 namespace {
 
@@ -210,14 +210,30 @@ char* RunRadio(const cJSON* args, bool* is_error) {
 char* BuildPlayResult(bool* is_error, const std::vector<MediaItem>& items, int start,
                       const char* kind) {
     MediaController& mc = MediaController::Instance();
-    mc.StagePlaylist(items, start);  // 后台线程起播；本调用即返回
+    // 回合进行中且 TTS 开着：不立即起播——起播的 FlushPlayback 会清掉已缓冲的 TTS 并
+    // 推进播放代次，把正在/即将播报的回复掐成整段无声。改为只暂存列表，把起播意图排给
+    // pi_media_focus，播报排空后（tts_ended/turn_ended 的去抖检查）自动开播。TTS 关闭时
+    // 没有可保护的播报，立即起播才是对的（否则平白等到回合结束）。
+    const bool queued = pi_agent_task_is_running() && pi_agent_tts_enabled();
+    if (queued) {
+        mc.StagePlaylist(items, -1);  // start<0：只暂存列表，不 Teardown/不 Flush/不起播
+        pi_media_focus_queue_play(start);
+    } else {
+        mc.StagePlaylist(items, start);  // 后台线程起播；本调用即返回
+    }
 
     cJSON* out = cJSON_CreateObject();
     cJSON_AddBoolToObject(out, "ok", true);
     cJSON_AddStringToObject(out, "kind", kind);
     cJSON_AddNumberToObject(out, "count", static_cast<double>(items.size()));
     cJSON_AddNumberToObject(out, "index", start);
-    cJSON_AddStringToObject(out, "state", StateName(mc.state()));  // 多半是 loading，异步转 playing
+    cJSON_AddStringToObject(out, "state", queued ? "queued" : StateName(mc.state()));
+    if (queued) {
+        cJSON_AddBoolToObject(out, "queued", true);
+        cJSON_AddStringToObject(out, "note",
+                                "playback auto-starts right after your spoken reply finishes — phrase "
+                                "it as about to play, not already playing");
+    }
     if (start >= 0 && start < static_cast<int>(items.size())) {
         cJSON_AddStringToObject(out, "title", items[start].title.c_str());
         cJSON_AddStringToObject(out, "subtitle", items[start].subtitle.c_str());
@@ -230,10 +246,12 @@ char* BuildPlayResult(bool* is_error, const std::vector<MediaItem>& items, int s
         cJSON_AddStringToObject(o, "subtitle", it.subtitle.c_str());
         cJSON_AddItemToArray(tracks, o);
     }
+    // 播放器卡片已整体删除（设备内置播放器 UI 自动出现），明确告知别渲染卡片、别引用
+    // media.* 路径（渲染层同步硬拦，见 pi_card_host / pi_card_preview）。
     cJSON_AddStringToObject(out, "hint",
-                            "now render a control card with ui_render (bind media.title/media.state/"
-                            "media.progress_pct; list rows set media.play_index; buttons "
-                            "{icon:'skip-back'|'play'|'skip-forward'} invoke media.prev/toggle/next)");
+                            "the device's built-in player UI is already showing — do NOT ui_render "
+                            "any media/player card and do NOT reference media.* paths; just confirm "
+                            "in text");
     char* printed = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     if (printed == nullptr) return Fail(is_error, "OOM");
@@ -309,7 +327,7 @@ char* RunPlay(const cJSON* args, bool* is_error) {
 }
 
 // control：语音里的"暂停/继续/下一首/上一首/停/打开播放页"直接落地，不走 search+play 接力。
-// toggle/next/prev/stop 直接转发 MediaController（同 RegisterCommands 里的 invoke 命令）；
+// toggle/next/prev/stop 直接转发 MediaController；
 // pause/resume 该控制器没有独立方法，只有 Toggle（Playing<->Paused），故按当前状态判断
 // 幂等语义：已是目标态就什么都不做（成功返回原状态），否则调 Toggle。open 不受 Stopped
 // 门槛限制（全屏播放页任何时候都能开，Stage C 语义）；其余 action 在 Stopped/Error（无东西
@@ -332,10 +350,46 @@ char* RunControl(const cJSON* args, bool* is_error) {
         return printed != nullptr ? printed : Fail(is_error, "OOM");
     }
 
+    // stop/pause 先作废排队中的起播意图——必须在下面的 Stopped 早退**之前**做：意图
+    // 排队期间 state 就是 Stopped，"叫停"若只落进 nothing-playing 分支，音乐会在回合
+    // 结束时反而响起。
+    if (std::strcmp(action, "stop") == 0 || std::strcmp(action, "pause") == 0) {
+        pi_media_focus_clear_queued_play();
+    }
+
     MediaState st = mc.state();
     if (st == MediaState::Stopped || st == MediaState::Error) {
         *is_error = true;
         return DupString("{\"error\":\"nothing playing\"}");
+    }
+
+    // 回合中且 TTS 开着：会**起播/换曲**的动作（resume/next/prev、等效 resume 的
+    // toggle-on-Paused）不立即执行——它们都经 StartPump 的 FlushPlayback，立即执行会把
+    // 正在播报的 TTS 掐成无声（"好的，下一首"话音未落）。排给 pi_media_focus，播报排空
+    // 后执行。pause/stop 保持立即：挂起态无泵，Teardown 早退不 Flush，对 TTS 无害。
+    if (pi_agent_task_is_running() && pi_agent_tts_enabled()) {
+        int defer = -1;
+        if (std::strcmp(action, "next") == 0) {
+            defer = PI_MEDIA_QUEUE_NEXT;
+        } else if (std::strcmp(action, "prev") == 0) {
+            defer = PI_MEDIA_QUEUE_PREV;
+        } else if (st == MediaState::Paused && (std::strcmp(action, "resume") == 0 ||
+                                                std::strcmp(action, "toggle") == 0)) {
+            defer = PI_MEDIA_QUEUE_RESUME;
+        }
+        if (defer != -1) {
+            pi_media_focus_queue_play(defer);
+            cJSON* out = cJSON_CreateObject();
+            cJSON_AddBoolToObject(out, "ok", true);
+            cJSON_AddBoolToObject(out, "queued", true);
+            cJSON_AddStringToObject(out, "state", "queued");
+            cJSON_AddStringToObject(out, "note",
+                                    "applies right after your spoken reply finishes — announce as "
+                                    "upcoming, not done");
+            char* printed = cJSON_PrintUnformatted(out);
+            cJSON_Delete(out);
+            return printed != nullptr ? printed : Fail(is_error, "OOM");
+        }
     }
 
     if (std::strcmp(action, "toggle") == 0) {
@@ -379,85 +433,12 @@ extern "C" char* pi_media_tool_run(const cJSON* args, bool* is_error) {
     return Fail(is_error, "unknown mode (use 'search' | 'radio' | 'play' | 'control')");
 }
 
-// ---------------------------------------------------------------------------
-// media.* DataHub 路径 + invoke 命令（LVGL 线程，Create 期）。MediaController 快照读全部
-// 加锁拷贝、非阻塞、任意线程安全 → getter 既供 Acquire 首帧种子，也供 1Hz PublishLive 刷新
-// （只读路径），无需自建 timer / SetOnState 编组。
-// ---------------------------------------------------------------------------
 namespace pi_card_media {
 
-void RegisterDataPaths() {
-    static bool done = false;  // Init() 会被多处调用；DataHub::Register 本就幂等，这里只省日志噪音
-    if (done) return;
-    done = true;
-    using pi_card::DataHub;
-    using pi_card::HubType;
-    using pi_card::HubValue;
-    using pi_card::WorkerRead;
-    auto& hub = DataHub::Instance();
-    auto& mc = MediaController::Instance();
-
-    hub.Register("media.state", HubType::String,
-                 [&mc]() -> HubValue { return std::string(StateName(mc.state())); }, nullptr,
-                 WorkerRead::Safe);
-    hub.Register("media.title", HubType::String,
-                 [&mc]() -> HubValue { return mc.current().title; }, nullptr, WorkerRead::Safe);
-    hub.Register("media.subtitle", HubType::String,
-                 [&mc]() -> HubValue { return mc.current().subtitle; }, nullptr, WorkerRead::Safe);
-    hub.Register("media.position_s", HubType::Int,
-                 [&mc]() -> HubValue { return mc.position_s(); }, nullptr, WorkerRead::Safe);
-    hub.Register("media.duration_s", HubType::Int,
-                 [&mc]() -> HubValue { return mc.duration_s(); }, nullptr, WorkerRead::Safe);
-    hub.Register("media.progress_pct", HubType::Int,
-                 [&mc]() -> HubValue {
-                     int dur = mc.duration_s();
-                     if (dur <= 0) return 0;  // 未知/直播：恒 0
-                     int pct = mc.position_s() * 100 / dur;
-                     return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
-                 },
-                 nullptr, WorkerRead::Safe, 0, 100);
-    hub.Register("media.playing", HubType::Bool,
-                 [&mc]() -> HubValue { return mc.state() == MediaState::Playing; }, nullptr,
-                 WorkerRead::Safe);
-    hub.Register("media.index", HubType::Int, [&mc]() -> HubValue { return mc.index(); }, nullptr,
-                 WorkerRead::Safe);
-
-    // 可写：跳到指定曲目。getter 回读当前索引，setter 调 PlayIndex（越界由 controller 忽略）。
-    // 量程 0-99：让它进入 ui_render 的「可写路径」清单（可被 list 行 set 引用/被发现），
-    // 钳制无害——播放列表本就 ≤50 曲。
-    hub.Register("media.play_index", HubType::Int, [&mc]() -> HubValue { return mc.index(); },
-                 [&mc](const HubValue& v) { mc.PlayIndex(std::get<int>(v)); }, WorkerRead::Safe, 0,
-                 99);
-
-    ESP_LOGI(TAG, "media.* data paths registered");
-}
-
-void RegisterCommands() {
-    static bool done = false;  // 同上：CommandRegistry::Register 幂等，这里只省日志噪音
-    if (done) return;
-    done = true;
-    using pi_card::CmdLevel;
-    using pi_card::CommandRegistry;
-    auto& reg = CommandRegistry::Instance();
-    auto& mc = MediaController::Instance();
-
-    // 预算超标后精简 desc 措辞（命令语义不变，只删口水词：full=true 的 COMMANDS 子句才含
-    // desc，false 变体只列名，故这里的每字节都进了 ui_render DESC 的预算）。
-    reg.Register("media.toggle", "play/pause", CmdLevel::Safe, [&mc]() { mc.Toggle(); });
-    reg.Register("media.next", "next", CmdLevel::Safe, [&mc]() { mc.Next(); });
-    reg.Register("media.prev", "prev", CmdLevel::Safe, [&mc]() { mc.Prev(); });
-    reg.Register("media.stop", "stop playback", CmdLevel::Safe, [&mc]() { mc.Stop(); });
-    // media.open：推出全屏 Now-Playing 页（Stage C）。invoke 在 LVGL 线程执行，直接调
-    // pi_media::Open()（用 CreateMiniBar 记住的 parent，重复调用 no-op）。
-    reg.Register("media.open", "open full-screen player", CmdLevel::Safe,
-                 []() { pi_media::Open(); });
-
-    ESP_LOGI(TAG, "media.* invoke commands registered");
-}
-
-// 递归扫 spec：任意字符串值以 "media." 开头即视为媒体卡（bind:'media.title'、
-// invoke:'media.toggle'、action path:'media.play_index' 全覆盖；误报只可能来自
-// LLM 写的字面文案恰好以 media. 开头，可接受）。
+// 递归扫 spec：任意字符串值以 "media." 开头即视为媒体卡。media.* 数据路径/invoke 命令
+// 已随媒体卡整体删除（播控只走内置播放器 UI），此扫描只剩一个用途：pi_card_host /
+// pi_card_preview 在渲染与流式预览两级拦掉 LLM 不听话画出的播放器卡。误报只可能来自
+// LLM 写的字面文案恰好以 media. 开头，可接受。
 bool SpecUsesMedia(const cJSON* node) {
     if (node == nullptr) return false;
     if (cJSON_IsString(node)) {

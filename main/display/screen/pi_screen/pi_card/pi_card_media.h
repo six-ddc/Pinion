@@ -34,13 +34,13 @@ char *pi_media_tool_run(const cJSON *args, bool *is_error);
     "lists built-in CN stations -> {stations:[{index,name,genre}]} (query filters); mode:'play' "     \
     "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int,...] (from " \
     "radio list; pass several stations, requested one first, so next/prev can switch channels) -> "   \
-    "now-playing snapshot. After play succeeds, ui_render a control card: label "                     \
-    "bind:'media.title'/'media.state', bar bind:'media.progress_pct', buttons "                        \
-    "{icon:'skip-back'|'play'|'skip-forward'} invoke media.prev/toggle/next, list bind_data:"          \
-    "'tracks' rows {do:'set',path:'media.play_index',value:'{i}'}. "                                   \
+    "now-playing snapshot; during a spoken reply play/resume/next/prev are queued (result "           \
+    "queued:true) and auto-apply when speech ends — announce as upcoming, not done. The device "      \
+    "shows its own player UI automatically — never ui_render a media/player card and never "          \
+    "reference media.* paths in a card. "                                                              \
     "mode:'control' with action runs pause/resume/next/prev/stop/open immediately, no search+play "   \
     "round-trip — use it for spoken pause/continue/next/prev/stop/open-player requests. "              \
-    "Never poll — media.* auto-refreshes."
+    "Never poll."
 
 #define PI_MEDIA_TOOL_SCHEMA                                                                         \
     "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"search\","       \
@@ -61,14 +61,9 @@ char *pi_media_tool_run(const cJSON *args, bool *is_error);
 
 namespace pi_card_media {
 
-// 注册 media.* DataHub 路径（只读播放态 + 可写 media.play_index）。pi_card::Init 调，幂等。
-void RegisterDataPaths();
-
-// 注册 media.* invoke 命令（toggle/next/prev/stop/open，全 Safe）。pi_card::Init 调，幂等。
-void RegisterCommands();
-
 // spec 树里是否引用了 media.*（bind/invoke/path 等任意字符串值以 "media." 开头）——
-// host 据此把卡标成媒体卡，聊天流里同类只保留最新一张（旧卡自动关）。
+// 播放器卡片已整体删除（播控只走内置播放器 UI），host 与 preview 据此在正式渲染与
+// 流式预览两级拦掉 LLM 不听话画出的媒体卡。
 bool SpecUsesMedia(const cJSON* spec_root);
 
 // tracks 兜底注入：spec 有 list bind_data:'tracks' 而 data 里 tracks 缺失/为空时，从
