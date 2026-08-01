@@ -182,6 +182,11 @@ static void tts_enqueue_audio(TtsState* s, const uint8_t* data, size_t len) {
         s->audio_started = true;
         volc_tts_callbacks_t c = tts_cbs_snapshot(s);
         if (c.on_audio_start) c.on_audio_start(c.ctx);
+        // on_audio_start 里的焦点仲裁会让音乐让路：Suspend 的 Teardown 内含 FlushPlayback
+        // （++gen），speak_begin 时捕获的代次此刻已过期——不重取的话本会话每一帧都被管线
+        // 按代次不等丢弃（"音乐播放中直接开口（无 ASR 先行让路）"= 整段播报无声）。此时
+        // 首帧压缩字节尚未入队、pump 还没开始喂，重写无并发读者。
+        s->playback_gen = mhal::audio_pipeline::PlaybackGen();
     }
     // 载荷是 ogg_opus 压缩字节流（自带 Ogg page/lacing 定界），原样入队即可——
     // 解码在 pump 任务里做，绝不在此 WS 接收任务里为解码/播放阻塞。旧的直接

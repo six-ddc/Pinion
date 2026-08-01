@@ -37,6 +37,28 @@ void pi_media_focus_asr_start(void);
 // ASR 结束聆听（Finish/Cancel）：安排一次去抖 Resume 检查。
 void pi_media_focus_asr_ended(void);
 
+// 排队意图取值：>=0 = PlayIndex 目标；负值哨兵 = 等效控制动作（-1 保留为"无意图"）。
+// resume/next/prev 与起播同罪：都经 StartPump 的 FlushPlayback，回合中立即执行同样掐 TTS。
+#define PI_MEDIA_QUEUE_RESUME (-2)
+#define PI_MEDIA_QUEUE_NEXT (-3)
+#define PI_MEDIA_QUEUE_PREV (-4)
+
+// LLM 回合中触发的起播/换曲意图（media 工具 mode:'play' / mode:'control'，worker 线程
+// 调用）：回合中立即执行会 FlushPlayback 把正在/即将播报的 TTS 掐成整段无声，故 play
+// 调用方只 StagePlaylist(items, -1) 暂存列表，把起播索引（或上面的动作哨兵）排到这里；
+// Resume 检查通过（播报已排空）时由本模块代为执行。后到意图覆盖先到；执行时若 media
+// 已在 Playing（等待期间用户手动开播），play/resume 意图作废尊重用户选择，next/prev
+// 仍执行（换曲对"已在播"依然成立）。
+void pi_media_focus_queue_play(int index);
+
+// 取走排队意图（返回排队值，-1 = 无）。用户在内置播放器（迷你条/Now-Playing 页）按播放
+// 键时用：意图在场则立即播点名那首，而不是落进 Toggle 的 Stopped 分支从 index 0 起播。
+int pi_media_focus_take_queued_play(void);
+
+// 作废排队中的起播意图（用户明确 stop/pause 时调用——"叫停"之后音乐在回合结束
+// 反而响起是最糟的意外）。无意图时 no-op。
+void pi_media_focus_clear_queued_play(void);
+
 #ifdef __cplusplus
 }
 #endif

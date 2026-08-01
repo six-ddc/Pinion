@@ -510,7 +510,7 @@ void ApplyCtxUsage(uint32_t ctx_tokens) {
 // versions/tiers -- and mark the cut with a leading "..." (three ASCII
 // dots; the single-glyph ellipsis isn't in the mono font's ASCII+·°
 // subset). Names at or under the budget pass through unchanged.
-constexpr size_t kMaxModelNameChars = 16;
+constexpr size_t kMaxModelNameChars = 18;
 
 std::string FormatModelName(const char* raw) {
     if (raw == nullptr) return "?";
@@ -745,6 +745,21 @@ lv_obj_t* MakeSbarBase(lv_obj_t* parent) {
 // ---------------------------------------------------------------------------
 // S0 -- idle view
 // ---------------------------------------------------------------------------
+
+// lv_label_set_text 不做同值短路（每次都 realloc + invalidate + 标脏布局），时钟这类
+// 每秒 tick、每分钟才真正变化的 label 用它过滤：文本没变就一个字不碰。cache 以 label
+// 指针为键，屏树重建换了指针即自动失效重灌。
+void SetLabelTextIfChanged(lv_obj_t* lbl, const char* text, const lv_obj_t*& owner, char* cache,
+                           size_t cache_cap) {
+    if (owner != lbl) {
+        owner = lbl;
+        cache[0] = '\0';
+    }
+    if (std::strcmp(text, cache) == 0) return;
+    std::snprintf(cache, cache_cap, "%s", text);
+    lv_label_set_text(lbl, text);
+}
+
 void UpdateIdleClock(lv_timer_t*) {
     if (s_clock_lbl == nullptr) return;
     time_t now = time(nullptr);
@@ -757,7 +772,9 @@ void UpdateIdleClock(lv_timer_t*) {
     } else {
         std::snprintf(buf, sizeof(buf), "--#%06X :#--", faint);
     }
-    lv_label_set_text(s_clock_lbl, buf);
+    static const lv_obj_t* s_clock_owner = nullptr;
+    static char s_clock_cache[24];
+    SetLabelTextIfChanged(s_clock_lbl, buf, s_clock_owner, s_clock_cache, sizeof(s_clock_cache));
 
     if (s_date_lbl != nullptr) {
         static const char* kWd[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -770,7 +787,9 @@ void UpdateIdleClock(lv_timer_t*) {
         } else {
             std::snprintf(dbuf, sizeof(dbuf), "--- · --- --");
         }
-        lv_label_set_text(s_date_lbl, dbuf);
+        static const lv_obj_t* s_date_owner = nullptr;
+        static char s_date_cache[32];
+        SetLabelTextIfChanged(s_date_lbl, dbuf, s_date_owner, s_date_cache, sizeof(s_date_cache));
     }
 
     // pin 在场时的状态栏迷你时钟：时间 + 日期压成一行（"12:34 · THU · JUL 17"）。
@@ -786,7 +805,9 @@ void UpdateIdleClock(lv_timer_t*) {
         } else {
             std::snprintf(sbuf, sizeof(sbuf), "--:--");
         }
-        lv_label_set_text(s_sbar_clock_lbl, sbuf);
+        static const lv_obj_t* s_sbar_owner = nullptr;
+        static char s_sbar_cache[48];
+        SetLabelTextIfChanged(s_sbar_clock_lbl, sbuf, s_sbar_owner, s_sbar_cache, sizeof(s_sbar_cache));
     }
 }
 
@@ -1896,6 +1917,9 @@ void CursorBlinkTick(lv_timer_t*) {
 // per-turn lifecycle
 // ---------------------------------------------------------------------------
 void ResetTurnState() {
+    // 上一回合被打断（取消/出错后直接开新回合）时，工具点的无限呼吸动画可能还挂着；
+    // 指针置空前必须先停，否则那颗点永远以帧率做 opa 动画 + invalidate，逐回合累积。
+    if (s_cur_tool_dot != nullptr) StopBreath(s_cur_tool_dot);
     s_cur_think_row = s_cur_think_dot = s_cur_think_lbl = nullptr;
     s_cur_tool_card = s_cur_tool_dot = s_cur_tool_fn_lbl = nullptr;
     s_cur_tool_ret_lbl = s_cur_tool_body_args_lbl = s_cur_tool_body_partial_row = nullptr;
@@ -2234,7 +2258,9 @@ void DrainQueueTick(lv_timer_t*) {
                 }
                 const char* name = evt.s1 != nullptr ? evt.s1 : "tool";
                 const char* output = evt.s2 != nullptr ? evt.s2 : "";
-                if (!s_zen && s_cur_tool_dot != nullptr) {
+                // 不再叠 !s_zen 门控：整回合 ZEN 时根本不建卡（dot 恒空，条件自然短路）；
+                // 而 FLOW 中途切 ZEN 时卡已存在只是被隐藏，旧门控会让呼吸动画永远停不下来。
+                if (s_cur_tool_dot != nullptr) {
                     StopBreath(s_cur_tool_dot);
                     pi_theme::ApplyBg(s_cur_tool_dot, Tok::Ok);
                     char ret[128];
@@ -2282,7 +2308,11 @@ void DrainQueueTick(lv_timer_t*) {
                     // 会漏到下一轮。
                     const bool cut_stale_audio = pi_agent_task_tts_take_cut();
                     // 显示不变；另外把 delta 剥成纯文本后按句喂 TTS（仅开 TTS 时）。
-                    if (pi_agent_tts_enabled()) {
+                    // Listen 在场时不喂：barge-in（VoiceCmd::Start 的 tts_cancel）只能停掉
+                    // 已缓冲音频，回合若还在流式，后续 delta 会让 pump 开新会话接着念——
+                    // 用户正按住说话，旧回复的剩余文本不该出声（真机日志：stopped (barge-in)
+                    // 后 111ms session 又 started）。聆听取消返回后恢复喂，从下一句起念。
+                    if (pi_agent_tts_enabled() && s_state != ViewState::Listen) {
                         if (cut_stale_audio) {
                             // 必须是 tts_cancel：pump 此刻正卡在 volc_tts_feed_text 的限速阀里
                             // （60B/s，等音频播到 <8s 存量才放行），只在循环顶部查代次——只有
@@ -2361,6 +2391,9 @@ void DrainQueueTick(lv_timer_t*) {
             }
             case UI_ERROR: {
                 pi_card::PreviewTeardown();  // 出错收尾：预览不该活过整个回合，兜底撤除
+                // 工具跑到一半出错：呼吸动画必须在这里停掉——错误路径不走 UI_TOOL_END，
+                // 不停就是一颗永远逐帧 invalidate 的孤儿呼吸点。
+                if (s_cur_tool_dot != nullptr) StopBreath(s_cur_tool_dot);
                 // Not a modal -- reading can continue around it. Real
                 // transports hit this path on genuine network/API failures,
                 // so the banner's retry has to actually work (it resends the
@@ -2843,6 +2876,9 @@ void StartListen(ViewState return_state, ListenOwner owner) {
     s_asr_committed_bytes = VOLC_ASR_COMMITTED_UNKNOWN;
     s_asr_error_text.clear();
     AsrUnlock();
+    // barge-in 配套：voice 任务的 tts_cancel 已作废 pump 缓冲，提取器的半句残文本
+    // 也一并清掉——否则聆听取消返回后，下一个 delta 会把新句拼在残句后面喂出去。
+    TtsExtractReset();
     VoiceSend(VoiceCmd::Start);  // 建连+开采集都在 voice 任务，UI 不阻塞
     if (s_asr_lbl != nullptr) lv_label_set_text(s_asr_lbl, "");
     s_rec_secs = 0;
