@@ -160,11 +160,27 @@ static void ReaderRun(Pump* p) {
         // 源/编解码三分路由：.m3u8 → HLS 源（TS 解封装吐 ADTS，AAC 解码）；
         // 其余流 → 裸 MP3 无限流；文件 → SD MP3。
         const bool is_hls = item.is_stream && UrlIsHls(item.path_or_url.c_str());
-        std::unique_ptr<MediaSource> src =
-            is_hls           ? OpenHlsStreamSource(item.path_or_url.c_str(), on_reconnecting)
-            : item.is_stream ? OpenHttpStreamSource(item.path_or_url.c_str(), on_reconnecting)
-                             : OpenFileSource(item.path_or_url.c_str());
+        // 流式源打开重试：冷启动 DNS+TLS+拉 m3u8 撞上一次 socket 超时（2.5s）就判死太脆
+        // ——真机实录：排队起播自动执行后首连超时 → Error 无声躺平，用户手按播放键"人肉
+        // 重试"一次即成功。播放中断流已有 60s 重连兜底，唯独 open 这步没有容错。重试仅限
+        // 流式（本地文件失败=文件坏，走既有跳曲路径）；退避 1s/2s，p->stop 随时可打断。
+        std::unique_ptr<MediaSource> src;
+        const int open_tries = item.is_stream ? 3 : 1;
+        for (int t = 0; t < open_tries && !p->stop; ++t) {
+            if (t > 0) {
+                ESP_LOGW(TAG, "track %d open retry %d/%d", idx, t + 1, open_tries);
+                for (int w = 0; w < t * 10 && !p->stop; ++w) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (p->stop) break;
+            }
+            src = is_hls           ? OpenHlsStreamSource(item.path_or_url.c_str(), on_reconnecting)
+                  : item.is_stream ? OpenHttpStreamSource(item.path_or_url.c_str(), on_reconnecting)
+                                   : OpenFileSource(item.path_or_url.c_str());
+            if (src) break;
+        }
         if (!src) {
+            if (p->stop) break;  // 重试等待期被叫停：正常收场，不是错误
             if (item.is_stream) {
                 if (p->host) p->host->OnTrackError(p, idx, "open failed");
                 break;

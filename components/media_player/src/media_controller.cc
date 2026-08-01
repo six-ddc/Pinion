@@ -236,21 +236,25 @@ struct MediaController::Impl : public PumpHost {
         esp_pthread_cfg_t prev_cfg;
         const bool had_prev_cfg = esp_pthread_get_cfg(&prev_cfg) == ESP_OK;
         esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-        // prio 2：高于 LVGL 适配层（1）、低于播放消费任务（4）。曾与 LVGL 同级靠时间片
-        // 分享核，但 AAC(esp_audio_codec) 解码比 minimp3 重，核 1 高负载时 prio 1 抢不到
-        // 片、解码跑不到实时 → 播放队列欠载嘟嘟卡顿（真机实测）。现在解码有 3s 水位
-        // 节流 + 每帧 2ms 让步 + FeedPlayback 背压，突发有界，不会复现早期"高优先级把
-        // LVGL/IDLE 饿死"的跑飞场景（那时无节流）。对照：官方固件 simple_player 任务
-        // prio 5 在同硬件上 UI 流畅。
+        // prio 4 不钉核：音频生产与消费同级（audio_playback/tts_audio 也是 4）。
+        // 演进史：P2 时代渲染任务（swdraw P3、LVGL P5）压得住解码，真机实测放音乐
+        // 时 dec 探针从正常 ~890ms/5s 恶化到 4900-6100ms/5s、产出 <1x 实时，播放环
+        // 持续欠载（swdraw 忙时段完全对齐）；提到 P4 后渲染永远压不住解码，代价只是
+        // 解码突发窗口（起播/切曲预蓄水位，1-2s）UI 帧率略降。突发有界：3s 水位节流
+        // + 每帧 2ms 让步 + FeedPlayback 背压。core 1 上 P4 < LVGL(P5)，滚动不受影响
+        // ——"泵抢渲染帧"的老病（P2>LVGL P1 时代）不会回来。线程命名 media_rd/
+        // media_dec：esp_pthread 默认名都叫 "pthread"，sysmon 任务榜分不清谁是谁。
         //
         // 栈放**内部 SRAM**：曾放 PSRAM（当时动机是 minimp3 28KB 内部栈教训 + 内部占用
         // 归零），但 esp_audio_codec 的 AAC 解码栈上工作集大，栈走 PSRAM 实测把解码拖到
         // 近实时边缘（dec 占墙钟 ~90%），是卡顿另一半根因。16KB×2=32KB 内部堆可承受
         //（解码器大状态在库内堆分配，不吃栈）。约束不变：这两线程不得做需要关 cache 的
         // flash 操作（SD 走 SDMMC、网络走 esp-hosted，均不涉及）。
-        cfg.prio = 2;
+        cfg.prio = 4;
         cfg.stack_size = 16 * 1024;
         cfg.stack_alloc_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        cfg.pin_to_core = -1;  // esp_pthread 惯用值：越界回落 PTHREAD_TASK_CORE_DEFAULT(-1)=无亲和
+        cfg.thread_name = "media_rd";
         esp_pthread_set_cfg(&cfg);
 #endif
         // 建线程可能因低内存失败抛 std::system_error：不接就是 std::terminate 整机
@@ -263,6 +267,10 @@ struct MediaController::Impl : public PumpHost {
             p->reader_thr.detach();
 #endif
             p->threads_started = 1;
+#ifdef ESP_PLATFORM
+            cfg.thread_name = "media_dec";
+            esp_pthread_set_cfg(&cfg);
+#endif
             p->decoder_thr = std::thread(PumpDecoderMain, p);
 #ifdef ESP_PLATFORM
             p->decoder_thr.detach();

@@ -225,9 +225,23 @@ void PlaybackTask(void*) {
             dbg_last = dbg_now;
         }
 
-        // 低水位预启动：空转后首批数据到达时，先积累 prestart_ms 再开播，
-        // 避免流式下行初期欠载卡顿；积累超时（3x）则不再等。
-        if (s_play.prebuffering && PlaybackFilled() > 0 && !s_play.flushing) {
+        // 低水位预启动：空转后先积累 prestart_ms 再开播，避免流式下行欠载碎停；
+        // 积累超时（3x）则不再等。预缓冲期**不进下面的 receive**：旧实现只在"检查
+        // 瞬间恰好已有数据"时才积累，排空后数据若在 receive 阻塞期间到达会被当场
+        // 播掉——持续欠载时预缓冲被完全旁路（真机日志 underrun=7 与 prebuf=0 同秒），
+        // 每块数据到即播即空，密集碎停。
+        if (s_play.prebuffering && !s_play.flushing) {
+            if (PlaybackFilled() == 0) {
+                // 等首批数据。50ms 轮询并照常计闲时断电（与底部空转路径同口径）。
+                vTaskDelay(pdMS_TO_TICKS(50));
+                idle_ms += 50;
+                if (output_on && idle_ms >= s_play.cfg.idle_power_off_ms) {
+                    mhal::audio::EnableOutput(false);
+                    output_on = false;
+                    ESP_LOGI(TAG, "playback idle %ums, speaker off", (unsigned)idle_ms);
+                }
+                continue;
+            }
             dbg_prebuf++;
             const size_t prestart_bytes =
                 (size_t)s_play.cfg.prestart_ms * SampleRate() * 2 / 1000;

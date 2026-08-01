@@ -67,7 +67,12 @@ struct PlaybackConfig {
     //   1.48MB，双缓冲 ≈ 3MB，叠加本队列 2MB 已占 PSRAM 主要份额——调大本值
     //   前需核对 PSRAM 余量，避免挤垮显示缓冲。
     size_t queue_bytes = 2 * 1024 * 1024;
-    uint32_t prestart_ms = 100;  // 队列积累到该时长（或 300ms 超时）才开播
+    // 队列积累到该时长（或 3 倍超时兜底）才开播；排空后重新预积累。
+    // 100ms 时代拦不住流式 TTS：LLM 吐卡片 JSON 期间语音文本断供数秒，音频到达
+    // 率低于实时，100ms 底子秒穿 → rb=0 反复欠载成"哒-停-哒"密集停顿（真机
+    // serial 抓包：session 开始 1s 内即 underrun，prebuf 等待 0ms）。400ms 把
+    // 短断供桥过去、把长断供合并成一次停顿，代价是开口/恢复慢 ~0.4s。
+    uint32_t prestart_ms = 400;
     uint32_t idle_power_off_ms = 15000;  // 队列空闲该时长后关扬声器通路
 };
 
