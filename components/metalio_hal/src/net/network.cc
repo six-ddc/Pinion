@@ -218,9 +218,22 @@ int GetWifiRssi() {
     if (CachedType() != Type::WiFi) {
         return 0;
     }
+    // esp-hosted 下 esp_wifi_sta_get_ap_info 是走 SDIO 的同步 RPC（总线被电台拉流占满时
+    // 可达数十 ms），而 DataHub 1Hz 历史采样和状态栏刷新都在 LVGL 线程上调这里——3s TTL
+    // 原子缓存把 UI 线程上的 RPC 压到最多 1/3Hz，并让多路调用方共享同一次读数。
+    constexpr TickType_t kTtl = pdMS_TO_TICKS(3000);
+    static std::atomic<int> s_cached{0};
+    static std::atomic<TickType_t> s_last{static_cast<TickType_t>(0) - kTtl};  // 首调必刷新
+    const TickType_t now = xTaskGetTickCount();
+    if (now - s_last.load(std::memory_order_relaxed) < kTtl) {
+        return s_cached.load(std::memory_order_relaxed);
+    }
     wifi_ap_record_t ap{};
-    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;  // 未连/未init→0，不 abort，无 TOCTOU
-    return ap.rssi;
+    // 未连/未 init→0，不 abort，无 TOCTOU
+    const int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+    s_cached.store(rssi, std::memory_order_relaxed);
+    s_last.store(now, std::memory_order_relaxed);
+    return rssi;
 }
 
 std::string GetIpAddress() {

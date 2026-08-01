@@ -77,9 +77,9 @@ void InitPanelImpl() {
     dpi_config.dpi_clock_freq_mhz = 36;  // NV3051F_DCLK_MHZ
     dpi_config.virtual_channel = 0;
     dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
-    // LVGL adapter 跑 TEAR_AVOID_MODE_TRIPLE_FULL，需要 3 张 panel FB
-    // 当 LVGL 的 draw buffer，避免回退到 partial 模式抢内部 SRAM。
-    dpi_config.num_fbs = 3;
+    // LVGL adapter 跑 TEAR_AVOID_MODE_DOUBLE_DIRECT，需要 2 张 panel FB
+    // 当 LVGL 的 draw buffer（direct 模式脏区渲染），第三张省回 ~1.5MB PSRAM。
+    dpi_config.num_fbs = 2;
     // 视频时序 (TRULY HE396-040T2BZZ + NV3051F, 20250708 datasheet)
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 720;
@@ -135,9 +135,8 @@ void InitPanelImpl() {
     dpi_config.dpi_clock_freq_mhz = 48;  // FL7707N_DCLK_MHZ
     dpi_config.virtual_channel = 0;
     dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
-    // 厂商 example 用 2 张 FB，但本工程 LVGL 通路必须 3 张（TRIPLE_FULL），
-    // 否则回退 partial 模式抢内部 SRAM，初始化失败。
-    dpi_config.num_fbs = 3;
+    // 与 NV3051F 分支保持一致：LVGL 通路 DOUBLE_DIRECT 用 2 张 panel FB 当 draw buffer。
+    dpi_config.num_fbs = 2;
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 720;
     dpi_config.video_timing.hsync_back_porch = 120;
@@ -255,19 +254,23 @@ void StartLvglAdapter() {
     // 64KB LVGL 任务栈：stack_in_psram=true 只占 PSRAM。历史教训是 8KB
     // 会在复杂字形布局时爆栈（Stack protection fault），保留大栈。
     adapter_cfg.task_stack_size = 65536;
-    adapter_cfg.task_priority = 1;
+    // prio 5：曾长期是 1（全系统最低），播放/网络任何 prio≥2 的任务都能抢占渲染，
+    // 是"放音乐滚动更卡"的主因之一。5 与 touch_feed/sysmon 同级（它们不钉核、突发
+    // 短，可迁去 core 0），高于媒体泵（2，钉 core 0）与 agent/tts/播放消费（4，不钉核）。
+    adapter_cfg.task_priority = 5;
     adapter_cfg.task_core_id = 1;
 
     ESP_ERROR_CHECK(esp_lv_adapter_init(&adapter_cfg));
 
     // 性能调优要点（720x720 屏）：
-    //   - enable_ppa_accel: ESP32-P4 PPA 硬件做 alpha 混合/格式转换/旋转。
-    //   - tear_avoid_mode = TRIPLE_FULL：直接把 LCD 驱动 num_fbs=3 的 3 张
-    //     panel 帧缓冲当 LVGL draw buffer 用，渲染→DMA 三级流水无撕裂；
-    //     TRIPLE_PARTIAL 会额外要 ~280KB 内部 SRAM partial buffer（已被
-    //     FreeRTOS/WiFi/SDIO 吃光）并再 fallback ~576KB PSRAM 双缓冲，
-    //     TRIPLE_FULL 彻底避开这条 fallback 路径。
-    //   - buffer_height / require_double_buffer 在 TRIPLE_FULL 下不生效，
+    //   - enable_ppa_accel: ESP32-P4 PPA 硬件做大块 fill / alpha blend，关掉时
+    //     全部回落单线程软件渲染（本仓无 SIMD/DMA2D draw）。
+    //   - tear_avoid_mode = DOUBLE_DIRECT：LVGL direct 模式只重绘脏区，panel FB
+    //     即 draw buffer（num_fbs=2）；此前的 TRIPLE_FULL 会把任意 invalidate 放大
+    //     成 720x720 全屏软件重绘 + 1.5MB cache 回写，是滚动卡顿的第一性原因。
+    //     TRIPLE_PARTIAL 曾因要 ~280KB 内部 SRAM partial buffer 失败（已被
+    //     FreeRTOS/WiFi/SDIO 吃光），DOUBLE_DIRECT 与 FULL 一样只用 panel FB。
+    //   - buffer_height / require_double_buffer 在 panel-FB 模式下不生效，
     //     保留是为了将来切回 partial 模式方便。
     esp_lv_adapter_display_config_t disp_cfg = {
         .panel = s_panel_handle,
@@ -278,13 +281,15 @@ void StartLvglAdapter() {
             .ver_res = static_cast<uint16_t>(DISPLAY_HEIGHT),
             .buffer_height = 200,
             .use_psram = true,
-            // PPA 加速暂关（A/B 验证蓝闪）：真机日志抓到 stock 图卡重绘触发
-            // PPA blend 前 esp_cache_msync 越界窗口报错，且 PPA 2D-DMA 与 DSI
-            // 扫描抢 PSRAM 带宽疑似 underrun 闪蓝——关掉观察蓝闪是否消失。
-            .enable_ppa_accel = false,
+            // PPA 重开（第二轮 A/B）：当初关它是因为 stock 图卡重绘触发 blend 前
+            // esp_cache_msync 越界报错 + 疑似与 DSI 抢 PSRAM 带宽闪蓝；现用的
+            // esp_lvgl_adapter 0.5.3 已在 blend handler 里加了源边界裁剪守卫
+            // （lvgl_ppa_accel_v9.c "LVGL does not pre-clip blend_area"），越界
+            // 成因已被上游修掉——若蓝闪复现，此开关是唯一回退点。
+            .enable_ppa_accel = true,
             .require_double_buffer = true,
         },
-        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT,
     };
 
     s_lv_display = esp_lv_adapter_register_display(&disp_cfg);

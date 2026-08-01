@@ -36,7 +36,8 @@ SysSnap    s_snap;
 // 的单核占比。同时打 usStackHighWaterMark（IDF 口径为字节，历史最小剩余）——LVGL
 // 64KB 任务栈 / 48KB 绘制栈能不能砍、砍多少，就以它为准。快照缓冲放 PSRAM。
 constexpr int kTaskDumpEveryN = 10;  // 默认周期 1s → 每 10s 一份任务榜
-constexpr size_t kMaxTasks = 48;
+// uxTaskGetSystemState 装不下时返回 0、任务榜静默消失——播放+WiFi+BT 全开曾逼近 48。
+constexpr size_t kMaxTasks = 64;
 constexpr int kTaskDumpTopN = 10;
 
 struct TaskPrev {
