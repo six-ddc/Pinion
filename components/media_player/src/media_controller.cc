@@ -13,13 +13,16 @@
 #include "media_player/media_player.h"
 
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "media_internal.h"
 #include "media_player/media_http_stream.h"
+#include "media_player/media_id3.h"
 #include "media_player/media_source.h"
 #include "metalio_hal/audio_pipeline.h"
 
@@ -34,7 +37,13 @@ struct MediaController::Impl : public PumpHost {
     std::mutex ctrl_mu_;  // 串行化控制操作 + 线程 join
     std::mutex mu_;       // 保护下列状态快照
 
-    std::vector<MediaItem> playlist_;
+    // 播放列表共享快照：pump 起播时只拷 shared_ptr（O(1)），不再整表深拷贝——全曲库
+    // 几百条 × 3 个 string 的小分配在 SPIRAM_MALLOC_ALWAYSINTERNAL=4096 下全落内部
+    // SRAM，控制器+泵+zombie 多份并存会耗尽内部堆。代价：vector 从建列表起不可变；
+    // 惰性 meta（OnTrackStarted 补 ID3）写 meta_overlay_ 叠加层，读接口按下标合并。
+    std::shared_ptr<const std::vector<MediaItem>> playlist_ =
+        std::make_shared<std::vector<MediaItem>>();
+    std::unordered_map<int, MediaItem> meta_overlay_;  // 惰性 meta；StagePlaylist 清空
     int index_ = -1;
     MediaState state_ = MediaState::Stopped;
     Pump* pump_ = nullptr;         // 当前 pump（owned），nullptr = 无播放线程
@@ -55,6 +64,13 @@ struct MediaController::Impl : public PumpHost {
     bool track_has_flowed_ = false;
 
     std::vector<Pump*> zombies_;  // 已自然结束（OnAllFinished/OnTrackError）待回收的 pump
+
+    // 要求已持 mu_、index 已判界：取 index 处条目，meta 叠加层命中优先。
+    const MediaItem& ItemAtLocked(int index) const {
+        auto it = meta_overlay_.find(index);
+        if (it != meta_overlay_.end()) return it->second;
+        return (*playlist_)[index];
+    }
 
     // —— 生命周期辅助（均要求已持 ctrl_mu_、且调用点不持 mu_，因为要等线程退出）——
 
@@ -321,6 +337,8 @@ struct MediaController::Impl : public PumpHost {
         // （见下）。多曲连播时上一曲可能是 Playing，这里显式切回 Loading 让 UI 如实
         // 反映"新曲正在缓冲"。
         bool changed = false;
+        bool need_meta = false;
+        MediaItem meta_probe;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (p != pump_) return;  // 陈旧 pump
@@ -330,8 +348,30 @@ struct MediaController::Impl : public PumpHost {
             }
             track_has_flowed_ = false;  // 新曲：Playing 需要重新用首帧触发（含 OnReconnecting 的恢复分支）
             changed = true;  // 索引变化本身也值得通知 UI（标题/曲目切换）
+            if (idx >= 0 && idx < (int)playlist_->size() && !(*playlist_)[idx].is_stream &&
+                !(*playlist_)[idx].meta_filled && meta_overlay_.count(idx) == 0) {
+                need_meta = true;
+                meta_probe = (*playlist_)[idx];  // 快照带出锁外读文件
+            }
         }
         if (changed) NotifyState();
+        // 惰性 meta：全库列表构建时不逐首读 ID3（几百次开文件数秒级），播到哪首补哪首。
+        // 本回调在 pump reader 线程、文件刚被打开（页缓存热），读 tag 头几 KB 毫秒级；
+        // I/O 在锁外做。结果写 meta_overlay_ 叠加层（共享快照 vector 不可变，pump 正在
+        // 无锁读它），回写前按 path 校验条目未被换列表（换代/换单则静默丢弃）。
+        if (need_meta) {
+            FillItemMetaFromId3(meta_probe);
+            bool meta_changed = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (idx < (int)playlist_->size() &&
+                    (*playlist_)[idx].path_or_url == meta_probe.path_or_url) {
+                    meta_overlay_[idx] = meta_probe;
+                    meta_changed = true;
+                }
+            }
+            if (meta_changed) NotifyState();  // 标题/时长上屏（Now-Playing/迷你条的 tick 去重兜底）
+        }
     }
 
     // 本曲第一帧真正喂给播放管线：Loading→Playing 的唯一触发点（文件/流统一）。
@@ -446,7 +486,8 @@ void MediaController::StagePlaylist(std::vector<MediaItem> items, int start_inde
     const int n = (int)items.size();
     {
         std::lock_guard<std::mutex> lk(impl_->mu_);
-        impl_->playlist_ = std::move(items);
+        impl_->playlist_ = std::make_shared<const std::vector<MediaItem>>(std::move(items));
+        impl_->meta_overlay_.clear();  // 叠加层按下标挂在旧列表上，换列表即作废
         impl_->suspended_for_speech_ = false;
     }
     if (start_index >= 0 && start_index < n) {
@@ -462,7 +503,7 @@ void MediaController::PlayIndex(int index) {
     int n;
     {
         std::lock_guard<std::mutex> lk(impl_->mu_);
-        n = (int)impl_->playlist_.size();
+        n = (int)impl_->playlist_->size();
     }
     if (index < 0 || index >= n) return;
     impl_->TeardownCurrent();
@@ -510,8 +551,8 @@ void MediaController::Toggle() {
         std::lock_guard<std::mutex> lk(impl_->mu_);
         st = impl_->state_;
         idx = impl_->index_;
-        n = (int)impl_->playlist_.size();
-        if (idx >= 0 && idx < n) is_stream = impl_->playlist_[idx].is_stream;
+        n = (int)impl_->playlist_->size();
+        if (idx >= 0 && idx < n) is_stream = (*impl_->playlist_)[idx].is_stream;
     }
 
     if (st == MediaState::Playing) {
@@ -550,7 +591,7 @@ void MediaController::Next() {
     {
         std::lock_guard<std::mutex> lk(impl_->mu_);
         idx = impl_->index_;
-        n = (int)impl_->playlist_.size();
+        n = (int)impl_->playlist_->size();
     }
     if (n == 0) return;
     int next = (idx < 0) ? 0 : idx + 1;
@@ -572,7 +613,7 @@ void MediaController::Prev() {
     {
         std::lock_guard<std::mutex> lk(impl_->mu_);
         idx = impl_->index_;
-        n = (int)impl_->playlist_.size();
+        n = (int)impl_->playlist_->size();
     }
     if (n == 0) return;
     int prev = (idx <= 0) ? 0 : idx - 1;  // 钳制在首
@@ -596,8 +637,8 @@ void MediaController::SuspendForSpeech() {
         std::lock_guard<std::mutex> lk(impl_->mu_);
         st = impl_->state_;
         idx = impl_->index_;
-        n = (int)impl_->playlist_.size();
-        if (idx >= 0 && idx < n) is_stream = impl_->playlist_[idx].is_stream;
+        n = (int)impl_->playlist_->size();
+        if (idx >= 0 && idx < n) is_stream = (*impl_->playlist_)[idx].is_stream;
     }
     if (st != MediaState::Playing) return;  // 非播放态无操作
 
@@ -657,34 +698,50 @@ int MediaController::position_s() {
 
 int MediaController::duration_s() {
     std::lock_guard<std::mutex> lk(impl_->mu_);
-    if (impl_->index_ >= 0 && impl_->index_ < (int)impl_->playlist_.size()) {
-        return impl_->playlist_[impl_->index_].duration_s;
+    if (impl_->index_ >= 0 && impl_->index_ < (int)impl_->playlist_->size()) {
+        return impl_->ItemAtLocked(impl_->index_).duration_s;
     }
     return 0;
 }
 
 MediaItem MediaController::current() {
     std::lock_guard<std::mutex> lk(impl_->mu_);
-    if (impl_->index_ >= 0 && impl_->index_ < (int)impl_->playlist_.size()) {
-        return impl_->playlist_[impl_->index_];
+    if (impl_->index_ >= 0 && impl_->index_ < (int)impl_->playlist_->size()) {
+        return impl_->ItemAtLocked(impl_->index_);
     }
     return MediaItem{};
 }
 
 int MediaController::playlist_size() {
     std::lock_guard<std::mutex> lk(impl_->mu_);
-    return (int)impl_->playlist_.size();
+    return (int)impl_->playlist_->size();
 }
 
 MediaItem MediaController::item_at(int index) {
     std::lock_guard<std::mutex> lk(impl_->mu_);
-    if (index >= 0 && index < (int)impl_->playlist_.size()) return impl_->playlist_[index];
+    if (index >= 0 && index < (int)impl_->playlist_->size()) return impl_->ItemAtLocked(index);
     return MediaItem{};
 }
 
 void MediaController::SetOnState(std::function<void()> cb) {
     std::lock_guard<std::mutex> lk(impl_->mu_);
     impl_->on_state_ = std::move(cb);
+}
+
+void FillItemMetaFromId3(MediaItem& item) {
+    if (item.is_stream) return;
+    media_id3::Tags t = media_id3::ReadTags(item.path_or_url);
+    if (!t.title.empty()) item.title = t.title;
+    if (!t.album.empty() && !t.artist.empty()) {
+        item.subtitle = t.album + " · " + t.artist;  // "专辑 · 艺人"
+    } else if (!t.album.empty()) {
+        item.subtitle = t.album;
+    } else if (!t.artist.empty()) {
+        item.subtitle = t.artist;
+    }
+    int dur = media_id3::ProbeDurationS(item.path_or_url);
+    if (dur > 0) item.duration_s = dur;
+    item.meta_filled = true;
 }
 
 }  // namespace media

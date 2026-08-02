@@ -30,9 +30,12 @@ char *pi_media_tool_run(const cJSON *args, bool *is_error);
 // 预算超标后精简（保留 mode 语义/search·radio·play·control 参数形状/接力引导本身，只删口水词）。
 #define PI_MEDIA_TOOL_DESC                                                                            \
     "Play SD-card music/podcasts, or live radio. mode:'search' scans SD (Music/Podcasts "            \
-    "subdirs=albums/shows) -> {items:[{index,title,album,path}]} (query=fuzzy filter); mode:'radio' " \
+    "subdirs=albums/shows) -> {items:[{index,title,album,path}],total} (query=fuzzy filter; items "   \
+    "capped at 50); mode:'radio' "                                                                    \
     "lists built-in CN stations -> {stations:[{index,name,genre}]} (query filters); mode:'play' "     \
-    "starts playback: paths:[\"...\"] (from search, +start_index) OR station_indices:[int,...] (from " \
+    "starts playback: paths:[\"...\"] (ONE path queues the WHOLE library from that track in folder "  \
+    "order — the normal case; several paths = explicit custom queue, +start_index) OR "               \
+    "station_indices:[int,...] (from "                                                                \
     "radio list; pass several stations, requested one first, so next/prev can switch channels) -> "   \
     "now-playing snapshot; during a spoken reply play/resume/next/prev are queued (result "           \
     "queued:true) and auto-apply when speech ends — announce as upcoming, not done. The device "      \

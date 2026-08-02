@@ -29,13 +29,21 @@ enum class MediaState { Stopped, Loading, Playing, Paused, Error };
 
 // 播放列表条目。path_or_url：文件绝对路径或流 URL；is_stream=true 表示无限电台流；
 // duration_s：曲目秒长，0 表示未知或直播（LIVE）。title/subtitle 供 UI 展示。
+// meta_filled：title/subtitle/duration_s 已由 ID3 回填（或构建方确认无需回填）——
+// false 的文件条目在起播时由 controller 惰性补读（全库列表扫描期不逐首开文件）。
 struct MediaItem {
     std::string title;
     std::string subtitle;
     std::string path_or_url;
     bool is_stream = false;
     int duration_s = 0;  // 0 = 未知或 LIVE
+    bool meta_filled = false;
 };
+
+// 用 ID3 标签回填条目显示信息：TIT2→title、TALB/TPE1→subtitle（"专辑 · 艺人"，缺一显
+// 一）、探测时长→duration_s；tag 缺失的字段保留调用方已填的文件名/目录名兜底。完成后
+// 置 meta_filled。流条目 no-op。同步读文件头几 KB（毫秒级），勿在 UI 线程对整列表循环调。
+void FillItemMetaFromId3(MediaItem& item);
 
 class MediaController {
  public:

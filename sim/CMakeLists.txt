@@ -97,6 +97,7 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_settings.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media_focus.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_media_library.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_guide.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_net_events.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_sleep.cc
@@ -230,6 +231,8 @@ add_executable(media_stress
     ${CLAW_ROOT}/components/media_player/src/media_resampler.cc
     ${CLAW_ROOT}/components/media_player/src/media_hls.cc
     ${CLAW_ROOT}/components/media_player/src/media_ts_demux.cc
+    ${CLAW_ROOT}/components/media_player/src/media_id3.cc
+    shim/src/media_textconv_sim.cc
     shim/src/media_http_fetch_curl.cc
     shim/src/media_decoder_sim.cc
     shim/src/media_decoder_atb_aac.cc
@@ -243,7 +246,7 @@ target_include_directories(media_stress PRIVATE
 )
 target_compile_options(media_stress PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(media_stress PRIVATE -fsanitize=address,undefined)
-target_link_libraries(media_stress PRIVATE curl "-framework AudioToolbox" "-framework CoreFoundation")
+target_link_libraries(media_stress PRIVATE curl iconv "-framework AudioToolbox" "-framework CoreFoundation")
 
 # ---- card_solver_test: CARD V2 布局求解器（纯 C++、无 LVGL 依赖）单测 ----
 # solver = 零 LVGL / 零 ESP 依赖的纯函数，复用 pi-c 里同一份 cJSON 源码，ASan/UBSan 全程开。

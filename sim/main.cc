@@ -45,6 +45,7 @@
 #include "pi_card/pi_card_data.h"
 #include "pi_card/pi_card_host.h"
 #include "pi_card/pi_card_media.h"
+#include "pi_media.h"  // mediaresume 测试命令：续播链路（全曲库重扫+定位）验收
 #include "pi/pi_partial_json.h"  // previewscenechunks：真实字节级流式回放用
 #include "pi_card/pi_card_preview.h"
 #include "pi_card/pi_card_tools.h"
@@ -1413,6 +1414,12 @@ void ExecCmd(const std::string& line) {
         }
         std::fprintf(stderr, "[sim][mediadump] state=%s index=%d pos=%ds title=%s\n", st, mc.index(),
                      mc.position_s(), mc.current().title.c_str());
+    } else if (cmd == "mediaresume") {  // TEMP SCAFFOLD: 快捷面板「音乐」的续播链路直调
+                                        // （NVS 记录→全曲库重扫定位 / 无记录→全库从头播）
+        int r = static_cast<int>(pi_media::ResumeLast());
+        auto& mc2 = media::MediaController::Instance();
+        std::fprintf(stderr, "[sim][mediaresume] result=%d index=%d count=%d title=%s\n", r,
+                     mc2.index(), mc2.playlist_size(), mc2.current().title.c_str());
     } else if (cmd == "shot") {  // Stage B: shot <path> — 立即截图到指定路径
         std::string p;
         std::getline(ss, p);

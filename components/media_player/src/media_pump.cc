@@ -131,7 +131,7 @@ static void RingWrite(Pump* p, const uint8_t* buf, size_t n) {
 }
 
 static void ReaderRun(Pump* p) {
-    const int count = (int)p->playlist.size();
+    const int count = (int)p->playlist->size();
     int idx = p->start_index;
     if (idx < 0 || idx >= count) {
         p->stop = true;
@@ -149,7 +149,7 @@ static void ReaderRun(Pump* p) {
     int consec_fail = 0;
     for (;;) {
         if (p->stop) break;
-        const MediaItem item = p->playlist[idx];
+        const MediaItem item = (*p->playlist)[idx];
         // 转发给字节源：网络流断线重连时切 Loading，恢复数据时切回 Playing。可能从本
         // reader 线程（esp 的 Reconnect 同步跑在这）或字节源自己的后台线程（curl 的
         // bg thread）调用，捕获 p 的裸指针安全——字节源在 reader 线程退出前必被 Close()

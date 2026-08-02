@@ -1,7 +1,5 @@
 #include "pi_media.h"
 
-#include <sys/stat.h>
-
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -31,6 +29,7 @@
 #include "pi_card_icons.h"
 #include "pi_fonts.h"
 #include "pi_media_focus.h"            // X 停播须同步作废排队中的起播意图
+#include "pi_media_library.h"          // 全曲库扫描（续播/无记录起播的列表来源）
 #include "pi_theme.h"
 #include "pi_ui_bridge.h"              // pi_agent_task_note：关闭播放器静默告知模型
 #include "screen_util.h"
@@ -410,6 +409,8 @@ uint32_t s_vol_last_apply_ms = 0;
 lv_obj_t* s_drawer_root = nullptr;
 lv_obj_t* s_drawer_list = nullptr;
 std::vector<lv_obj_t*> s_drawer_rows;
+lv_timer_t* s_drawer_build_timer = nullptr;  // 分帧建行（全曲库几百行一口气建会卡帧）
+int s_drawer_total = 0;                      // 打开抽屉时快照的列表长度
 
 constexpr int32_t kArt = 300;  // 任务C：为音量条腾出竖向空间（原 330）
 constexpr int32_t kProgW = kW - 96;
@@ -419,47 +420,27 @@ struct PageCache {
     int index = -2;
     int state = -1;
     bool is_stream = false;
-    std::string title;
+    std::string path;   // 换曲判据——title 会被惰性 meta 回填改写，不能当曲目身份
+    std::string title;  // label 去重
+    std::string subtitle;
 } s_page_cache;
 
 // ---------------------------------------------------------------------------
 // 断点续播持久化（体验优化 任务A）：pi_media 层用 Settings 写 NVS "media"/"last"
 // 一条 JSON 记录（组件层 media_player 保持无 UI/NVS 依赖）。写磨损保护：值不变
-// 不写；pos 只在 60s 周期采样进 JSON，稳态播放约 60s 才落一次盘。NVS 字符串 ~4000B
-// 上限——文件路径列表超预算时以当前曲为中心截窗，丢弃两端并记录。
+// 不写；pos 只在 60s 周期采样进 JSON，稳态播放约 60s 才落一次盘。
+// 文件类只存当前曲路径（列表本身即全曲库，续播时重扫重建）；电台类存台快照数组，
+// NVS 字符串 ~4000B 上限——超预算时以当前台为中心截窗，丢弃两端并记录。
 // ---------------------------------------------------------------------------
 constexpr char kNvsNs[] = "media";
 constexpr char kNvsKey[] = "last";
-constexpr size_t kPathBudget = 3400;  // 路径部分字节预算（留 JSON scaffolding 余量）
-constexpr int kMaxTracks = 60;        // 记录曲目数上限（兼顾 NVS 尺寸 + 续播时 ID3 回读耗时）
+constexpr size_t kPathBudget = 3400;  // 电台快照字节预算（留 JSON scaffolding 余量）
+constexpr int kMaxTracks = 60;        // 电台快照条数上限
 
 std::string s_last_saved;   // 去重：与上次写入完全一致则不写
 std::string s_persist_sig;  // 不含 pos 的签名（state:index:size:path），变则立即存
 int s_persist_tick = 0;     // TimerCb 计数，用于 60s 周期采样
 
-std::string BaseNoExt(const std::string& path) {
-    size_t slash = path.find_last_of('/');
-    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
-    size_t dot = name.find_last_of('.');
-    return (dot == std::string::npos) ? name : name.substr(0, dot);
-}
-std::string ParentDirName(const std::string& path) {
-    size_t slash = path.find_last_of('/');
-    if (slash == std::string::npos || slash == 0) return {};
-    size_t p = path.find_last_of('/', slash - 1);
-    return (p == std::string::npos) ? path.substr(0, slash) : path.substr(p + 1, slash - p - 1);
-}
-// 与 pi_card_media 的 ApplyId3Meta 等价（那份是另一 TU 的私有 static，不可跨文件复用）。
-void ApplyId3(std::string& title, std::string& sub, const std::string& path) {
-    media_id3::Tags t = media_id3::ReadTags(path);
-    if (!t.title.empty()) title = t.title;
-    if (!t.album.empty() && !t.artist.empty())
-        sub = t.album + " · " + t.artist;  // "专辑 · 艺人"
-    else if (!t.album.empty())
-        sub = t.album;
-    else if (!t.artist.empty())
-        sub = t.artist;
-}
 // 序列化当前 MediaController 播放态为 JSON；空列表返回 ""。
 std::string BuildLastJson() {
     media::MediaController& mc = media::MediaController::Instance();
@@ -514,35 +495,11 @@ std::string BuildLastJson() {
             cJSON_AddItemToArray(arr, o);
         }
     } else {
-        std::vector<std::string> paths;
-        paths.reserve(n);
-        for (int i = 0; i < n; i++) paths.push_back(mc.item_at(i).path_or_url);
-        // 以当前曲为中心对称扩窗（字节预算 + 曲目数上限双钳制）。
-        int lo = idx, hi = idx;
-        size_t used = paths[idx].size() + 8;
-        bool grew = true;
-        while (grew) {
-            grew = false;
-            if (hi + 1 < n && (hi - lo + 1) < kMaxTracks &&
-                used + paths[hi + 1].size() + 8 <= kPathBudget) {
-                used += paths[++hi].size() + 8;
-                grew = true;
-            }
-            if (lo - 1 >= 0 && (hi - lo + 1) < kMaxTracks &&
-                used + paths[lo - 1].size() + 8 <= kPathBudget) {
-                used += paths[--lo].size() + 8;
-                grew = true;
-            }
-        }
-        if (lo > 0 || hi < n - 1) {
-            ESP_LOGW(TAG, "media last: playlist windowed [%d,%d]/%d (dropped head=%d tail=%d)", lo, hi,
-                     n, lo, n - 1 - hi);
-        }
+        // 文件：列表即全曲库（续播时重扫重建），只存当前曲路径 + 播放位置——不再存
+        // 路径数组窗口（那是"列表不可再生"时代的产物，顺带消掉 1Hz 下全表拷贝）。
         cJSON_AddStringToObject(root, "type", "file");
-        cJSON_AddNumberToObject(root, "index", idx - lo);  // 窗内相对下标
+        cJSON_AddStringToObject(root, "path", cur.path_or_url.c_str());
         cJSON_AddNumberToObject(root, "pos_s", mc.position_s());
-        cJSON* arr = cJSON_AddArrayToObject(root, "paths");
-        for (int i = lo; i <= hi; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(paths[i].c_str()));
     }
 
     char* txt = cJSON_PrintUnformatted(root);
@@ -1167,6 +1124,10 @@ void BuildArt(bool is_stream, bool playing) {
 void SetPlayGlyph(bool playing) { SetGlyph(s_play_host, playing, Tok::Bg, 44); }
 
 void CloseDrawer() {
+    if (s_drawer_build_timer != nullptr) {  // 分帧建行未完就关抽屉：停建
+        lv_timer_delete(s_drawer_build_timer);
+        s_drawer_build_timer = nullptr;
+    }
     if (s_drawer_root != nullptr) {
         lv_obj_delete(s_drawer_root);
         s_drawer_root = nullptr;
@@ -1179,6 +1140,77 @@ void OnDrawerRow(lv_event_t* e) {
     intptr_t idx = reinterpret_cast<intptr_t>(lv_event_get_user_data(e));
     MediaController::Instance().PlayIndex(static_cast<int>(idx));
     CloseDrawer();
+}
+
+constexpr int kDrawerChunk = 40;  // 分帧建行：每 tick 建的行数
+
+void BuildDrawerRow(int i, int cur_idx) {
+    MediaController& mc = MediaController::Instance();
+    MediaItem it = mc.item_at(i);  // 建行期间列表被换：返回空 item，行显示 "--"，点按被钳制
+    bool active = (i == cur_idx);
+    char tbuf[16];
+    lv_obj_t* row = lv_obj_create(s_drawer_list);
+    screen_strip_obj_chrome(row);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(row, LV_PCT(100), 72);
+    lv_obj_set_style_radius(row, 12, LV_PART_MAIN);
+    pi_theme::ApplyBg(row, Tok::Card2, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, OnDrawerRow, LV_EVENT_CLICKED,
+                        reinterpret_cast<void*>(static_cast<intptr_t>(i)));
+    s_drawer_rows.push_back(row);
+
+    if (active) {  // 4px accent 左边条
+        lv_obj_t* edge = lv_obj_create(row);
+        screen_strip_obj_chrome(edge);
+        lv_obj_remove_flag(edge, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(edge, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(edge, 4, 40);
+        lv_obj_set_style_radius(edge, 2, LV_PART_MAIN);
+        pi_theme::ApplyBg(edge, Tok::Accent);
+        lv_obj_set_style_bg_opa(edge, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_align(edge, LV_ALIGN_LEFT_MID, 4, 0);
+    }
+
+    std::snprintf(tbuf, sizeof(tbuf), "%02d", i + 1);
+    lv_obj_t* num = Label(row, tbuf, &font_pi_mono_17, active ? Tok::Accent : Tok::Faint);
+    lv_obj_align(num, LV_ALIGN_LEFT_MID, 20, 0);
+
+    lv_obj_t* title = Label(row, it.title.empty() ? "--" : it.title.c_str(), &font_puhui_20_4,
+                            active ? Tok::Accent : Tok::Tx);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(title, kW - 40 - 56 - 80);
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, 64, 0);
+
+    if (it.is_stream) {
+        std::snprintf(tbuf, sizeof(tbuf), "LIVE");
+    } else if (it.duration_s <= 0) {
+        std::snprintf(tbuf, sizeof(tbuf), "--:--");
+    } else {
+        FmtTime(it.duration_s, tbuf, sizeof(tbuf));
+    }
+    lv_obj_t* dur = Label(row, tbuf, &font_pi_mono_14, it.is_stream ? Tok::Accent : Tok::Dim);
+    lv_obj_align(dur, LV_ALIGN_RIGHT_MID, -22, 0);
+}
+
+// 建下一批行；建完停 timer 并滚动到当前曲（全库几百行时不滚动根本找不到在播哪首）。
+void BuildDrawerChunk() {
+    if (s_drawer_list == nullptr) return;
+    int cur_idx = MediaController::Instance().index();
+    int end = static_cast<int>(s_drawer_rows.size()) + kDrawerChunk;
+    if (end > s_drawer_total) end = s_drawer_total;
+    for (int i = static_cast<int>(s_drawer_rows.size()); i < end; i++) BuildDrawerRow(i, cur_idx);
+    if (static_cast<int>(s_drawer_rows.size()) >= s_drawer_total) {
+        if (s_drawer_build_timer != nullptr) {
+            lv_timer_delete(s_drawer_build_timer);
+            s_drawer_build_timer = nullptr;
+        }
+        if (cur_idx >= 0 && cur_idx < static_cast<int>(s_drawer_rows.size())) {
+            lv_obj_scroll_to_view(s_drawer_rows[cur_idx], LV_ANIM_OFF);
+        }
+    }
 }
 
 void BuildDrawer() {
@@ -1231,55 +1263,10 @@ void BuildDrawer() {
     lv_obj_set_style_pad_hor(s_drawer_list, 20, LV_PART_MAIN);
     lv_obj_set_style_pad_row(s_drawer_list, 2, LV_PART_MAIN);
 
-    int cur_idx = mc.index();
-    char tbuf[16];
-    for (int i = 0; i < n; i++) {
-        MediaItem it = mc.item_at(i);
-        bool active = (i == cur_idx);
-        lv_obj_t* row = lv_obj_create(s_drawer_list);
-        screen_strip_obj_chrome(row);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(row, LV_PCT(100), 72);
-        lv_obj_set_style_radius(row, 12, LV_PART_MAIN);
-        pi_theme::ApplyBg(row, Tok::Card2, LV_STATE_PRESSED);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
-        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, OnDrawerRow, LV_EVENT_CLICKED,
-                            reinterpret_cast<void*>(static_cast<intptr_t>(i)));
-        s_drawer_rows.push_back(row);
-
-        if (active) {  // 4px accent 左边条
-            lv_obj_t* edge = lv_obj_create(row);
-            screen_strip_obj_chrome(edge);
-            lv_obj_remove_flag(edge, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_remove_flag(edge, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_size(edge, 4, 40);
-            lv_obj_set_style_radius(edge, 2, LV_PART_MAIN);
-            pi_theme::ApplyBg(edge, Tok::Accent);
-            lv_obj_set_style_bg_opa(edge, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_align(edge, LV_ALIGN_LEFT_MID, 4, 0);
-        }
-
-        std::snprintf(tbuf, sizeof(tbuf), "%02d", i + 1);
-        lv_obj_t* num = Label(row, tbuf, &font_pi_mono_17, active ? Tok::Accent : Tok::Faint);
-        lv_obj_align(num, LV_ALIGN_LEFT_MID, 20, 0);
-
-        lv_obj_t* title = Label(row, it.title.empty() ? "--" : it.title.c_str(), &font_puhui_20_4,
-                                active ? Tok::Accent : Tok::Tx);
-        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(title, kW - 40 - 56 - 80);
-        lv_obj_align(title, LV_ALIGN_LEFT_MID, 64, 0);
-
-        if (it.is_stream) {
-            std::snprintf(tbuf, sizeof(tbuf), "LIVE");
-        } else if (it.duration_s <= 0) {
-            std::snprintf(tbuf, sizeof(tbuf), "--:--");
-        } else {
-            FmtTime(it.duration_s, tbuf, sizeof(tbuf));
-        }
-        lv_obj_t* dur = Label(row, tbuf, &font_pi_mono_14, it.is_stream ? Tok::Accent : Tok::Dim);
-        lv_obj_align(dur, LV_ALIGN_RIGHT_MID, -22, 0);
+    s_drawer_total = n;
+    BuildDrawerChunk();  // 首块同步建（开抽屉即时有内容），其余分帧
+    if (static_cast<int>(s_drawer_rows.size()) < s_drawer_total) {
+        s_drawer_build_timer = lv_timer_create([](lv_timer_t*) { BuildDrawerChunk(); }, 16, nullptr);
     }
 }
 
@@ -1522,21 +1509,27 @@ void RefreshPage() {
     bool playing = st == MediaState::Playing;
     int idx = mc.index();
 
-    bool track_changed = (idx != s_page_cache.index) || (cur.title != s_page_cache.title) ||
+    bool track_changed = (idx != s_page_cache.index) || (cur.path_or_url != s_page_cache.path) ||
                          (cur.is_stream != s_page_cache.is_stream);
     if (track_changed) {
         s_page_cache.index = idx;
-        s_page_cache.title = cur.title;
+        s_page_cache.path = cur.path_or_url;
         s_page_cache.is_stream = cur.is_stream;
         lv_label_set_text(s_eyebrow, cur.is_stream ? "LIVE RADIO" : "NOW PLAYING");
-        lv_label_set_text(s_title, cur.title.empty() ? "--" : cur.title.c_str());
-        lv_label_set_text(s_sub, cur.subtitle.c_str());
         s_cover_gen.fetch_add(1);             // 作废任何在途封面加载（含切到电台的情形）
         FreeCoverBitmap(&s_cover);            // 换曲：先释放上一曲的解码位图
         BuildArt(cur.is_stream, playing);     // 生成式母题打底（clean 掉旧封面 img）
         ESP_LOGI(TAG, "track_changed idx=%d is_stream=%d path=%s", idx, cur.is_stream,
                  cur.path_or_url.c_str());
         if (!cur.is_stream) TryLoadCover(cur.path_or_url);  // 有真封面则叠图覆盖；电台永远走母题
+    }
+    // 标题/副标题独立于换曲刷新：惰性 meta（OnTrackStarted 补 ID3）会在曲中改写
+    // title/subtitle——只刷 label，不重建 art、不重解封面。
+    if (track_changed || cur.title != s_page_cache.title || cur.subtitle != s_page_cache.subtitle) {
+        s_page_cache.title = cur.title;
+        s_page_cache.subtitle = cur.subtitle;
+        lv_label_set_text(s_title, cur.title.empty() ? "--" : cur.title.c_str());
+        lv_label_set_text(s_sub, cur.subtitle.c_str());
     }
     if (static_cast<int>(st) != s_page_cache.state) {
         // 播放态变化：切图元 + 电波呼吸随播放态起停（重建 art）。
@@ -1664,7 +1657,20 @@ void Back() {
 bool HasResumable() {
     if (media::MediaController::Instance().state() != media::MediaState::Stopped) return true;
     Settings s(kNvsNs);  // 只读
-    return !s.GetString(kNvsKey, "").empty();
+    if (!s.GetString(kNvsKey, "").empty()) return true;
+    return pi_media_library::HasAnyTrack();  // 无记录但 SD 有歌：「音乐」= 全库从头播
+}
+
+// 无续播记录（或记录已不可用）时的兜底：曲库非空则全库从头播——「音乐」按钮从
+// "续上次"升格为"随时能进音乐"。
+ResumeResult PlayLibraryFromTop() {
+    std::vector<media::MediaItem> lib = pi_media_library::ScanLibrary();
+    if (lib.empty()) return ResumeResult::NoRecord;
+    ESP_LOGI(TAG, "ResumeLast: no record, playing library from top (%d tracks)",
+             static_cast<int>(lib.size()));
+    media::MediaController::Instance().StagePlaylist(lib, 0);
+    Open();
+    return ResumeResult::Opened;
 }
 
 ResumeResult ResumeLast() {
@@ -1675,11 +1681,11 @@ ResumeResult ResumeLast() {
     }
     Settings s(kNvsNs);  // 只读
     std::string j = s.GetString(kNvsKey, "");
-    if (j.empty()) return ResumeResult::NoRecord;
+    if (j.empty()) return PlayLibraryFromTop();
     cJSON* root = cJSON_Parse(j.c_str());
     if (root == nullptr) {
         ESP_LOGW(TAG, "ResumeLast: corrupt record, ignoring");
-        return ResumeResult::NoRecord;
+        return PlayLibraryFromTop();
     }
 
     cJSON* jtype = cJSON_GetObjectItem(root, "type");
@@ -1721,43 +1727,35 @@ ResumeResult ResumeLast() {
         if (saved_index < 0 || saved_index >= static_cast<int>(items.size())) saved_index = 0;
         mc.StagePlaylist(items, saved_index);
         result = ResumeResult::Opened;
-    } else {  // file
-        cJSON* arr = cJSON_GetObjectItem(root, "paths");
-        int cnt = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
-        std::vector<media::MediaItem> items;
-        int new_idx = 0;
-        bool idx_set = false;
-        uint32_t t0 = lv_tick_get();
-        for (int i = 0; i < cnt; i++) {
-            cJSON* e = cJSON_GetArrayItem(arr, i);
-            if (!cJSON_IsString(e) || e->valuestring == nullptr) continue;
-            std::string p = e->valuestring;
-            struct stat stt;
-            if (::stat(p.c_str(), &stt) != 0 || !S_ISREG(stt.st_mode)) continue;  // 已删除，跳过
-            if (!idx_set && i >= saved_index) {
-                new_idx = static_cast<int>(items.size());  // 存点或其后第一个幸存曲
-                idx_set = true;
+    } else {  // file：记录 = 当前曲绝对路径，列表由全曲库重扫重建（不再逐首读 ID3——
+              // 真名/时长由播放路径惰性回填）
+        std::string want;
+        cJSON* jpath = cJSON_GetObjectItem(root, "path");
+        if (cJSON_IsString(jpath) && jpath->valuestring != nullptr && jpath->valuestring[0] != '\0') {
+            want = jpath->valuestring;
+        } else {
+            // 旧格式兼容（paths 数组 + 窗内 index）：取存点那一首当锚。下版可删。
+            cJSON* arr = cJSON_GetObjectItem(root, "paths");
+            int cnt = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+            if (cnt > 0) {
+                if (saved_index < 0 || saved_index >= cnt) saved_index = 0;
+                cJSON* e = cJSON_GetArrayItem(arr, saved_index);
+                if (cJSON_IsString(e) && e->valuestring != nullptr) want = e->valuestring;
             }
-            media::MediaItem m;
-            m.title = BaseNoExt(p);
-            m.subtitle = ParentDirName(p);
-            ApplyId3(m.title, m.subtitle, p);  // 走现有 ID3 回填（同 pi_card_media 语义）
-            m.path_or_url = p;
-            m.is_stream = false;
-            m.duration_s = media_id3::ProbeDurationS(p);  // 0 = 未知，UI 显示 --:--
-            items.push_back(m);
         }
-        if (items.empty()) {
+        uint32_t t0 = lv_tick_get();
+        std::vector<media::MediaItem> lib = pi_media_library::ScanLibrary();
+        if (lib.empty()) {
             cJSON_Delete(root);
             return ResumeResult::FilesGone;
         }
-        if (!idx_set) new_idx = static_cast<int>(items.size()) - 1;  // 存点在幸存曲之后
+        int at = want.empty() ? 0 : pi_media_library::IndexOfPath(lib, want);
+        if (at < 0) at = 0;  // 记录的那首已删：从库头起播
         ESP_LOGI(TAG,
-                 "ResumeLast: file %d survivors start=%d id3=%ums (公有 API 无 seek，pos_s 仅记录，"
+                 "ResumeLast: library %d tracks start=%d scan=%ums (公有 API 无 seek，pos_s 仅记录，"
                  "从曲首起播)",
-                 static_cast<int>(items.size()), new_idx,
-                 static_cast<unsigned>(lv_tick_get() - t0));
-        mc.StagePlaylist(items, new_idx);  // start_index>=0 立即起播
+                 static_cast<int>(lib.size()), at, static_cast<unsigned>(lv_tick_get() - t0));
+        mc.StagePlaylist(lib, at);  // start_index>=0 立即起播
         result = ResumeResult::Opened;
     }
 
@@ -1774,6 +1772,10 @@ void OnScreenUnloaded() {
     }
     // widget 树随 screen 删除；只清静态指针与图元登记。
     s_glyphs.clear();
+    if (s_drawer_build_timer != nullptr) {  // lv_timer 不随 screen 删除，须显式停
+        lv_timer_delete(s_drawer_build_timer);
+        s_drawer_build_timer = nullptr;
+    }
     s_drawer_root = s_drawer_list = nullptr;
     s_drawer_rows.clear();
     s_root = nullptr;

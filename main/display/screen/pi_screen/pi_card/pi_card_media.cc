@@ -2,9 +2,6 @@
 
 #include "pi_card_media.h"
 
-#include <dirent.h>
-#include <sys/stat.h>
-
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -13,13 +10,12 @@
 #include "esp_log.h"
 
 #include "device_config.h"  // 运行时网络电台列表（Web 后台可配，NVS 覆盖 or 内置种子）
-#include "media_player/media_id3.h"
 #include "media_player/media_player.h"
-#include "metalio_hal/storage.h"
 
 #include "pi_media.h"
-#include "pi_media_focus.h"  // 回合中起播排队（TTS 优先）
-#include "pi_ui_bridge.h"    // pi_agent_task_is_running / pi_agent_tts_enabled
+#include "pi_media_focus.h"    // 回合中起播排队（TTS 优先）
+#include "pi_media_library.h"  // 共享曲库扫描/排序/ID3 缓存
+#include "pi_ui_bridge.h"      // pi_agent_task_is_running / pi_agent_tts_enabled
 
 namespace {
 
@@ -29,8 +25,9 @@ using media::MediaController;
 using media::MediaItem;
 using media::MediaState;
 
-constexpr size_t kMaxItems = 50;      // search 返回上限（防爆 token / 内存）
-constexpr size_t kMaxPlaylist = 50;   // 一次 play 的曲目上限
+constexpr size_t kMaxItems = 50;      // search 返回上限（防爆 token；库全量见 total 字段）
+constexpr size_t kMaxPlaylist = 50;   // 一次 play 显式点名队列的曲目上限（全库扩列不受此限）
+constexpr size_t kTracksForLlm = 40;  // play 返回给模型的 tracks 条数上限（防爆上下文）
 
 // ---- 小工具 ----------------------------------------------------------------
 
@@ -67,28 +64,6 @@ bool CaseInStr(const std::string& hay, const std::string& needle) {
     return false;
 }
 
-bool HasMp3Ext(const char* name) {
-    size_t n = std::strlen(name);
-    if (n < 4) return false;
-    const char* e = name + n - 4;
-    return e[0] == '.' && LowerAscii(e[1]) == 'm' && LowerAscii(e[2]) == 'p' && e[3] == '3';
-}
-
-std::string BaseNoExt(const std::string& path) {
-    size_t slash = path.find_last_of('/');
-    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
-    size_t dot = base.find_last_of('.');
-    return (dot == std::string::npos) ? base : base.substr(0, dot);
-}
-
-std::string ParentDirName(const std::string& path) {
-    size_t slash = path.find_last_of('/');
-    if (slash == std::string::npos) return "";
-    std::string parent = path.substr(0, slash);
-    size_t slash2 = parent.find_last_of('/');
-    return (slash2 == std::string::npos) ? parent : parent.substr(slash2 + 1);
-}
-
 const char* StateName(MediaState s) {
     switch (s) {
         case MediaState::Loading: return "loading";
@@ -99,80 +74,42 @@ const char* StateName(MediaState s) {
     }
 }
 
-// ---- 本地扫描 --------------------------------------------------------------
-
-struct LocalTrack {
-    std::string title;
-    std::string album;
-    std::string path;
-};
-
-// 用 ID3v2 标签覆盖标题/副信息（Stage E）：有 TIT2 用作 title，否则保留调用方
-// 已填的文件名兜底；TALB/TPE1 组成 "专辑 · 艺人"（缺一个就显示另一个），都缺
-// 保留调用方已填的目录名兜底。只读 tag 头几 KB（media_id3::ReadTags 内部
-// 流式解析，不载入整曲），50 个文件量级 <1s（Stage E 实测见工作包报告）。
-void ApplyId3Meta(std::string& title, std::string& subtitle, const std::string& path) {
-    media_id3::Tags t = media_id3::ReadTags(path);
-    if (!t.title.empty()) title = t.title;
-    if (!t.album.empty() && !t.artist.empty()) {
-        subtitle = t.album + " · " + t.artist;  // "专辑 · 艺人"
-    } else if (!t.album.empty()) {
-        subtitle = t.album;
-    } else if (!t.artist.empty()) {
-        subtitle = t.artist;
-    }
-}
-
-// 递归收集 dir 下的 .mp3；album = 该文件所在的直接父目录名（顶层文件用 category）。
-void ScanInto(const std::string& dir, const std::string& album, std::vector<LocalTrack>& out) {
-    if (out.size() >= kMaxItems) return;
-    DIR* d = opendir(dir.c_str());
-    if (d == nullptr) return;  // 目录不存在/无权限：跳过
-    struct dirent* ent;
-    while ((ent = readdir(d)) != nullptr && out.size() < kMaxItems) {
-        const char* name = ent->d_name;
-        if (name[0] == '.') continue;  // 跳过 "." ".." 及隐藏项
-        std::string full = dir + "/" + name;
-        struct stat st;
-        if (::stat(full.c_str(), &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            ScanInto(full, name, out);  // 子目录名即专辑名
-        } else if (S_ISREG(st.st_mode) && HasMp3Ext(name)) {
-            std::string title = BaseNoExt(name);
-            std::string sub = album;
-            ApplyId3Meta(title, sub, full);
-            out.push_back({title, sub, full});
-        }
-    }
-    closedir(d);
-}
-
 // ---- 三个 mode ------------------------------------------------------------
 
 char* RunSearch(const cJSON* args, bool* is_error) {
     const char* query = GetStr(args, "query");
-    const std::string root = mhal::storage::GetMountPoint();
-    std::vector<LocalTrack> all;
-    ScanInto(root + "/Music", "Music", all);
-    ScanInto(root + "/Podcasts", "Podcasts", all);
+    // 全库扫描（目录序）+ 逐首补 ID3 供按真歌名匹配——首次全量读 tag 慢（几百首数秒，
+    // worker 线程、LLM 工具往返本身秒级），此后进程内缓存秒回。
+    uint32_t t0 = lv_tick_get();
+    std::vector<MediaItem> all = pi_media_library::ScanLibrary();
+    for (MediaItem& it : all) pi_media_library::ApplyId3(it);
+    ESP_LOGI(TAG, "search: %d tracks scanned+id3 in %ums", (int)all.size(),
+             (unsigned)(lv_tick_get() - t0));
 
     cJSON* out = cJSON_CreateObject();
     cJSON_AddBoolToObject(out, "ok", true);
     cJSON_AddStringToObject(out, "kind", "local");
     cJSON* items = cJSON_AddArrayToObject(out, "items");
-    int idx = 0;
-    for (const LocalTrack& t : all) {
-        if (query != nullptr && !CaseInStr(t.title, query) && !CaseInStr(t.album, query)) continue;
+    int matched = 0;
+    int shown = 0;
+    for (const MediaItem& t : all) {
+        if (query != nullptr && !CaseInStr(t.title, query) && !CaseInStr(t.subtitle, query)) continue;
+        matched++;
+        if ((size_t)shown >= kMaxItems) continue;  // 只截输出，total 仍如实计数
         cJSON* o = cJSON_CreateObject();
-        cJSON_AddNumberToObject(o, "index", idx++);
+        cJSON_AddNumberToObject(o, "index", shown++);
         cJSON_AddStringToObject(o, "title", t.title.c_str());
-        cJSON_AddStringToObject(o, "album", t.album.c_str());
-        cJSON_AddStringToObject(o, "path", t.path.c_str());
+        cJSON_AddStringToObject(o, "album", t.subtitle.c_str());
+        cJSON_AddStringToObject(o, "path", t.path_or_url.c_str());
         cJSON_AddItemToArray(items, o);
     }
+    cJSON_AddNumberToObject(out, "total", matched);  // 匹配总数（items 只给前 kMaxItems 条）
     cJSON_AddStringToObject(out, "hint",
-                            idx > 0 ? "to play, call media mode:'play' with paths:[the file paths above]"
-                                    : "no mp3 found under Music/ or Podcasts/ on the SD card");
+                            matched > 0
+                                ? "to play, call media mode:'play' with paths:[ONE file path] — the "
+                                  "device queues the WHOLE library from that track (folder order); "
+                                  "pass several paths only for an explicit custom queue"
+                                : "no mp3 found under Music/ or Podcasts/ on the SD card");
     char* printed = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     if (printed == nullptr) return Fail(is_error, "OOM");
@@ -238,13 +175,21 @@ char* BuildPlayResult(bool* is_error, const std::vector<MediaItem>& items, int s
         cJSON_AddStringToObject(out, "title", items[start].title.c_str());
         cJSON_AddStringToObject(out, "subtitle", items[start].subtitle.c_str());
     }
-    // tracks：AI 可原样塞进 ui_render 的 data.tracks，让 list bind_data:'tracks' 渲染整份列表。
+    // tracks：AI 可原样塞进 ui_render 的 data.tracks，让 list bind_data:'tracks' 渲染列表。
+    // 全库扩列后必须封顶（几百条 JSON 会吃满模型上下文）：从起播曲开始最多 kTracksForLlm
+    // 条；count 字段已是全量，截断时补 tracks_note 说明。
+    size_t lo = (start >= 0 && start < static_cast<int>(items.size())) ? (size_t)start : 0;
     cJSON* tracks = cJSON_AddArrayToObject(out, "tracks");
-    for (const MediaItem& it : items) {
+    for (size_t k = lo; k < items.size() && k - lo < kTracksForLlm; k++) {
         cJSON* o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "title", it.title.c_str());
-        cJSON_AddStringToObject(o, "subtitle", it.subtitle.c_str());
+        cJSON_AddStringToObject(o, "title", items[k].title.c_str());
+        cJSON_AddStringToObject(o, "subtitle", items[k].subtitle.c_str());
         cJSON_AddItemToArray(tracks, o);
+    }
+    if (items.size() > kTracksForLlm) {
+        cJSON_AddStringToObject(out, "tracks_note",
+                                "tracks lists only the next 40 from the playing index; count is the "
+                                "full queue length");
     }
     // 播放器卡片已整体删除（设备内置播放器 UI 自动出现），明确告知别渲染卡片、别引用
     // media.* 路径（渲染层同步硬拦，见 pi_card_host / pi_card_preview）。
@@ -298,23 +243,35 @@ char* RunPlay(const cJSON* args, bool* is_error) {
     }
 
     if (cJSON_IsArray(jpaths) && cJSON_GetArraySize(jpaths) > 0) {
-        std::vector<MediaItem> items;
+        std::vector<std::string> req;
         const cJSON* el = nullptr;
         cJSON_ArrayForEach(el, jpaths) {
-            if (items.size() >= kMaxPlaylist) break;
+            if (req.size() >= kMaxPlaylist) break;
             if (!cJSON_IsString(el) || el->valuestring[0] == '\0') continue;
+            req.push_back(el->valuestring);
+        }
+        if (req.empty()) return Fail(is_error, "paths is empty or has no valid file path");
+        // 单曲兜底：镜像电台"单台扩全台"——列表扩成全曲库（目录序）、从所点曲起播，
+        // Next/Prev 永远有歌可切且跨目录连播。路径陈旧（不在库里）退回单曲列表。
+        if (req.size() == 1) {
+            std::vector<MediaItem> lib = pi_media_library::ScanLibrary();
+            int at = pi_media_library::IndexOfPath(lib, req[0]);
+            if (at >= 0) {
+                pi_media_library::ApplyId3(lib[at]);  // 起播曲补真名（模型要在回复里报）
+                return BuildPlayResult(is_error, lib, at, "local");
+            }
+        }
+        // 显式点名队列（模型给的顺序即队列）：逐首补 ID3+时长（≤kMaxPlaylist，秒内）。
+        std::vector<MediaItem> items;
+        for (const std::string& p : req) {
             MediaItem m;
-            m.title = BaseNoExt(el->valuestring);
-            m.subtitle = ParentDirName(el->valuestring);
-            ApplyId3Meta(m.title, m.subtitle, el->valuestring);  // ID3 覆盖（Stage E）
-            m.path_or_url = el->valuestring;
+            m.title = pi_media_library::BaseNoExt(p);
+            m.subtitle = pi_media_library::ParentDirName(p);
+            m.path_or_url = p;
             m.is_stream = false;
-            // Xing/VBRI 帧数或 CBR 码率估算（同一文件已开过一次读 tag，这里再开一次只
-            // 读首帧头几 KB）；0 = 未知，UI 显示 --:--。
-            m.duration_s = media_id3::ProbeDurationS(el->valuestring);
+            pi_media_library::ApplyId3(m);
             items.push_back(std::move(m));
         }
-        if (items.empty()) return Fail(is_error, "paths is empty or has no valid file path");
         int start = 0;
         const cJSON* jstart = cJSON_GetObjectItemCaseSensitive(args, "start_index");
         if (cJSON_IsNumber(jstart)) start = static_cast<int>(jstart->valuedouble);
@@ -484,9 +441,13 @@ void MaybeFillTracks(const cJSON* spec_root, cJSON* data) {
     if (existing != nullptr) cJSON_DeleteItemFromObjectCaseSensitive(data, "tracks");
     cJSON* tracks = cJSON_AddArrayToObject(data, "tracks");
     if (tracks == nullptr) return;
-    // 窗口化：与 play 工具的列表上限一致，防超大歌单撑爆节点预算前的 data 内存。
-    const int cap = static_cast<int>(kMaxPlaylist);
-    for (int i = 0; i < n && i < cap; i++) {
+    // 窗口化：全库列表几百条会撑爆节点预算前的 data 内存——从当前曲起最多 kTracksForLlm
+    // 条（与 play 工具返回的 tracks 同窗口语义）。
+    const int cap = static_cast<int>(kTracksForLlm);
+    int lo = mc.index();
+    if (lo < 0 || lo >= n) lo = 0;
+    int filled = 0;
+    for (int i = lo; i < n && filled < cap; i++, filled++) {
         const MediaItem it = mc.item_at(i);
         cJSON* o = cJSON_CreateObject();
         if (o == nullptr) break;
@@ -494,7 +455,7 @@ void MaybeFillTracks(const cJSON* spec_root, cJSON* data) {
         cJSON_AddStringToObject(o, "subtitle", it.subtitle.c_str());
         cJSON_AddItemToArray(tracks, o);
     }
-    ESP_LOGI(TAG, "tracks fallback filled: %d rows from MediaController", std::min(n, cap));
+    ESP_LOGI(TAG, "tracks fallback filled: %d rows from MediaController (from idx %d)", filled, lo);
 }
 
 }  // namespace pi_card_media

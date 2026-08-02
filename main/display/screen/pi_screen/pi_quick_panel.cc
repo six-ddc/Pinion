@@ -380,16 +380,14 @@ void BuildActionGrid(lv_obj_t* parent) {
         },
         LV_EVENT_CLICKED, nullptr);
 
-    // 「♪ 音乐」：继续上次播放。正在播 / 有持久化记录则打开播放页续播；都没有点按
-    // 只吐 toast（不置灰——同「文件」的判定策略，点按时判一次足够）。
+    // 「♪ 音乐」：正在播 / 有持久化记录则续播；无记录但 SD 有歌则全库从头播（按目录
+    // 排序连播）。SD 没音乐才吐 toast（不置灰——同「文件」的判定策略，点按时判一次足够）。
     lv_obj_t* btn_music = MakeGridBtn(grid, "音乐");
     pi_card::MakeIcon(lv_obj_get_child(btn_music, 0), "music", 24, Tok::Dim);
     lv_obj_add_event_cb(
         btn_music,
         [](lv_event_t*) {
-            // "没有可继续的播放"
-            const char* kNone =
-                "没有可继续的播放";
+            const char* kNone = "SD 卡上没有音乐";
             if (!pi_media::HasResumable()) {
                 ShowToast(kNone, &font_puhui_20_4, Tok::Dim);
                 return;
@@ -399,16 +397,9 @@ void BuildActionGrid(lv_obj_t* parent) {
                     pi_quick_panel::Close();
                     break;
                 case pi_media::ResumeResult::NoNetwork:
-                    // "无网络连接"
-                    ShowToast("无网络连接",
-                              &font_puhui_20_4, Tok::Dim);
+                    ShowToast("无网络连接", &font_puhui_20_4, Tok::Dim);
                     break;
-                case pi_media::ResumeResult::FilesGone:
-                    // "文件已不存在"
-                    ShowToast("文件已不存在",
-                              &font_puhui_20_4, Tok::Dim);
-                    break;
-                default:
+                default:  // NoRecord / FilesGone：都归结为曲库空
                     ShowToast(kNone, &font_puhui_20_4, Tok::Dim);
                     break;
             }

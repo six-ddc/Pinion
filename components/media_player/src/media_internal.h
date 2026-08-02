@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -100,7 +101,11 @@ class ByteRing {
 struct Pump {
     PumpHost* host = nullptr;
     uint32_t session = 0;                 // 会话代次（与 controller 当前代次比对，丢弃陈旧回调）
-    std::vector<MediaItem> playlist;      // 起播时的列表快照（pump 自持，解耦 controller 锁）
+    // 起播时的列表快照：与 controller 共享同一不可变 vector（shared_ptr 拷贝 O(1)）。
+    // 全曲库几百条的 string 小分配落内部 SRAM（SPIRAM_MALLOC_ALWAYSINTERNAL），逐泵
+    // 深拷贝会在 zombie 堆积时多份并存打穿内部堆；controller 建列表后绝不改写该 vector
+    // （惰性 meta 走 meta_overlay_ 叠加层），无锁共享读安全。
+    std::shared_ptr<const std::vector<MediaItem>> playlist;
     int start_index = 0;                  // 起播索引
     uint64_t skip_out_samples = 0;        // 续播/暂停恢复：解码后先丢弃这么多输出样本（文件 seek 近似）
     uint32_t playback_gen = 0;            // 起播时捕获的 FeedPlayback 代次（打断残音竞态收口）
