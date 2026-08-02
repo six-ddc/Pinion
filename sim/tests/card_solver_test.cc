@@ -762,6 +762,106 @@ TEST_CASE("G-NOWRAP: cols.num 强制数值列，非数值契约文本 cell 轨�
     cJSON_Delete(intent);
 }
 
+TEST_CASE("H1: 全数值列表格（无 stretch 列）剩余宽度摊给所有列，表格铺满整幅") {
+    // 真机行情卡实录：四列全是数值 bind → 全 NUM 轨、无 stretch 列，修前剩余宽度悬空、
+    // 表格停在自然宽靠左（右半空）。修后 Σtrack + gap×(ncol-1) == vw。
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cols":[{"title":"名称"},{"title":"现价","num":true},{"title":"涨跌","num":true},{"title":"涨跌幅","num":true}],
+         "rows":[
+           [{"type":"label","role":"value","bind":"stock.a.price","text":"茅台"},
+            {"type":"label","role":"value","bind":"stock.a.price"},
+            {"type":"label","role":"value","bind":"stock.a.chg"},
+            {"type":"label","role":"value","bind":"stock.a.pct"}],
+           [{"type":"label","role":"value","bind":"stock.b.price","text":"腾讯"},
+            {"type":"label","role":"value","bind":"stock.b.price"},
+            {"type":"label","role":"value","bind":"stock.b.chg"},
+            {"type":"label","role":"value","bind":"stock.b.pct"}]
+         ]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    int sum = 0;
+    for (int t : g.track_w) sum += t;
+    CHECK_EQ(sum + kStackGap * (static_cast<int>(g.track_w.size()) - 1), 600);
+    CheckS1S2(lo, 600);
+    cJSON_Delete(intent);
+}
+
+TEST_CASE("H2: 数值 bind 无 fmt → 代表串兜底加宽到 '88888.88'；静态数值 text 直接量真身") {
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cols":[{"title":"K"},{"title":"V","num":true}],
+         "rows":[
+           [{"type":"label","text":"现价"},{"type":"label","role":"value","bind":"stock.a.price"}],
+           [{"type":"label","text":"指数"},{"type":"label","role":"value","text":"3832.26","mono":true}]
+         ]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    // 无 fmt 数值 bind：轨道 ≥ "88888.88" 代表串宽（修前只有 "88888"，活值 7 字符被左裁）。
+    int rep_w = MeasureStub("88888.88", pi_card::solver::kRoleValue, true, nullptr);
+    // 静态数值 text "3832.26"：轨道 ≥ 真身测量宽（修前量的是 5 字符代表串）。
+    int text_w = MeasureStub("3832.26", pi_card::solver::kRoleValue, true, nullptr);
+    int need = rep_w > text_w ? rep_w : text_w;
+    CHECK(g.track_w[1] >= need);
+    CheckS1S2(lo, 600);
+    cJSON_Delete(intent);
+}
+
+TEST_CASE("H3: 表头标题参与定轨——窄数值列的 title 不再折行") {
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cols":[{"title":"名"},{"title":"涨跌幅百分比","num":true}],
+         "rows":[
+           [{"type":"label","text":"甲"},{"type":"label","role":"value","text":"1","mono":true}]
+         ]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    int title_w = MeasureStub("涨跌幅百分比", pi_card::solver::kRoleSection, true, nullptr);
+    CHECK(g.track_w[1] >= title_w);
+    CheckS1S2(lo, 600);
+    cJSON_Delete(intent);
+}
+
+TEST_CASE("H4: 独占行的 side:end 控件右锚定，不再被 S7 默认居中吞掉") {
+    // 标题/眉标恒 SPAN_ALL 独占行，模型想放"标题右上角"的角标按钮只能落下一行——side:end
+    // 是它仅存的靠右意图（真机行情卡刷新钮实录：修前孤零零居中）。
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cells":[{"type":"label","role":"eyebrow","text":"行情"},
+                  {"type":"label","role":"title","text":"自选股"},
+                  {"type":"button","icon":"refresh-cw","variant":"ghost","side":"end"}]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    bool found = false;
+    for (const auto& c : g.cells) {
+        if (c.row == 2) {  // row0=eyebrow row1=title row2=button
+            found = true;
+            CHECK_EQ(c.align, std::string("end"));
+            CHECK_EQ(c.x + c.w, 600);
+        }
+    }
+    CHECK(found);
+    // 对照：无 side:end 的独占行控件维持 S7 居中。
+    Layout lo2;
+    cJSON* intent2 = SolveJson(R"({"root":[
+        {"cells":[{"type":"switch","checked":true}]}
+    ]})",
+                               600, lo2);
+    bool found2 = false;
+    for (const auto& c : lo2.grids[0].cells) {
+        // switch 契约 align 默认 end，但独占行无 side:end 声明 → S7 居中
+        found2 = true;
+        CHECK_EQ(c.align, std::string("center"));
+    }
+    CHECK(found2);
+    cJSON_Delete(intent);
+    cJSON_Delete(intent2);
+}
+
 int main() {
     return RUN_ALL_TESTS();
 }

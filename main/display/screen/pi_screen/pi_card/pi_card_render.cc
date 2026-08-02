@@ -2478,7 +2478,8 @@ struct LintState {
     int grid_count = 0;
     int primary_count = 0;
     bool has_label = false;
-    bool emoji_seen = false;  // 整卡只提示一次，别按节点刷屏
+    bool emoji_seen = false;      // 整卡只提示一次，别按节点刷屏
+    bool text_bind_seen = false;  // 同上：text+bind 并存（bind 覆盖 text）只提示一次
     std::vector<std::string>* hints = nullptr;
 };
 
@@ -2564,6 +2565,14 @@ void LintLeaf(const cJSON* leaf, const cJSON* data, LintState& st) {
                 "This label has no text and no bind/bind_data; it renders empty.");
         } else {
             st.has_label = true;
+        }
+        // text + bind 并存：活值到达即覆盖静态 text（真机行情卡实录：名称列全变成价格）。
+        // 整卡只提示一次，别按节点刷屏。
+        if (!st.text_bind_seen && text != nullptr && text[0] != '\0' && HasKey(leaf, "bind")) {
+            st.text_bind_seen = true;
+            st.hints->push_back(
+                "A label has both static text and a bind — the live bound value REPLACES the "
+                "text (a name column must not bind a value path); use two labels instead.");
         }
         // mono/value 走数字等宽字体，无 CJK 字形——fmt 里夹中文单位（"%d分钟"）上屏就是
         // 豆腐块（Haiku 实测踩中）。单位放行首的文字 label 里才安全。

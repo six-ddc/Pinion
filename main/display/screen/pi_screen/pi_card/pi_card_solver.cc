@@ -264,6 +264,19 @@ Contract ContractFor(const Input& in, const cJSON* cell, int viewport_w) {
         if (numeric) {
             std::string rep = FmtRep(fmt);
             int w = Measure(in, rep.c_str(), rc == kRoleNone ? kRoleValue : rc, true);
+            // 数值 cell 是 NOWRAP 不截断，轨道装不下=读数错误，宽度必须宁大勿小（§2.2）：
+            //  - fmt 缺席的数值 bind：活值形如 "3832.26"（7 字符）而缺省代表串 "88888" 只有
+            //    5 字符 → 左裁掉头一位（真机行情卡实录）。用 "88888.88" 保守代表串兜底。
+            //  - 静态数值 text（含 mono 静态串）：内容已知，直接量它取 max——代表串只是预测，
+            //    真身在手不该输给预测。
+            if (has_bind && (!fmt || !*fmt)) {
+                int bw = Measure(in, "88888.88", rc == kRoleNone ? kRoleValue : rc, true);
+                if (bw > w) w = bw;
+            }
+            if (text && *text) {
+                int tw = Measure(in, text, rc == kRoleNone ? kRoleValue : rc, true);
+                if (tw > w) w = tw;
+            }
             c.occ = Occ::kInline;
             c.align = Align::kEnd;
             c.is_num = true;
@@ -497,16 +510,20 @@ void SolveCells(const Input& in, const cJSON* cells, int gi, int vw, int gap, cJ
 
         // 普通 INLINE/FILL 行布局。
         int n = (int)line.size();
-        // 单个 cell 独占行且不可拉 → 居中（S7）。
+        // 单个 cell 独占行且不可拉 → 居中（S7）；但显式 side:"end" 优先于默认居中——
+        // 标题/眉标是 SPAN_ALL 恒独占行，模型想放"标题行右上角"的角标按钮（真机行情卡的
+        // 刷新钮实录）只能落到下一行，此时 side:end 是它仅存的"靠右"意图表达，吞掉它就
+        // 变成孤零零居中一颗钮。
         if (n == 1 && !cs[line[0]].stretch) {
             Contract& c = cs[line[0]];
             int w = c.is_arc ? arc_d : (c.pref_w > c.min_w ? c.pref_w : c.min_w);
             if (w > vw) w = vw;
-            int x = (vw - w) / 2;
+            int x = c.side_end ? (vw - w) : (vw - w) / 2;
             if (x < 0) x = 0;
             // 独占行但非 stretch：一定是非文本控件（文本 label 恒 stretch=true，不会走这支），
             // truncate_ok 恒为 false，NOWRAP 语义。
-            EmitCell(cells_out, gi, c.ci, r, 0, 1, x, w, Align::kCenter, c.truncate_ok, WrapMode::kNowrap);
+            EmitCell(cells_out, gi, c.ci, r, 0, 1, x, w, c.side_end ? Align::kEnd : Align::kCenter,
+                     c.truncate_ok, WrapMode::kNowrap);
             row_h = c.h;
             total_h += row_h + (r ? gap : 0);
             continue;
@@ -861,6 +878,15 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
                 if (w > base) base = w;
             }
         }
+        // 表头标题参与定轨：title 比列内容宽时按标题定——否则「涨跌幅」这类三字表头落进
+        // 窄数值轨会折行/截断（表头行与数据行共享同一套轨道，宽度契约必须同时罩住两者）。
+        if (cJSON_IsArray(cols) && c < cJSON_GetArraySize(cols)) {
+            const char* title = GetStr(cJSON_GetArrayItem(cols, c), "title");
+            if (title && *title) {
+                int tw = Measure(in, title, kRoleSection, true);
+                if (tw > base) base = tw;
+            }
+        }
         track[c] = base;
     }
 
@@ -880,6 +906,19 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
         int extra = rem - base * (int)stretch_cols.size();
         for (int k = 0; k < (int)stretch_cols.size(); ++k)
             track[stretch_cols[k]] += base + (k < extra ? 1 : 0);
+    } else if (rem > 0 && ncol > 0) {
+        // 全 NUM/FIXED 列（一个 stretch 列都没有，如整表全是数值 bind 的行情卡）：剩余宽度
+        // 按轨道宽比例摊给所有列铺满整幅——否则表格停在自然宽、右半悬空（真机实录）。
+        // 数值列加宽是安全的：NOWRAP 只要求轨道 ≥natural，cell 在更宽的轨道里仍按列对齐
+        // （num 恒右对齐）落位，观感恰是行情表的「列拉开」样式。
+        int given = 0;
+        for (int c = 0; c < ncol; ++c) {
+            int add = (c == ncol - 1)
+                          ? rem - given
+                          : (sum > 0 ? (int)((long long)rem * track[c] / sum) : rem / ncol);
+            track[c] += add;
+            given += add;
+        }
     } else if (rem < 0) {
         // 压缩 TEXT/FILL 列（不压 NUM/FIXED）。
         for (int c = 0; c < ncol && rem < 0; ++c) {
