@@ -1888,10 +1888,8 @@ int main() {
     if (const char* dp = std::getenv("PI_SIM_DUMP_PROMPT")) {
         FILE* f = std::fopen(dp, "w");
         if (f) {
-            // schema 走 pi_card_render_schema()：随 ui/cardfmt（或 PI_SIM_CARDFMT）二选一，
-            // 与真机 TOOLS[] 实际注入的一致（编译期宏只覆盖 json 版）。
             std::fprintf(f, "===SYSTEM_PROMPT===\n%s\n===RENDER_DESC===\n%s\n===RENDER_SCHEMA===\n%s\n",
-                         pi_card_system_prompt(), pi_card_render_desc(), pi_card_render_schema());
+                         pi_card_system_prompt(), pi_card_render_desc(), PI_CARD_RENDER_SCHEMA);
             std::fclose(f);
             std::fprintf(stderr, "[sim] dumped prompt+schema to %s\n", dp);
         }

@@ -78,23 +78,27 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
         return;
     }
 
-    // XML 通道（docs/CARD_XML.md §3 P3a）：流式吐的是 {"xml":"<card>…"}，partial parser 把
+    // 线格式 = XML（docs/CARD_XML.md §3）：流式吐的是 {"xml":"<card>…"}，partial parser 把
     // 未闭合的字符串值补全成节点，这里逐帧把当前 xml 前缀过 XmlCompile（宽容截断：尾部残缺
     // token 丢弃、未闭合自动闭合）。编译确定性保证已冻结前序 grid 的 JSON 逐帧一致（
-    // card_xml_test「前缀单调性」锁定），signature 不抖；产物与 JSON 通道同构，后面的
-    // display 门控/media 拦截/grid 签名整块重渲机器原样复用，零分叉。snap/compiled 生命期
-    // 同帧：下面所有 early-return 都要两个一起删。
+    // card_xml_test「前缀单调性」锁定），signature 不抖；产物进 display 门控/media 拦截/
+    // grid 签名整块重渲机器。xml 键还没现身（或还没吐出任何元素）就安静等下一帧。
+    // snap/compiled 生命期同帧：下面所有 early-return 都要两个一起删。
     cJSON* compiled = nullptr;
     const cJSON* xmlj = cJSON_GetObjectItem(snap, "xml");
-    if (cJSON_IsString(xmlj) && xmlj->valuestring[0] != '\0') {
+    if (!cJSON_IsString(xmlj) || xmlj->valuestring[0] == '\0') {
+        cJSON_Delete(snap);
+        return;
+    }
+    {
         std::string xerr;
         if (!XmlCompile(xmlj->valuestring, std::strlen(xmlj->valuestring), &compiled, nullptr,
                         xerr)) {
             cJSON_Delete(snap);
-            return;  // 还没吐出任何元素：安静等下一帧（与 JSON 通道 root 未现身同口径）
+            return;
         }
     }
-    const cJSON* env = compiled ? compiled : snap;  // 后续统一读 env（信封）
+    const cJSON* env = compiled;  // 后续统一读 env（编译出的信封）
 
     // display：值确定不是 "chat" 时永久放弃（仅 chat 模式预览；overlay/standby 走各自的渲染
     // 通路，跟聊天流内联生长无关）。没出现这个键就按默认口径（chat）继续。注意 partial parser

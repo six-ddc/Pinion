@@ -847,22 +847,6 @@ std::string BindStateJson(const cJSON* root) {
     return out;
 }
 
-// ---- 线格式开关（docs/CARD_XML.md D2）：NVS ui/cardfmt 0=json 1=xml，默认 json ----
-// 单次启动只注入一套提示词/schema（construct-once 缓存与 desc/prompt 同生命周期），改开关
-// 需重启生效。xml 参数键本身**不受开关控制**——host 双通道常开（有 xml 键就走 XmlCompile），
-// 开关只决定教给模型哪套线格式。sim 里 PI_SIM_CARDFMT=1 免写 ini 直接切（A/B 工装）。
-int CardFmt() {
-    static int fmt = -1;
-    if (fmt >= 0) return fmt;
-#ifndef ESP_PLATFORM
-    if (const char* e = std::getenv("PI_SIM_CARDFMT")) {
-        fmt = std::atoi(e) != 0 ? 1 : 0;
-        return fmt;
-    }
-#endif
-    fmt = Settings("ui", false).GetInt("cardfmt", 0) != 0 ? 1 : 0;
-    return fmt;
-}
 
 }  // namespace
 
@@ -881,10 +865,10 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         *is_error = true;
         return Dup(e);
     };
-    // XML 通道（docs/CARD_XML.md §3）：args 有 "xml" 串就先 XmlCompile 成同构信封，之后
-    // 与 JSON 通道汇入**同一漏斗**（Repair/Validate/Lint/入队全复用，下面的 spec 指针二选一，
-    // 逻辑零分叉）。通道常开，不受 cardfmt 开关控制（开关只决定教模型哪套格式）。编译 note
-    // 与 Repair note 同口径——都是「你给的和实际渲染的不一样」，随 hints 回给 LLM。
+    // 线格式 = XML（docs/CARD_XML.md §3）：args 的 "xml" 串经 XmlCompile 编译成 cJSON 信封
+    // 再进 Repair/Validate/Lint/入队漏斗。直接给 "root"（编译后 spec）是**内部/测试通道**
+    // ——sim 语料与脚手架直喂用，不在提示词/描述里教，LLM 面只有 xml。编译 note 与 Repair
+    // note 同口径——都是「你给的和实际渲染的不一样」，随 hints 回给 LLM。
     std::vector<std::string> repair_notes;  // 修复动作（如 >8 grids 截断）随 hints 回给 LLM
     struct CJsonDel {
         void operator()(cJSON* j) const { cJSON_Delete(j); }
@@ -1094,14 +1078,10 @@ std::string BuildPathsClause(bool full) {
 // 动态 ui_render 工具描述：静态 HEAD/TAIL 骨架之间插 BuildPathsClause(true)。construct-once，
 // 缓存进 function-static std::string：pi_agent_task_start 只在启动时借一次这个指针塞进
 // TOOLS[].def.description，该指针必须常驻——static 局部变量的存储期覆盖整个固件运行期。
-// HEAD/TAIL 随 cardfmt 二选一（XML 版见 pi_card_tools.h 的 *_XML 宏），路径/命令清单与
-// STANDBY 段两套共用。
 extern "C" const char* pi_card_render_desc(void) {
     static std::string s;
     if (!s.empty()) return s.c_str();
-    const bool xml = CardFmt() == 1;
-    s = std::string(xml ? PI_CARD_DESC_HEAD_XML : PI_CARD_DESC_HEAD) + BuildPathsClause(true) + " " +
-        (xml ? PI_CARD_DESC_TAIL_XML : PI_CARD_DESC_TAIL) +
+    s = std::string(PI_CARD_DESC_HEAD) + BuildPathsClause(true) + " " + PI_CARD_DESC_TAIL +
         " COMMANDS (invoke cmd): " + BuildCommandsClause(true) +
         ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (replaces any prior "
         "pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an on-screen ✕ also removes "
@@ -1109,37 +1089,30 @@ extern "C" const char* pi_card_render_desc(void) {
     return s.c_str();
 }
 
-// ui_render 参数 schema（编译期常量二选一，见 pi_card_tools.h 的选择理由注释）。
-extern "C" const char* pi_card_render_schema(void) {
-    return CardFmt() == 1 ? PI_CARD_RENDER_SCHEMA_XML : PI_CARD_RENDER_SCHEMA;
-}
 
 namespace {
 
-// 两套线格式提示词的共享段——单一来源（CARD_XML.md §6：动态清单两套共用，不出现第三份
-// 硬编码）：人格开场 + WRITABLE/HOME WIDGET/DEVICE COMMANDS 尾段。invoke_syntax 是两套唯一
-// 的措辞分叉点（JSON 教 {do:'invoke',cmd}，XML 教 invoke:cmd 微语法步）。
+// system prompt 的拼接件：人格开场 + WRITABLE/HOME WIDGET/DEVICE COMMANDS 尾段（活体
+// 路径/命令清单与 DESC 共用 BuildPathsClause/BuildCommandsClause，不出现第二份硬编码）。
 constexpr const char* kPromptIntro =
     "You are pi, the on-device assistant in a palm-size 720×720 touch screen; the user also "
     "talks by voice. Reply short, warm, in the user's language (usually Chinese). Text is read "
     "aloud by TTS -- avoid markdown symbols, links, long bullet lists.\n\n";
 
-std::string SharedPromptTail(const char* invoke_syntax) {
+std::string SharedPromptTail() {
     return std::string("WRITABLE device paths you can set: ") + BuildPathsClause(false) +
            ".\n\n"
            "HOME WIDGET -- display:'standby' pins one card to the home/clock screen (survives new "
            "chats/reboot). Prefer local actions/invoke in it -- a report runs you in the "
            "BACKGROUND, keep rare. Remove via ui_close card:'pin'.\n"
-           "DEVICE COMMANDS -- " +
-           invoke_syntax +
+           "DEVICE COMMANDS -- invoke:cmd (a tap step)"
            " for real actions a data path can't do (reconnect, "
            "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
            BuildCommandsClause(false) + ".\n\n";
 }
 
-// XML 版 system prompt（cardfmt=1，docs/CARD_XML.md §6）：CARDS 教学换线格式词表 + 五示例
-// 逐一翻译成 XML（示例红线：原文过管线零 hints——card_xml_test/伤疤语料锁定）。NEVER 清单
-// 按 XML 语境改写（一维 rows/裸叶子等错型已被语法本身消化，保留 media 卡/emoji 两条）。
+// system prompt 正文（docs/CARD_XML.md §6）：CARDS 教学 + 五示例（示例红线：原文过管线零
+// hints——card_xml_test/伤疤语料锁定）。NEVER 清单收拢实录高频错型（media 卡/emoji 等）。
 std::string BuildXmlSystemPrompt() {
     return std::string(kPromptIntro) +
         "CARDS -- draw real interactive UI with ui_render (+ ui_update/ui_close) instead of "
@@ -1184,7 +1157,7 @@ std::string BuildXmlSystemPrompt() {
         "UPDATE vs RE-RENDER: change text/value/visibility/data via ui_update (JSON args "
         "id+props/patches/data, unchanged), not a fresh ui_render; re-render only if structurally "
         "different.\n\n" +
-        SharedPromptTail("invoke:cmd (a tap step)") +
+        SharedPromptTail() +
         "Example 1, control card: <card><grid><icon name='volume'/><slider bind='audio.volume'/>"
         "<label role='value' bind='audio.volume' fmt='%d%%'/></grid><grid><icon name='sun'/>"
         "<label>浅色</label><switch bind='ui.theme' side='end'/></grid></card>\n"
@@ -1217,98 +1190,7 @@ std::string BuildXmlSystemPrompt() {
 extern "C" const char* pi_card_system_prompt(void) {
     static std::string s;
     if (!s.empty()) return s.c_str();
-    if (CardFmt() == 1) {
-        s = BuildXmlSystemPrompt();
-        return s.c_str();
-    }
-    // 预算超标后精简（P4/media 累计撑爆 9216B 预算）：措辞收紧 + 去与 TAIL 重复的 PRESETS
-    // 形状/示例（TAIL 现只写"see system prompt"）；规则/关键字/preset 形状/路径清单一个不少，
-    // 只留 1 个示例（confirm/list 的用法已在 PRESETS 小节与 HEAD 的 list{} 条目里讲过）。
-    s = std::string(kPromptIntro) +
-        // v2（CARD_V2.md §10）：v1 的 DESIGN/COMPACT/LAYOUT 三段布局教学（row/grow/justify）已
-        // 随 grid-only 重构整段替换——布局改由固件的 solver 纯函数决定，模型只声明"有哪些控件、
-        // 语义是什么"。CHOOSE 段替代了 v1"WHEN A CARD, NOT CHAT"里提到的 LIST（v1 类型，已删，
-        // 换成 bind_rows）。原独立的"You have a SCREEN"引子段与 CARDS 段开头语义重复（都在讲
-        // "画UI而非描述"），合并成一段省字节（4KB 预算，见步骤5验收）。
-        "CARDS -- draw real interactive UI with ui_render (+ ui_update/ui_close) instead of "
-        "describing controls/status/choices. There is NO read tool -- rendering a card that binds a "
-        "device path IS how you read the device (return value gives live values as state). A card = "
-        "\"root\": an ARRAY of grid blocks stacked top-to-bottom. Only ONE container: grid, no "
-        "nesting; depth is fixed card -> grid -> leaf. You never write x/y, width, gaps, columns, "
-        "grow, justify or align -- the device lays it out from your intent. Just say WHAT controls "
-        "exist.\n\n"
-        "GRID: three forms, exactly one key each:\n"
-        "- \"cells\":[leaf,...] -- a flow wrapped by size. Use for headers/control rows (icon+slider+"
-        "value)/button groups; full-width leaves (divider/chart/choice/qrcode) get their own line.\n"
-        "- \"rows\":[[leaf,...],...], cols?:[{title,num}] -- an aligned TABLE sharing columns; "
-        "num:true right-aligns+mono that column; one cell/row = a vertical menu. Use for status/"
-        "forms/dashboards.\n"
-        "- \"item\":[leaf,...],\"bind_rows\":\"key\",max?,empty? -- repeat item once per data[\"key\"] "
-        "element; strings use {i}/{n}/{item.FIELD}. Row taps: report/set/close only.\n\n"
-        "LEAVES: label{text,role,bind,bind_data,fmt,mono} - button{text,icon,variant,on_click} - "
-        "slider/arc/bar/switch/choice{bind/value/options,on_change} - icon(decor; tappable="
-        "button{icon}) - divider - qrcode{text} - "
-        "chart{bind_history} - stock_chart{symbol}. role ramp: eyebrow|kicker|section|title|heading|"
-        "label|value|caption. Header = eyebrow+title in one cells grid. Big number = role:value "
-        "(mono, right-aligned in tables). Controls carry their own state -- don't restate it in "
-        "words.\n\n"
-        "STYLE: lean on pi's look. tone/fill = semantic tokens (accent/ok/err/tx/dim/faint/card2/"
-        "line...), never hex. ONE primary(amber) button/card, rest ghost/plain/default. "
-        "\"side\":\"end\" pushes a cell to the row's right edge. Grid \"fill\":\"card2\" gives a "
-        "background box. Labels 1-3 words; num columns don't truncate, text columns do. Max 8 "
-        "grids/64 leaves per card; split big dashboards.\n\n"
-        "CHOOSE: SET something -> a control grid that binds the path (writes hardware directly). "
-        "STATUS -> a rows table binding the paths. CHOICE/CONFIRM/FORM/MENU -> render it, the tap "
-        "rides back on report. Chit-chat -> just text. Playback UI is built-in — never render "
-        "player/media cards. Prefer display:'chat'; \"overlay\" only for a "
-        "modal moment (auto-closes).\n\n"
-        "ACTION ECONOMICS -- can the device finish this itself? YES -> a LOCAL action (close/set/"
-        "toggle/show/hide/patch): instant, zero round-trip, invisible in chat. Only REPORT to "
-        "generate new content or a NEW decision -- full round-trip, shows as a user message; never "
-        "report to browse/expand/echo a value, use toggle/patch. A report auto-carries every id'd "
-        "control's value (choice as idx(label)) -- id a control instead of writing its value into "
-        "text.\n\n"
-        "UPDATE vs RE-RENDER: change text/value/visibility/data via ui_update, not a fresh "
-        "ui_render; re-render only if structurally different.\n\n" +
-        SharedPromptTail("{do:'invoke',cmd}") +
-        // 示例必须无瑕疵——弱模型照抄它们（真机实录：没在示例里见过的形态它永远写不对，
-        // 一维 rows 连拒两次后才补的 Ex2/Ex3）。Ex1=cells 控制卡（switch 绑真实可写 bool
-        // 路径，纯 bind 即生效无需 handler）；Ex2=rows 表格，肉眼可见二维嵌套 + num 列；
-        // Ex3=bind_rows 行模板 + report 行点按 + data。NEVER 清单收拢实录过的高频错型。
-        "Example 1, control card (two cells grids): {\"root\":[{\"cells\":[{\"type\":"
-        "\"icon\",\"icon\":\"volume\"},{\"type\":\"slider\",\"bind\":\"audio.volume\"},{\"type\":"
-        "\"label\",\"role\":\"value\",\"bind\":\"audio.volume\",\"fmt\":\"%d%%\"}]},{\"cells\":[{"
-        "\"type\":\"icon\",\"icon\":\"sun\"},{\"type\":\"label\",\"text\":\"浅色\"},{\"type\":"
-        "\"switch\",\"bind\":\"ui.theme\",\"side\":\"end\"}]}]}\n"
-        "Example 2, status TABLE — rows is 2-D, each row an ARRAY: {\"root\":[{\"cells\":[{\"type\":"
-        "\"label\",\"role\":\"eyebrow\",\"text\":\"状态\"}]},{\"cols\":[{},{\"num\":true}],\"rows\":"
-        "[[{\"type\":\"label\",\"text\":\"电量\"},{\"type\":\"label\",\"role\":\"value\",\"bind\":"
-        "\"battery.level\",\"fmt\":\"%d%%\",\"mono\":true}],[{\"type\":\"label\",\"text\":\"信号\"},"
-        "{\"type\":\"label\",\"role\":\"value\",\"bind\":\"net.rssi\",\"fmt\":\"%d\",\"mono\":true}]"
-        "]}]}\n"
-        "Example 3, tap-a-row menu (bind_rows + data): {\"root\":[{\"item\":[{\"type\":\"button\","
-        "\"text\":\"{item.title}\",\"variant\":\"ghost\",\"on_click\":[{\"do\":\"report\",\"text\":"
-        "\"选了{item.title}\"}]}],\"bind_rows\":\"tracks\",\"max\":8,\"empty\":\"暂无\"}],\"data\":"
-        "{\"tracks\":[{\"title\":\"七里香\"},{\"title\":\"花海\"}]}}\n"
-        // Ex4/Ex5：复合示例——把动作系统串起来（toggle 显隐零往返、id 值随 report 自动上送、
-        // overlay+ttl、primary/ghost 纪律）。hidden/id 只在叶子级生效（grid 不注册 id），
-        // 故折叠目标是整行独占的 chart 叶子。
-        "Example 4, expandable detail — local toggle, ZERO round-trip: {\"root\":[{\"cells\":[{"
-        "\"type\":\"label\",\"role\":\"eyebrow\",\"text\":\"电量\"},{\"type\":\"label\",\"role\":"
-        "\"title\",\"bind\":\"battery.level\",\"fmt\":\"%d%%\"},{\"type\":\"button\",\"icon\":"
-        "\"chevron-down\",\"variant\":\"ghost\",\"side\":\"end\",\"on_click\":[{\"do\":\"toggle\","
-        "\"target\":\"hist\"}]}]},{\"fill\":\"card2\",\"cells\":[{\"type\":\"chart\","
-        "\"bind_history\":\"battery.level\",\"id\":\"hist\",\"hidden\":true}]}]}\n"
-        "Example 5, overlay confirm — id'd control value auto-attaches to report: {\"display\":"
-        "\"overlay\",\"ttl_ms\":30000,\"root\":[{\"cells\":[{\"type\":\"label\",\"role\":\"title\","
-        "\"text\":\"睡眠定时\"},{\"type\":\"choice\",\"options\":[\"15分\",\"30分\",\"60分\"],"
-        "\"id\":\"dur\"}]},{\"cells\":[{\"type\":\"button\",\"text\":\"取消\",\"variant\":\"ghost\","
-        "\"on_click\":[{\"do\":\"close\"}]},{\"type\":\"button\",\"text\":\"开始\",\"variant\":"
-        "\"primary\",\"side\":\"end\",\"on_click\":[{\"do\":\"report\",\"text\":\"开始睡眠定时\"},"
-        "{\"do\":\"close\"}]}]}]}\n"
-        "NEVER: a bare leaf as a root block (wrap it: {\"cells\":[leaf]}); rows as a flat leaf "
-        "list (always [[…],[…]]); on_click on a grid block (leaves only); media.* player cards; "
-        "emoji in text (no glyphs on device).";
+    s = BuildXmlSystemPrompt();
     return s.c_str();
 }
 

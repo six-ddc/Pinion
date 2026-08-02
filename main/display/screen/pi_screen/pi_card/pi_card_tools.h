@@ -42,135 +42,21 @@ const char *pi_card_render_desc(void);
  * 指针是安全的。实现见 pi_card_host.cc。 */
 const char *pi_card_system_prompt(void);
 
-/* ui_render 参数 schema：随 NVS ui/cardfmt（0=json 1=xml，默认 json）二选一——JSON 模式用
- * PI_CARD_RENDER_SCHEMA（含 required:["root"]），XML 模式用 PI_CARD_RENDER_SCHEMA_XML。
- * 必须运行时选：pi-c 解析 $ref 且强制一切内联约束（CARD_XML.md §10.1），若 XML 模式沿用
- * JSON schema，xml-only args 会被 required:["root"] 在 pi-c 层干拒（截断 echo→弱模型原样
- * 重试）。pi_agent_task_start 里与 description 同一循环改填 TOOLS[].def.parameters_schema_json
- * （返回编译期常量字符串指针，常驻契约天然满足）。 */
-const char *pi_card_render_schema(void);
+/* ---- 喂给 LLM 的工具描述与参数 schema（编译期常量）---- */
 
-/* ---- 喂给 LLM 的工具描述与 JSON-Schema（编译期常量）---- */
-
-/* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述（CARD_V2）。
- * 拆两段是因为路径清单必须插在「双向 bind 目标」与「事件/图标/示例」这两段说明
- * 之间——HEAD 收尾在类型清单/设计规范，TAIL 从"路径清单之后的补充说明"接着讲
- * fmt/事件/图标/示例。v2：root 是 grid 块数组，只有一种容器（grid），无嵌套；
- * preset/slots/column/row/旧grid/justify/align/grow/gap/pad/w/h/size/color/bg/span/children
- * 全部删除（docs/CARD_V2.md §1）。 */
-#define PI_CARD_DESC_HEAD                                                                            \
-    "Render an interactive UI card. Args ARE the card spec: {root:[grid,…], data?:{key:scalar|"       \
-    "array}, display?:'chat'|'overlay'|'standby', ttl_ms?:int, card?:'id'} — emit root before "      \
-    "data. root: "                                                                                    \
-    "ARRAY of grid blocks, top-to-bottom. ONLY container is grid (no nesting; depth fixed "           \
-    "card->grid->leaf); no x/y/w/h/gaps/grow/justify/align. Returns "                                 \
-    "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = every hardware path this " \
-    "card binds (this IS your device read); hints = advice for FUTURE cards — the card IS on "        \
-    "screen, never re-render because of a hint. "                                                     \
-    "Invalid input returns a fixable error; overlays auto-close (ttl_ms) and are capped. "            \
-    "Each grid has exactly one of: "                                                                  \
-    "cells:[leaf,…] (size-wrapped flow; divider/chart/choice/qrcode get their own line); "            \
-    "cols?:[{title?,num?}],rows:[[leaf,…],…] (aligned TABLE, 2-D: each row is an ARRAY of leaves; "   \
-    "shared tracks; num:true=right-align mono; 1 cell/row=vertical menu); "                           \
-    "item:<leaf>|[leaf,…],bind_rows:'key',max?,empty? (repeats item per data[key] elem; "             \
-    "{i}=idx0,{n}=idx1,{item.FIELD}; row tap = on_click on an item leaf (not the grid), "          \
-    "report/set/close only). "                                                                     \
-    "Leaves (12, exactly these, never nested): label{text?,role?,bind?,fmt?,mono?,bind_data?}; "      \
-    "button{text?,icon?,variant?,on_click}; slider{min,max,value,bind?,id?,on_change?,on_release?}; " \
-    "arc{like slider}(round dial); switch{checked,bind?,id?,on_change?}; bar{min,max,value,bind?}; "  \
-    "choice{options:[2-6],value?,id?,bind?,on_change?}(picker; reports idx+label); "                   \
-    "icon{icon:'name'}(decor; tappable=button{icon}); divider; qrcode{text}; "                     \
-    "chart{bind_history:'path',points?}(LINE chart, fixed " \
-    "height); stock_chart{symbol,name?,mode?}(live CN/HK/US chart, self-refreshing, timeframe "        \
-    "buttons, hold-to-inspect; symbol from stock tool). "                                              \
-    "role ramp: eyebrow|kicker|section|title|heading|label|value|caption (header=eyebrow+title; "     \
-    "big number=value). variant(button): primary(ONE amber CTA)|ghost|plain|default. Common props: "  \
-    "id,bind,tone,hidden,side (side:'end'=push cell to row's right edge). Grid fill=bg box. "         \
-    "tone/fill: semantic token (auto light/dark): accent|accent_dim|ok|err|tx|dim|faint|card|card2|"  \
-    "line|line2|bg — never hex. "
-
-/* PI_CARD_DESC_TAIL：路径清单之后——fmt 安全/事件模型/图标/限额/布局提要。 */
-#define PI_CARD_DESC_TAIL                                                                             \
-    "Bound label fmt: ONE placeholder matching the type — number->%d/\"%d%%\", string->%s (%s on a "  \
-    "number path crashes); mono:true for numbers. bind_data label shows card data[key] ({value} in "  \
-    "its text inlines it). "                                                                          \
-    "EVENTS: action arrays, zero round-trip — close | set,path,value?(number, or '{i}' in a row "     \
-    "template) | toggle/show/hide,target "     \
-    "(hidden:true block) | patch,target,props:{text?,value?,checked?,hidden?,tone?} ({v} in "         \
-    "props.text=trigger value) | invoke,cmd (safe cmds run at once, else confirm). report,text only " \
-    "when you must generate text ({v}=value,{label}=choice's text; every id'd control's value "      \
-    "auto-attaches, choice as idx(label)). "                                                          \
-    "DATA: ui_update mutates card data (set/append/remove/replace); bound bind_rows/bind_data "        \
-    "re-render. Icons: Lucide names (wifi|battery|play|check|x…); unknown → dot. "                     \
-    "Limits: 64 nodes (bind_rows reserves max×row-leaf-count); >8 grids->first 8 render, so prefer "  \
-    "3-5 grids/card & split big dashboards. Layout auto (no coordinates): cells wraps by size; "      \
-    "rows aligns to shared tracks. See system prompt for CHOOSE tree+example."
-
+/* ui_render 参数 schema：只声明裸 {"xml":string}，零内联约束零 required——pi-c 解析 $ref 且
+ * 强制一切内联约束（CARD_XML.md §10.1），任何 required/type 收紧都是"干拒绝+截断 echo→弱
+ * 模型原样重试"的硬拒面。root/display 等键只为内部/测试通道（sim 语料、脚手架直喂编译后
+ * spec）留门，不在提示词/描述里教。 */
 #define PI_CARD_RENDER_SCHEMA \
-    "{\"type\":\"object\",\"$defs\":{\"action\":{\"type\":\"object\",\"properties\":{\"do\":{\"type\"" \
-    ":\"string\",\"enum\":[\"close\",\"set\",\"report\",\"toggle\",\"show\",\"hide\",\"patch\",\"invo" \
-    "ke\"]},\"pa" \
-    /* action.value 允许 string：行模板 set 的 value:"{i}"（渲染期替换成行号）是文档教的合法
-     * 用法，schema 只写 number 会误导照 schema 写卡的模型。 */ \
-    "th\":{\"type\":\"string\"},\"value\":{\"type\":[\"number\",\"string\"]},\"text\":{\"type\":\"st" \
-    "ring\"},\"targ" \
-    "et\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"},\"cmd\":{\"type\":\"string\"}},\"req" \
-    "uired\":[\"do\"]}," \
-    "\"leaf\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[\"label\"" \
-    ",\"button\",\"slider\",\"arc\",\"switch\",\"bar\",\"icon\",\"divider\",\"qrcode\",\"choice\",\"c" \
-    "hart\",\"stock_chart\"]},\"symbol\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"mode\"" \
-    ":{\"type\":\"string\",\"enum\":[\"min\",\"5d\",\"day\",\"week\"]},\"text\":{\"type\":\"string\"" \
-    "},\"role\":{\"type\":\"string\",\"enum\":[\"eyebrow\",\"kicker\",\"section\",\"title\",\"headin" \
-    "g\",\"label\",\"value\",\"caption\"]},\"variant\":{\"type\":\"string\",\"enum\":[\"primary\",\"g" \
-    "host\",\"plain\",\"default\"]},\"bind\":{\"type\":\"string\"},\"bind_data\":{\"type\":\"string\"" \
-    /* "empty" 是 grid（bind_rows 形态）的属性，之前误混进 leaf——已移回 grid 独有。 */ \
-    "},\"bind_history\":{\"type\":\"string\"},\"points\":{\"type\":\"number\"}" \
-    ",\"fmt\":{\"type\":\"string\"},\"icon\":{\"type\":\"string\"},\"value\":{\"type\":\"nu" \
-    "mber\"},\"min\":{\"type\":\"number\"},\"max\":{\"type\":\"number\"},\"checked\":{\"type\":\"boo" \
-    /* options 无 minItems/maxItems：rows 一维失败实证 pi-c 解析 $ref 并强制内联约束，7 个
-     * 选项会在 pi-c 层吃 "Expected array length" 干拒绝；host 侧有友好的 2-6 校验。 */ \
-    "lean\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}" \
-    "},\"mono\":{\"type\":\"boolean\"},\"tone\":{\"type\":\"string\",\"enum\":[\"accent\",\"acc" \
-    "ent_dim\",\"ok\",\"err\",\"tx\",\"dim\",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
-    ",\"id\":{\"type\":\"string\"},\"side\":{\"type\":\"string\",\"enum\":[\"end\"]},\"hidden\":{\"ty" \
-    "pe\":\"boolean\"},\"on_click\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on" \
-    "_change\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}},\"on_release\":{\"type\"" \
-    ":\"array\",\"items\":{\"$ref\":\"#/$defs/action\"}}},\"required\":[\"type\"]}," \
-    "\"col\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"num\":{\"type\":" \
-    "\"boolean\"}}}," \
-    "\"grid\":{\"type\":\"object\",\"properties\":{" \
-    "\"cells\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/leaf\"}}," \
-    "\"cols\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/col\"}}," \
-    /* rows 不写内层 items 约束：真机实录弱模型把 rows 写成一维叶子数组，被 pi-c 的内联
-     * type:"array" 硬拒（"Expected array"+截断echo）后原样重试两次——$defs 引用内部 pi-c
-     * 不查，但内联约束查。形状修复交给 host Repair（裸叶子包成单格行）。 */ \
-    "\"rows\":{\"type\":\"array\"}," \
-    "\"item\":{\"oneOf\":[{\"$ref\":\"#/$defs/leaf\"},{\"type\":\"array\",\"items\":{\"$ref\":\"#/$d" \
-    "efs/leaf\"}}]}," \
-    "\"bind_rows\":{\"type\":\"string\"},\"max\":{\"type\":\"number\"},\"empty\":{\"type\":\"string\"" \
-    "}," \
-    "\"fill\":{\"type\":\"string\",\"enum\":[\"accent\",\"accent_dim\",\"ok\",\"err\",\"tx\",\"dim\"" \
-    ",\"faint\",\"card\",\"card2\",\"line\",\"line2\",\"bg\"]}" \
-    "}}}," \
-    /* 无 maxItems/minItems：>8 grids 由 host Repair() 截断+hint、空 root 由 Validate 给可修复
-     * 错误（宽进严出），pi-c 层硬拒的干错误（"Expected array length…"+全量 args echo）会让
-     * 弱模型连环重试越改越错。 */ \
-    "\"properties\":{\"root\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/grid\"}" \
-    "},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
-    "},\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"typ" \
-    "e\":\"object\"}},\"required\":[\"root\"]}"
-
-/* XML 模式的 ui_render 参数 schema：只声明裸 {"xml":string}，零内联约束零 required——
- * 弱模型若惯性回落 JSON 形态（直接给 root），host 侧 pi_card_tool_render 双通道都接得住，
- * 绝不让 pi-c 层硬拒（CARD_XML.md §10.1 避坑）。 */
-#define PI_CARD_RENDER_SCHEMA_XML \
     "{\"type\":\"object\",\"properties\":{\"xml\":{\"type\":\"string\"},\"root\":{\"type\":\"array\"" \
     "},\"display\":{\"type\":\"string\"},\"ttl_ms\":{\"type\":\"number\"},\"card\":{\"type\":\"strin" \
     "g\"},\"data\":{\"type\":\"object\"}}}"
 
-/* XML 版 ui_render 描述（cardfmt=1 时注入）：HEAD + <活体路径清单> + TAIL，骨架与 JSON 版
- * 同构（拆两段的理由同上）。词表/属性/动作微语法一次讲全——示例在 system prompt。 */
-#define PI_CARD_DESC_HEAD_XML                                                                         \
+/* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述。拆两段是
+ * 因为路径清单必须插在「双向 bind 目标」与「fmt/事件/限额补充」两段之间。线格式 = HTML 式
+ * XML（docs/CARD_XML.md §2）：词表/属性/动作微语法一次讲全——示例在 system prompt。 */
+#define PI_CARD_DESC_HEAD                                                                             \
     "Render an interactive UI card. Args: {\"xml\":\"<card>…</card>\"} — one HTML-like XML string; "  \
     "the device compiles and lays out everything (you never write x/y/w/h/columns/CSS). Returns "     \
     "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = every hardware path this " \
@@ -203,7 +89,7 @@ const char *pi_card_render_schema(void);
     "bare booleans. Grid fill=bg box. tone/fill: semantic token (auto light/dark): accent|"           \
     "accent_dim|ok|err|tx|dim|faint|card|card2|line|line2|bg — never hex. "
 
-#define PI_CARD_DESC_TAIL_XML                                                                         \
+#define PI_CARD_DESC_TAIL                                                                             \
     "Bound label fmt: ONE placeholder matching the type — number->%d/'%d%%', string->%s (%s on a "    \
     "number path crashes); mono for numbers. bind_data label shows card data[key] ({value} in its "   \
     "text inlines it). "                                                                              \

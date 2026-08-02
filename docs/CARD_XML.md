@@ -1,8 +1,9 @@
 # pi_card XML 线格式前端
 
-> 状态：**P0-P4 已实现**（编译器 `pi_card_xml.{cc,h}` + card_xml_test 50 cases + 工具接线 +
-> 提示词 v4 + cardfmt 开关 + SAX 流式预览 + 双端 build/回归全绿）。欠账：P5 Haiku A/B 与
-> 真机烧录烟测；JSON 通道并存（默认 json），去留待 A/B（§9 D1）。
+> 状态：**已全量落地，XML 是 ui_render 唯一线格式**（编译器 `pi_card_xml.{cc,h}` +
+> card_xml_test + SAX 流式预览 + 真机验证）。D1 已裁决：Haiku 四复杂任务 XML 臂零语法错 +
+> 真机 DeepSeek 对照（JSON 连吃两拒 vs XML 首发即过）后，JSON 线格式提示词/schema/cardfmt
+> 开关已整体退役；`root` 参数仅存内部/测试通道（sim 语料与脚手架直喂编译后 spec）。
 > 背景结论与实证依据见 §1；As-built 偏离与补充设计见 §12；避坑清单见 §10。
 
 ## 0. 一句话
@@ -186,8 +187,9 @@ LLM ──xml 串──► pi_card_tool_render (worker) ──► XmlCompile() �
 
 ## 9. 开放决策（实施时拍板）
 
-- **D1 通道去留**：A/B 后若 XML 显著胜出，JSON 通道与 partial-JSON 预览机器（全仓最重
-  复杂度）择期退役；退役前 JSON 语料迁移为 XML 版。
+- **D1 通道去留**：**已裁决退役**（2026-08-02，Haiku A/B + 真机对照后用户拍板）。JSON 版
+  提示词/DESC/schema/cardfmt 开关全删；预览要求 xml 键；`root` 参数保留为内部/测试通道
+  （26 张 JSON 语料是编译后 spec 的测试夹具，不是线格式语料，继续服务 solver/校验回归）。
 - **D2 cardfmt 开关形态**：NVS（免刷机 A/B）vs 编译宏（省 flash）。建议 NVS。
 - **D3 patch 动作**：v1 缺席。若实测模型确有需求再定微语法（候选 `patch:id.text=…`）。
 - **D4 `<td>` 是否允许多叶子**：v1 恰一个；表格单元格塞按钮组的需求出现再放开。
@@ -229,8 +231,8 @@ LLM ──xml 串──► pi_card_tool_render (worker) ──► XmlCompile() �
   `<tracks title="七里香"/>`（属性→记录字段）；同名标量二次出现升级成标量数组。
 - **xml 参数通道常开**，不受 cardfmt 开关控制（开关只决定注入哪套提示词/schema）；
   `xml` 与 `root` 并存时 xml 优先 + note。
-- **cardfmt 开关**：NVS `ui/cardfmt`（0=json 默认，1=xml），改后重启生效；sim 里
-  `PI_SIM_CARDFMT=1` 免写 ini 直接切（dump/A-B 工装用）。
+- **cardfmt 开关已随 D1 裁决删除**（NVS `ui/cardfmt` 不再读取）：XML 是唯一线格式，
+  提示词/DESC/schema 单套注入。
 - **块级 `<divider/>` 并入散叶子流**：不单独包块，跟相邻散叶子聚进同一个 cells grid
   （leaf divider 在 cells 里本就 SPAN_ALL 独占行，视觉等价，少一个块预算）。
 - **提示词共享段**：`kPromptIntro` + `SharedPromptTail(invoke_syntax)` 两套线格式共用
