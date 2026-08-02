@@ -1,0 +1,6 @@
+<card><grid><label role='eyebrow'>系统详情</label><label role='title'>设备状态</label></grid>
+<grid><label role='heading'>电池</label><button icon='chevron-down' variant='ghost' side='end' tap='toggle:sec1'/></grid>
+<table id='sec1' hidden cols='项,值:num'><tr><td>电量</td><td><label role='value' bind='battery.level' fmt='%d%%' mono/></td></tr><tr><td>健康度</td><td><label role='value' bind='battery.soh_pct' fmt='%d%%' mono/></td></tr></table>
+<grid><label role='heading'>网络</label><button icon='chevron-down' variant='ghost' side='end' tap='toggle:sec2'/></grid>
+<table id='sec2' hidden cols='项,值:num'><tr><td>信号</td><td><label role='value' bind='net.rssi' fmt='%d' mono/></td></tr><tr><td>已连接</td><td><label role='value' bind='net.connected' fmt='%d' mono/></td></tr></table>
+</card>

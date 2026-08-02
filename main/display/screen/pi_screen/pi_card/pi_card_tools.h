@@ -63,8 +63,9 @@ const char *pi_card_system_prompt(void);
     "card binds (this IS your device read); hints = advice for FUTURE cards — the card IS on "        \
     "screen, never re-render because of a hint. Invalid input returns a fixable error; overlays "     \
     "auto-close (ttl) and are capped. "                                                               \
-    "<card display='chat|overlay|standby' ttl='30s' id?> stacks BLOCK elements top-to-bottom: "       \
-    "<grid fill?>leaves</grid> (a flow wrapped by size — headers, control rows like icon+slider+"     \
+    "<card display='chat|overlay|standby' ttl='30s' id?> stacks BLOCK elements top-to-bottom "        \
+    "(each takes fill?/id?/hidden?; toggling a block id folds a section): "                           \
+    "<grid>leaves</grid> (a flow wrapped by size — headers, control rows like icon+slider+"           \
     "value, button groups; divider/chart/choice/qrcode take their own line); "                        \
     "<table cols='项,值:num'><tr><td>…</td>…</tr>…</table> (aligned TABLE sharing column tracks; "    \
     "':num' = number column, right-aligned mono; cols optional — auto-inferred; a <td> holds text "   \
@@ -98,13 +99,12 @@ const char *pi_card_system_prompt(void);
     "(a hidden leaf) | invoke:cmd (safe cmds run at once, else confirm). report:text only when you "  \
     "must generate text or a NEW decision (quote a payload holding a comma: report:'a, b'; every "    \
     "id'd control's value auto-attaches, choice as idx(label)). "                                     \
-    "Escape & as &amp; in attribute values (URLs). "                                                  \
+    "Escape & as &amp; in attributes. "                                                               \
     "DATA: ui_update (JSON args, unchanged) mutates card data (set/append/remove/replace); bound "    \
     "list/bind_data re-render. Icons: Lucide names (wifi|battery|play|check|x…); unknown → dot. "     \
     "Limits: 64 leaves, >8 blocks->first 8 render, so prefer 3-5 blocks/card & split big "            \
     "dashboards. Layout auto: grid wraps by size; table aligns to shared tracks. Off-vocabulary "     \
-    "tags/attrs are tolerated but noted — stick to the vocabulary. See system prompt for CHOOSE "     \
-    "tree+examples."
+    "tags/attrs tolerated but noted. See system prompt for CHOOSE tree+examples."
 
 #define PI_CARD_UPDATE_DESC                                                                          \
     "Patch a node inside a rendered card, or mutate card data. Args {card?:'' (latest), id?:"        \

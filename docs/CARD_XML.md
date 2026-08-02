@@ -201,7 +201,10 @@ LLM ──xml 串──► pi_card_tool_render (worker) ──► XmlCompile() �
 2. **提示词预算**：pi_agent_task.c 软告警（现 11264B）；`PI_SIM_DUMP_PROMPT` 是唯一
    可信测量（BuildPathsClause 动态注册，静态估算必偏）。
 3. **示例红线**：few-shot 示例原文必须过管线零 hints（曾因示例本身是死控件教坏模型）。
-4. **hidden/id 只在叶子级生效**（grid 块不注册 id）；折叠目标必须是整行独占叶子。
+4. **hidden/id 叶子级与块级同权**（2026-08 拍板"让自然写法合法"）：grid/table/list 块可挂
+   id/hidden，toggle/show/hide/patch 可作用于整块（折叠分组的模型自然写法直接合法）；
+   `<grid id hidden>` 只包一个 `<table>` 时壳的 id/fill 转移给表（≡ `<table id hidden>`）；
+   list 行模板内 id 仍不注册（N 行克隆不唯一）。
 5. **真机格式串红线**：newlib-nano 无 %zu/%lld（不消费变参，后随 %s 直接崩）；
    `lv_snprintf` 同落 nano。一律 %u/%d + 显式强转。sim 复现不了这类 UB。
 6. **sim 工装**：CorpusDir 按 cwd 探测（scratchpad 放 tests/corpus/ 即可喂自定卡，

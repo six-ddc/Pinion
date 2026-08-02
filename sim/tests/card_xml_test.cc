@@ -381,6 +381,39 @@ TEST_CASE("块级 divider 与 grid 内 divider") {
     cJSON_Delete(env);
 }
 
+TEST_CASE("块级 id/hidden：grid/table/list 三形态同权直传") {
+    cJSON* env = Compile(
+        "<card>"
+        "<grid id='g1' hidden fill='card2'><label>甲</label></grid>"
+        "<table id='t1' hidden cols='k,v:num'><tr><td>乙</td><td>1</td></tr></table>"
+        "<list id='l1' hidden bind='xs'><label>{item.t}</label></list>"
+        "<data><xs t='丙'/></data></card>");
+    cJSON* g = Grid(env, 0);
+    CHECK_EQ(std::string(Str(g, "id")), "g1");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(g, "hidden")));
+    CHECK_EQ(std::string(Str(g, "fill")), "card2");
+    cJSON* t = Grid(env, 1);
+    CHECK_EQ(std::string(Str(t, "id")), "t1");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(t, "hidden")));
+    cJSON* l = Grid(env, 2);
+    CHECK_EQ(std::string(Str(l, "id")), "l1");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(l, "hidden")));
+    CHECK_EQ(std::string(Str(l, "bind_rows")), "xs");
+    cJSON_Delete(env);
+}
+
+TEST_CASE("hidden grid 里嵌 table：提升块继承 hidden + note 教直挂 id/hidden") {
+    std::vector<std::string> notes;
+    cJSON* env = Compile("<card><grid id='m1' hidden><label role='section'>电池</label>"
+                         "<table><tr><td>k</td><td>v</td></tr></table></grid></card>", &notes);
+    CHECK_EQ(cJSON_GetArraySize(cJSON_GetObjectItem(env, "root")), 2);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(Grid(env, 0), "hidden")));  // 原 grid（含 label）
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(Grid(env, 1), "hidden")));  // 提升的 table 同隐
+    CHECK(cJSON_GetObjectItem(Grid(env, 1), "id") == nullptr);         // id 不复制（唯一性）
+    CHECK(HasNote(notes, "own id/hidden"));
+    cJSON_Delete(env);
+}
+
 TEST_CASE("grid fill 属性；grid 级事件剥除+note") {
     std::vector<std::string> notes;
     cJSON* env = Compile("<card><grid fill=\"card2\" tap=\"close\"><label>x</label></grid></card>", &notes);

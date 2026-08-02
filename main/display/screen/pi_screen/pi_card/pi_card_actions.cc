@@ -345,8 +345,10 @@ bool ValidateActions(const cJSON* arr, const std::set<std::string>& node_ids, st
                 return false;
             }
             if (node_ids.find(tgtj->valuestring) == node_ids.end()) {
+                // 带路话术：重试回环里模型只看得到这一句，直接教正确形态。
                 err = std::string("toggle/show/hide/patch target '") + tgtj->valuestring +
-                      "' is not an \"id\" declared anywhere in this card";
+                      "' is not declared — put id=\"" + tgtj->valuestring +
+                      "\" on the leaf or block (grid/table/list) you want to act on, in this card";
                 return false;
             }
         }

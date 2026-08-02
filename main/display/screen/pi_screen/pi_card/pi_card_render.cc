@@ -1181,6 +1181,14 @@ lv_obj_t* RenderGridBlock(lv_obj_t* card_root, const cJSON* grid_json, const cJS
     lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
     ApplyFill(gobj, grid_json);
+    // 块级 id/hidden（与叶子同权，2026-08 拍板"让自然写法合法"）：模型折叠一个分组是高频
+    // 自然直觉（真机实录 toggle:m1 指 grid 被拒）。id 注册进 card->nodes 供 toggle/show/
+    // hide/patch 定位；hidden 置 LVGL 旗标（flex 布局自动跳过，展开时其余块回流）。预览
+    // 复用本函数时 card 为空，不注册（预览零 id 契约不变）。
+    if (card != nullptr) {
+        if (const char* gid = GetStr(grid_json, "id"); gid != nullptr) card->nodes[gid] = gobj;
+    }
+    if (GetBool(grid_json, "hidden")) lv_obj_add_flag(gobj, LV_OBJ_FLAG_HIDDEN);
     // fill/bg 底色 grid：solver 已按 viewport_w-2*inset 求解，这里补同宽 pad，行容器同步收窄。
     const int inset = GetInt(layout_grid, "inset", 0);
     const int inner_w = viewport_w - 2 * inset;
@@ -1280,6 +1288,11 @@ lv_obj_t* RebuildBindRowsGrid(lv_obj_t* old_gobj, const cJSON* grid_spec, UiCard
                               int viewport_w, int gap, const RenderLimits& limits, std::string& err) {
     lv_obj_t* parent = lv_obj_get_parent(old_gobj);
     uint32_t idx = lv_obj_get_index(old_gobj);
+    // 块级 id：旧容器要删了，先摘掉注册表里指向它的条目防悬垂（重建成功会由
+    // RenderGridBlock 重新注册同名 id；失败则保持摘除状态，target 落空但不是野指针）。
+    if (card != nullptr) {
+        if (const char* gid = GetStr(grid_spec, "id"); gid != nullptr) card->nodes.erase(gid);
+    }
     lv_obj_delete(old_gobj);  // 递归删子树；子控件的 DELETE 回调（如有）随之触发，无需手动清理
 
     cJSON* wrap = cJSON_CreateArray();
@@ -1688,6 +1701,8 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
     lv_obj_set_flex_flow(gobj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(gobj, gap, LV_PART_MAIN);
     ApplyFill(gobj, grid_json);
+    // 块级 hidden 预览同款生效（id 不注册——预览零 id/零事件契约不变），流式期观感与正式一致。
+    if (GetBool(grid_json, "hidden")) lv_obj_add_flag(gobj, LV_OBJ_FLAG_HIDDEN);
     // 与正式 RenderGridBlock 同款 fill 内边距（solver 按收窄视口求解，这里补 pad）。
     const int inset = layout_grid ? GetInt(layout_grid, "inset", 0) : 0;
     const int inner_w = viewport_w - 2 * inset;
@@ -1823,12 +1838,21 @@ bool ApplyProps(lv_obj_t* obj, const cJSON* props, std::string& err) {
         return false;
     }
     if (const char* txt = GetStr(props, "text")) {
-        // do:'patch' 改 heading（puhui_24_4）标签文本也是一个动态落文本点，同样可能吐出缺字
-        // 新中文——SafeFont 兜一遍（非 heading 字体空操作）。是本函数唯一改文本的地方，不必
-        // 判 obj 是不是 label：ApplyProps 只会被派给带 text 的节点。
-        const lv_font_t* f = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
-        if (SafeFont(f, txt)) lv_obj_set_style_text_font(obj, f, LV_PART_MAIN);
-        lv_label_set_text(obj, txt);
+        // 目标可能是 label 本体、button（label 是子节点）、或块容器（grid 现在也可注册 id）
+        // ——lv_label_set_text 只准打在真 label 上，其余找第一个 label 子节点，找不到就
+        // 静默跳过（对容器 patch text 属于无意义操作，不值得整个 patch 失败）。
+        lv_obj_t* lbl = lv_obj_check_type(obj, &lv_label_class) ? obj : nullptr;
+        for (uint32_t i = 0; lbl == nullptr && i < lv_obj_get_child_count(obj); ++i) {
+            lv_obj_t* ch = lv_obj_get_child(obj, i);
+            if (lv_obj_check_type(ch, &lv_label_class)) lbl = ch;
+        }
+        if (lbl != nullptr) {
+            // do:'patch' 改 heading（puhui_24_4）标签文本也是一个动态落文本点，同样可能吐出
+            // 缺字新中文——SafeFont 兜一遍（非 heading 字体空操作）。
+            const lv_font_t* f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+            if (SafeFont(f, txt)) lv_obj_set_style_text_font(lbl, f, LV_PART_MAIN);
+            lv_label_set_text(lbl, txt);
+        }
     }
     if (HasKey(props, "value")) {
         int v = GetInt(props, "value", 0);
@@ -1917,6 +1941,7 @@ void CollectRowIds(const cJSON* row, std::set<std::string>& ids) {
 }
 void CollectGridIds(const cJSON* grid, std::set<std::string>& ids) {
     if (!cJSON_IsObject(grid)) return;
+    if (const char* id = GetStr(grid, "id")) ids.insert(id);  // 块级 id（与叶子同权）
     if (const cJSON* cells = GetItem(grid, "cells"); cJSON_IsArray(cells)) {
         const cJSON* c = nullptr;
         cJSON_ArrayForEach(c, cells) CollectLeafId(c, ids);

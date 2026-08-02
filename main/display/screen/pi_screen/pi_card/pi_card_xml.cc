@@ -561,6 +561,23 @@ cJSON* CompileColsAttr(const std::string& val) {
     return cols;
 }
 
+// 块级公共属性（fill/id/hidden，grid/table/list 三形态同权——"让自然写法合法"：模型折叠
+// 一个分组/表格是高频直觉，id/hidden 下沉到块级后 toggle:块id 直接合法）。返回 true 表示
+// 该属性已消费。
+bool ApplyBlockAttr(cJSON* grid, const std::string& name, const std::string& val) {
+    if (name == "fill" || name == "id") {
+        if (!cJSON_GetObjectItem(grid, name.c_str()))
+            cJSON_AddStringToObject(grid, name.c_str(), val.c_str());
+        return true;
+    }
+    if (name == "hidden") {
+        if (!cJSON_GetObjectItem(grid, "hidden"))
+            cJSON_AddBoolToObject(grid, "hidden", ParseBool(val));
+        return true;
+    }
+    return false;
+}
+
 // <td>/<th>/<li> → 恰一个叶子：优先取首个叶子元素子节点（td 属性并入、叶子自身优先），
 // 否则拍平文本 → label。多叶子取第一个 + note（决策 D4：v1 恰一个）。
 cJSON* CompileCell(const Elem& cell, CompileCtx& ctx) {
@@ -595,9 +612,9 @@ cJSON* CompileTable(const Elem& el, CompileCtx& ctx) {
     cJSON* grid = cJSON_CreateObject();
     cJSON* cols = nullptr;
     if (const std::string* c = el.Attr("cols")) cols = CompileColsAttr(*c);
-    if (const std::string* f = el.Attr("fill")) cJSON_AddStringToObject(grid, "fill", f->c_str());
     for (const auto& a : el.attrs) {
-        if (a.first != "cols" && a.first != "fill") ctx.stripped_attrs.insert(a.first);
+        if (a.first == "cols") continue;
+        if (!ApplyBlockAttr(grid, a.first, a.second)) ctx.stripped_attrs.insert(a.first);
     }
 
     cJSON* rows = cJSON_CreateArray();
@@ -680,9 +697,8 @@ cJSON* CompileList(const Elem& el, CompileCtx& ctx, std::vector<cJSON*>& promote
 // 嵌套 table/list 无法拍平 → 提升成兄弟块（promoted，插在本 grid 之后）。空 grid → nullptr。
 cJSON* CompileGrid(const Elem& el, CompileCtx& ctx, std::vector<cJSON*>& promoted) {
     cJSON* grid = cJSON_CreateObject();
-    if (const std::string* f = el.Attr("fill")) cJSON_AddStringToObject(grid, "fill", f->c_str());
     for (const auto& a : el.attrs) {
-        if (a.first == "fill") continue;
+        if (ApplyBlockAttr(grid, a.first, a.second)) continue;
         if (a.first == "tap" || a.first == "change" || a.first == "release") {
             ctx.notes.push_back("grid-level '" + a.first + "' dropped — put events on a leaf");
         } else {
@@ -721,11 +737,23 @@ cJSON* CompileGrid(const Elem& el, CompileCtx& ctx, std::vector<cJSON*>& promote
             flattened = true;  // grid 里套容器：拍平（子内容提升进当前 cells）
             frames.push_back({&kid.kids, 0});
         } else if (IsTableTag(kid.tag)) {
-            if (cJSON* g = CompileTable(kid, ctx)) promoted.push_back(g);
-            ctx.notes.push_back("a <table> nested in <grid> was promoted to its own block");
+            if (cJSON* g = CompileTable(kid, ctx)) {
+                // 外层 grid 的 hidden 传播给被提升的块（视觉上同组同隐）；id 不复制（唯一性）
+                // ——想整组折叠，直接给 <table> 挂自己的 id/hidden。
+                if (el.Attr("hidden") && !cJSON_GetObjectItem(g, "hidden"))
+                    cJSON_AddBoolToObject(g, "hidden", ParseBool(*el.Attr("hidden")));
+                promoted.push_back(g);
+            }
+            ctx.notes.push_back("a <table> nested in <grid> was promoted to its own block — give "
+                                "the <table> its own id/hidden to fold it");
         } else if (kid.tag == "list") {
-            if (cJSON* g = CompileList(kid, ctx, promoted)) promoted.push_back(g);
-            ctx.notes.push_back("a <list> nested in <grid> was promoted to its own block");
+            if (cJSON* g = CompileList(kid, ctx, promoted)) {
+                if (el.Attr("hidden") && !cJSON_GetObjectItem(g, "hidden"))
+                    cJSON_AddBoolToObject(g, "hidden", ParseBool(*el.Attr("hidden")));
+                promoted.push_back(g);
+            }
+            ctx.notes.push_back("a <list> nested in <grid> was promoted to its own block — give "
+                                "the <list> its own id/hidden to fold it");
         } else if (kid.tag == "tr" || kid.tag == "td" || kid.tag == "th" || kid.tag == "li") {
             frames.push_back({&kid.kids, 0});  // 迷路的表格件：剥壳取其内容
         } else if (!kid.kids.empty()) {
@@ -738,6 +766,17 @@ cJSON* CompileGrid(const Elem& el, CompileCtx& ctx, std::vector<cJSON*>& promote
     if (flattened) ctx.notes.push_back("nested containers inside <grid> flattened — depth is card>grid>leaf");
     if (cJSON_GetArraySize(cells) == 0) {
         cJSON_Delete(cells);
+        // 空壳但有提升块：壳上的 id/fill 转移给第一个提升块——<grid id="x" hidden> 只包一个
+        // <table> 是模型高频写法（真机 toggle:m2 实录），语义 ≡ <table id="x" hidden>；壳丢
+        // id 会让 toggle 目标落空连环拒（hidden 已在提升时传播）。
+        if (!promoted.empty()) {
+            cJSON* first = promoted.front();
+            for (const char* key : {"id", "fill"}) {
+                const cJSON* v = cJSON_GetObjectItem(grid, key);
+                if (cJSON_IsString(v) && !cJSON_GetObjectItem(first, key))
+                    cJSON_AddStringToObject(first, key, v->valuestring);
+            }
+        }
         cJSON_Delete(grid);
         return nullptr;
     }
@@ -774,9 +813,7 @@ cJSON* CompileList(const Elem& el, CompileCtx& ctx, std::vector<cJSON*>& promote
             if (ParseNumber(a.second, n)) cJSON_AddNumberToObject(grid, "max", n);
         } else if (a.first == "empty") {
             cJSON_AddStringToObject(grid, "empty", a.second.c_str());
-        } else if (a.first == "fill") {
-            cJSON_AddStringToObject(grid, "fill", a.second.c_str());
-        } else {
+        } else if (!ApplyBlockAttr(grid, a.first, a.second)) {
             ctx.stripped_attrs.insert(a.first);
         }
     }
@@ -949,8 +986,9 @@ bool XmlCompile(const char* xml, size_t len, cJSON** out_args, std::vector<std::
             CompileData(kid, data, ctx);
         } else if (IsGridTag(kid.tag)) {
             flush_pending();
-            if (cJSON* g = CompileGrid(kid, ctx, promoted)) blocks.push_back(g);
-            else ctx.notes.push_back("empty <" + kid.tag + "> dropped");
+            cJSON* g = CompileGrid(kid, ctx, promoted);
+            if (g) blocks.push_back(g);
+            else if (promoted.empty()) ctx.notes.push_back("empty <" + kid.tag + "> dropped");
             for (cJSON* p : promoted) blocks.push_back(p);
         } else if (IsTableTag(kid.tag)) {
             flush_pending();

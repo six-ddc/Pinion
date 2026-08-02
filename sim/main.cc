@@ -121,6 +121,7 @@ constexpr const char* kCorpusFiles[] = {
     // （红线：过管线零 hints），x5-x7 是伤疒话术卡（仪表盘/HTML 容错/列表点选）。
     "x0_ctl.xml",         "x1_table.xml",       "x2_menu.xml",       "x3_fold.xml",
     "x4_confirm.xml",     "x5_dashboard.xml",   "x6_html.xml",       "x7_alarms.xml",
+    "x8_fold.xml",  // 块级 id/hidden 折叠分组（真机 toggle:m1 被拒实录的合法化形态）
 };
 constexpr int kNumCorpusFiles = static_cast<int>(sizeof(kCorpusFiles) / sizeof(kCorpusFiles[0]));
 
