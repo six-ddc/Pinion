@@ -880,7 +880,10 @@ TEST_CASE("H5: cols.num 摁在 %s 字符串列上被否决——该列降级文�
     CHECK_EQ(sum + kStackGap, 600);       // 两列铺满
     CHECK(g.track_w[1] > 200);            // 值列吃到了剩余宽度（不再是 64px 兜底轨）
     for (const auto& c : g.cells) {
-        if (c.col == 1 && c.ci >= 0) CHECK_EQ(c.wrap, std::string("ellipsis"));  // 文本列语义
+        if (c.col == 1 && c.ci >= 0) {
+            CHECK_EQ(c.wrap, std::string("ellipsis"));       // 几何降级：文本列语义
+            CHECK_EQ(c.align, std::string("end"));           // 对齐保住 num 声明意图（与表头一致）
+        }
     }
     CheckS1S2(lo, 600);
     cJSON_Delete(intent);

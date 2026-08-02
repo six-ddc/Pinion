@@ -822,6 +822,11 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
     // 列类型 & 基准轨道宽。
     std::vector<ColType> ctype(ncol, ColType::kText);
     std::vector<int> track(ncol, 0);
+    // cols.num 声明的列被字符串证据降级成 TEXT 后，**几何**降级（stretch+可截断）但**对齐**
+    // 尊重声明意图（右对齐）——否则合成表头按 num 右对齐、数据 cell 却按文本列默认左对齐，
+    // 同一列表头值两头跑（真机「连接详情」复验实录）。右对齐+尾部省略号截断安全：左裁风险
+    // 来自固定窄轨 NOWRAP，不来自对齐。
+    std::vector<char> end_text(ncol, 0);
     for (int c = 0; c < ncol; ++c) {
         bool col_num = false;
         if (cJSON_IsArray(cols) && c < cJSON_GetArraySize(cols)) {
@@ -903,6 +908,7 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
             }
         }
         track[c] = base;
+        if (ctype[c] == ColType::kText && col_num) end_text[c] = 1;
     }
 
     // 剩余分配 / 压缩。
@@ -1035,7 +1041,7 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
                 a = cell.align;  // icon start / switch end
                 wrap = WrapMode::kNowrap;
             } else {  // TEXT
-                a = Align::kStart;
+                a = end_text[c] ? Align::kEnd : Align::kStart;  // num 声明降级列保持右对齐意图
                 // F4：用未被 clamp≤400 污染的真实测量宽 natural_w 跟轨道宽比较，而不是 pref_w
                 // ——轨道宽落在 (400, natural_w) 区间时 pref_w(≤400) 会小于 w，误判"不用截断"，
                 // 结果 LVGL 收到 truncate=false 对超宽文本走 WRAP，断词多行。truncate 字段保留
