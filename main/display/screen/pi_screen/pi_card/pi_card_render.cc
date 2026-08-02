@@ -829,6 +829,15 @@ const lv_font_t* SolverFontFor(int role, bool mono) {
     }
 }
 
+// solver 的 bind 类型提示回调（Input.bind_kind）：字符串路径的活值宽度不可预测，solver 要
+// 把它按文本列处理（一票否决 mono/cols.num 摁出来的数值列几何，§2.2）。stock.* 等 DynProvider
+// 路径同样走 DataHub::TypeOf。查不到的路径返回 0（未知，solver 退回 fmt 启发式）。
+int SolverBindKindCb(const char* path, void* /*ctx*/) {
+    HubType t;
+    if (path == nullptr || !DataHub::Instance().TypeOf(path, t)) return 0;
+    return t == HubType::String ? 2 : 1;
+}
+
 int SolverMeasureCb(const char* utf8, int role, bool mono, void* /*ctx*/) {
     if (!utf8 || !*utf8) return 0;
     const lv_font_t* font = SolverFontFor(role, mono);
@@ -1282,6 +1291,8 @@ lv_obj_t* RebuildBindRowsGrid(lv_obj_t* old_gobj, const cJSON* grid_spec, UiCard
     in.gap = gap > 0 ? gap : solver::kStackGap;
     in.measure = SolverMeasureCb;
     in.measure_ctx = nullptr;
+    in.bind_kind = SolverBindKindCb;
+    in.bind_kind_ctx = nullptr;
     cJSON* layout = solver::Solve(in);
     const cJSON* layout_grids = GetItem(layout, "grids");
     const cJSON* layout_grid = layout_grids ? cJSON_GetArrayItem(layout_grids, 0) : nullptr;
@@ -1329,6 +1340,8 @@ lv_obj_t* RenderNode(lv_obj_t* parent, const cJSON* node, UiCard* card, const Re
     in.gap = solver::kStackGap;
     in.measure = SolverMeasureCb;
     in.measure_ctx = nullptr;
+    in.bind_kind = SolverBindKindCb;
+    in.bind_kind_ctx = nullptr;
     cJSON* layout = solver::Solve(in);
     const cJSON* layout_grids = GetItem(layout, "grids");
 
@@ -1661,6 +1674,8 @@ lv_obj_t* RenderGridBlockPreview(lv_obj_t* card_root, const cJSON* grid_json, co
     in.gap = gap;
     in.measure = SolverMeasureCb;
     in.measure_ctx = nullptr;
+    in.bind_kind = SolverBindKindCb;
+    in.bind_kind_ctx = nullptr;
     cJSON* layout = solver::Solve(in);
     const cJSON* layout_grid = cJSON_GetArrayItem(GetItem(layout, "grids"), 0);
 
@@ -2480,6 +2495,7 @@ struct LintState {
     bool has_label = false;
     bool emoji_seen = false;      // 整卡只提示一次，别按节点刷屏
     bool text_bind_seen = false;  // 同上：text+bind 并存（bind 覆盖 text）只提示一次
+    bool numcol_str_seen = false;  // 同上：cols.num 摁在字符串列上只提示一次
     std::vector<std::string>* hints = nullptr;
 };
 
@@ -2685,6 +2701,35 @@ void LintGrid(const cJSON* grid, const cJSON* data, LintState& st) {
         return;
     }
     if (cJSON_IsArray(rows)) {
+        // cols.num:true 摁在字符串列上：solver 会把这列降级回文本列（几何自愈，见
+        // pi_card_solver.cc 的 has_str 否决），这里教模型别标——num 只属于数值内容。
+        const cJSON* cols = GetItem(grid, "cols");
+        if (!st.numcol_str_seen && cJSON_IsArray(cols)) {
+            const int nc = cJSON_GetArraySize(cols);
+            for (int c = 0; c < nc && !st.numcol_str_seen; ++c) {
+                if (!GetBool(cJSON_GetArrayItem(cols, c), "num")) continue;
+                const cJSON* r = nullptr;
+                cJSON_ArrayForEach(r, rows) {
+                    const cJSON* cell = cJSON_IsArray(r) ? cJSON_GetArrayItem(r, c) : nullptr;
+                    if (!cJSON_IsObject(cell)) continue;
+                    const char* fmt = GetStr(cell, "fmt");
+                    const char* bind = GetStr(cell, "bind");
+                    HubType ht;
+                    const bool is_str =
+                        (fmt != nullptr && std::strstr(fmt, "%s") != nullptr) ||
+                        (bind != nullptr && DataHub::Instance().TypeOf(bind, ht) &&
+                         ht == HubType::String);
+                    if (is_str) {
+                        st.numcol_str_seen = true;
+                        st.hints->push_back(
+                            "A cols num:true column holds string values (%s / string path) — num "
+                            "is for numbers only (right-align, never truncate); the device treated "
+                            "it as a text column this time.");
+                        break;
+                    }
+                }
+            }
+        }
         const cJSON* r = nullptr;
         cJSON_ArrayForEach(r, rows) {
             if (!cJSON_IsArray(r)) continue;

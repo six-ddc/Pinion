@@ -38,6 +38,12 @@ constexpr int kStackGap = 12;        // grid 块竖排间距 / cell 间距 / 行
 constexpr int kTouchMinH = 44;       // 交互控件所在行最小触控高度
 constexpr int kFillInset = 12;       // 带 fill/bg 底色的 grid 块的内容内边距（四周）
 
+// bind 路径类型提示（注入，可空）：返回 0=未知 1=数值(Int/Bool) 2=字符串。字符串 bind 的
+// 活值宽度不可预测（没有 fmt 代表串可言），必须按文本列处理（§2.2）——纯函数拿不到
+// DataHub，由调用方注入（render/preview 用 DataHub::TypeOf 包装，宿主单测用 stub）；
+// 不注入时退回 fmt/mono 启发式（"%s" 仍视为字符串证据）。
+using BindKindFn = int (*)(const char* path, void* ctx);
+
 struct Input {
     const cJSON* root = nullptr;   // 信封里的 root 数组（grid 块列表）
     const cJSON* data = nullptr;   // 卡级 data（bind_rows 展开用），可为 nullptr
@@ -45,6 +51,8 @@ struct Input {
     int gap = kStackGap;
     MeasureFn measure = nullptr;
     void* measure_ctx = nullptr;
+    BindKindFn bind_kind = nullptr;
+    void* bind_kind_ctx = nullptr;
 };
 
 // 纯函数，确定性。返回新分配的 layout cJSON（调用方 cJSON_Delete）。结构见 §2.6：

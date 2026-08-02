@@ -138,6 +138,12 @@ inline cJSON* SolveJson(const char* json, int viewport_w, Layout& out, const cJS
     in.gap = pi_card::solver::kStackGap;
     in.measure = &MeasureStub;
     in.measure_ctx = nullptr;
+    // bind 类型 stub：只有 "str." 前缀的路径报字符串（2），其余报未知（0）——既有用例的
+    // bind（battery.*/stock.* 等）保持纯启发式行为不受影响，新用例用 str.* 显式驱动。
+    in.bind_kind = [](const char* path, void*) -> int {
+        return (path != nullptr && std::strncmp(path, "str.", 4) == 0) ? 2 : 0;
+    };
+    in.bind_kind_ctx = nullptr;
     cJSON* layout = pi_card::solver::Solve(in);
     Parse(layout, out);
     if (intent_keep) *intent_keep = intent;

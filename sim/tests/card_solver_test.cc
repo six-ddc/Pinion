@@ -862,6 +862,65 @@ TEST_CASE("H4: 独占行的 side:end 控件右锚定，不再被 S7 默认居中
     cJSON_Delete(intent2);
 }
 
+TEST_CASE("H5: cols.num 摁在 %s 字符串列上被否决——该列降级文本列吸收剩余，值不再硬裁") {
+    // 真机「连接详情」实录：KV 表 cols:[{},{num:true}]，值列全是 fmt %s 的字符串 bind，
+    // 修前值列被摁成 64px 固定数值轨（NOWRAP）→ "CHINA MOBILE" 硬裁。
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cols":[{},{"num":true}],
+         "rows":[
+           [{"type":"label","text":"SSID"},{"type":"label","bind":"net.ssid","fmt":"%s"}],
+           [{"type":"label","text":"运营商"},{"type":"label","bind":"net.operator","fmt":"%s"}]
+         ]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    int sum = 0;
+    for (int t : g.track_w) sum += t;
+    CHECK_EQ(sum + kStackGap, 600);       // 两列铺满
+    CHECK(g.track_w[1] > 200);            // 值列吃到了剩余宽度（不再是 64px 兜底轨）
+    for (const auto& c : g.cells) {
+        if (c.col == 1 && c.ci >= 0) CHECK_EQ(c.wrap, std::string("ellipsis"));  // 文本列语义
+    }
+    CheckS1S2(lo, 600);
+    cJSON_Delete(intent);
+}
+
+TEST_CASE("H6: bind_kind 注入的字符串路径（无 fmt 无 mono 线索）也走文本列，mono 不再误判") {
+    Layout lo;
+    cJSON* intent = SolveJson(R"({"root":[
+        {"cols":[{},{"num":true}],
+         "rows":[
+           [{"type":"label","text":"IP"},{"type":"label","bind":"str.ip","mono":true}],
+           [{"type":"label","text":"信号"},{"type":"label","bind":"battery.level","fmt":"%d"}]
+         ]}
+    ]})",
+                              600, lo);
+    const Grid& g = lo.grids[0];
+    // str.ip：类型提示=字符串 → 即使挂了 mono 也按文本列（列被否决降级，吸收剩余）。
+    int sum = 0;
+    for (int t : g.track_w) sum += t;
+    CHECK_EQ(sum + kStackGap, 600);
+    CHECK(g.track_w[1] > 200);
+    // 对照：数值 bind（未知类型走启发式）在无字符串证据的表里仍是数值列——单独一张表验证。
+    Layout lo2;
+    cJSON* intent2 = SolveJson(R"({"root":[
+        {"cols":[{},{"num":true}],
+         "rows":[[{"type":"label","text":"电量"},{"type":"label","bind":"battery.level","fmt":"%d%%","mono":true}]]}
+    ]})",
+                               600, lo2);
+    bool nowrap_found = false;
+    for (const auto& c : lo2.grids[0].cells) {
+        if (c.col == 1 && c.ci >= 0) {
+            nowrap_found = true;
+            CHECK_EQ(c.wrap, std::string("nowrap"));
+        }
+    }
+    CHECK(nowrap_found);
+    cJSON_Delete(intent);
+    cJSON_Delete(intent2);
+}
+
 int main() {
     return RUN_ALL_TESTS();
 }

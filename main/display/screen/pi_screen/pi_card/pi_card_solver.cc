@@ -59,6 +59,8 @@ struct Contract {
     Occ occ = Occ::kInline;
     Align align = Align::kStart;
     bool stretch = false;     // 参与剩余空间分配（FILL / 正文 label）
+    bool str_bind = false;    // 文本契约的 label 且带 bind/bind_data（活值宽度不可预测，
+                              // 供 SolveRows 否决 cols.num 强制的数值列几何）
     bool growable = false;    // 纯控件均分成员（button/slider/bar/arc/choice）
     bool truncate_ok = false; // 文本列超宽截断
     bool is_num = false;      // 数值 label（右对齐 mono 不截断）
@@ -230,6 +232,14 @@ Contract ContractFor(const Input& in, const cJSON* cell, int viewport_w) {
         bool has_bind = Has(cell, "bind");
         bool has_bind_data = Has(cell, "bind_data");
         const char* text = GetStr(cell, "text");
+        // 字符串证据（一票否决数值列判定，§2.2"string bind 不算数值列"）：fmt 带 %s，或
+        // 注入的类型提示说 bind 是字符串路径。真机实录：net.ssid/net.operator 这类字符串
+        // bind 被 mono/cols.num 摁进数值列后，64px 兜底轨道装不下活值 → NOWRAP 硬裁。
+        bool str_evidence = (fmt && std::strstr(fmt, "%s") != nullptr);
+        if (!str_evidence && has_bind && in.bind_kind) {
+            const char* bp = GetStr(cell, "bind");
+            if (bp && in.bind_kind(bp, in.bind_kind_ctx) == 2) str_evidence = true;
+        }
 
         // 标题类 role → 整行 SPAN_ALL 文本（WRAP）。
         if (rc == kRoleTitle || rc == kRoleHeading) {
@@ -259,8 +269,8 @@ Contract ContractFor(const Input& in, const cJSON* cell, int viewport_w) {
         // has_bind_data（卡级 data 模型绑定）无 fmt 时默认按字符串对待（既有口径——见
         // S:%s/bind_data 字符串 label 走文本列 64px 兜底测试），故此处只沿用 has_bind（DataHub
         // 路径绑定）参与"无 fmt 视为数值"判定，不把 has_bind_data 一并折进来。
-        bool numeric = mono || (has_bind && FmtNumeric(fmt)) || FmtHasNumericConv(fmt) ||
-                       TextLooksNumeric(text);
+        bool numeric = !str_evidence && (mono || (has_bind && FmtNumeric(fmt)) ||
+                                         FmtHasNumericConv(fmt) || TextLooksNumeric(text));
         if (numeric) {
             std::string rep = FmtRep(fmt);
             int w = Measure(in, rep.c_str(), rc == kRoleNone ? kRoleValue : rc, true);
@@ -287,11 +297,12 @@ Contract ContractFor(const Input& in, const cJSON* cell, int viewport_w) {
             return c;
         }
 
-        // 文本 label（正文 / bind_data 字符串 / %s）。
+        // 文本 label（正文 / bind_data 字符串 / %s / 字符串 bind）。
         c.occ = Occ::kInline;
         c.align = Align::kStart;
         c.truncate_ok = true;
         c.stretch = true;  // 可拉（吸收剩余）
+        c.str_bind = has_bind || has_bind_data;  // 供 SolveRows 否决 cols.num 强制声明
         int w = 0;
         if (text)
             w = Measure(in, text, rc, mono);
@@ -817,7 +828,7 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
             const cJSON* cd = cJSON_GetArrayItem(cols, c);
             col_num = GetBool(cd, "num");
         }
-        bool any = false, all_num = true, all_fixed = true, has_fill = false;
+        bool any = false, all_num = true, all_fixed = true, has_fill = false, has_str = false;
         int base = 0;
         for (auto& line : grid_cs) {
             if (c >= (int)line.size()) continue;
@@ -827,6 +838,7 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
             if (cell.occ == Occ::kFill) has_fill = true;
             if (cell.type == "choice") has_fill = true;  // rows 多列里 choice → FILL
             if (!cell.is_num) all_num = false;
+            if (cell.str_bind) has_str = true;
             bool fixed = (cell.type == "icon" || cell.type == "switch" || cell.is_num);
             if (!fixed) all_fixed = false;
         }
@@ -845,7 +857,10 @@ void SolveRows(const Input& in, const cJSON* grid, int gi, int vw, int gap, cJSO
                 int mn = (cell.type == "choice") ? cell.min_w : cell.min_w;
                 if (mn > base) base = mn;
             }
-        } else if (col_num || all_num) {
+        } else if ((col_num || all_num) && !has_str) {
+            // has_str 一票否决 cols.num：字符串 bind 的活值宽度不可预测，摁进"固定轨+NOWRAP"
+            // 的数值列几何=64px 兜底轨装长串必硬裁（真机「连接详情」实录：num:true 列全是
+            // fmt %s 的 net.ssid/operator）。降级为 kText（stretch 列，吸剩余、可截断）。
             ctype[c] = ColType::kNum;
             // 数值列轨道宽下限 = 该列所有行 cell 的真实测量宽最大值。用 natural_w（未被
             // clamp≤400 污染的原始测量宽，同 F4）兜底 pref_w——cols.num:true 强制声明的列里，
