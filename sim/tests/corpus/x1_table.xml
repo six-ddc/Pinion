@@ -1,0 +1,1 @@
+<card><grid><label role='eyebrow'>状态</label></grid><table cols=',:num'><tr><td>电量</td><td><label role='value' bind='battery.level' fmt='%d%%' mono/></td></tr><tr><td>信号</td><td><label role='value' bind='net.rssi' fmt='%d' mono/></td></tr></table></card>

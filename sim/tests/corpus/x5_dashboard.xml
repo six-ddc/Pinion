@@ -1,0 +1,12 @@
+<card>
+  <grid><label role="eyebrow">PINION</label><label role="title">设备总览</label></grid>
+  <table cols="项,值:num">
+    <tr><td>电量</td><td><label role="value" bind="battery.level" fmt="%d%%" mono/></td></tr>
+    <tr><td>亮度</td><td><label role="value" bind="display.brightness" fmt="%d%%" mono/></td></tr>
+    <tr><td>音量</td><td><label role="value" bind="audio.volume" fmt="%d%%" mono/></td></tr>
+  </table>
+  <divider/>
+  <grid><label role="section">电量趋势</label></grid>
+  <grid fill="card2"><chart bind="battery.level" points="60"/></grid>
+  <grid><button variant="ghost" icon="wifi" tap="invoke:net.reconnect">重连网络</button><button variant="primary" side="end" tap="close">好</button></grid>
+</card>

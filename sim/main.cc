@@ -116,6 +116,11 @@ constexpr const char* kCorpusFiles[] = {
     "17_media_ctl.json",  "18_stock_chart.json", "19_style_family.json", "22_table.json",
     "23_grid_auto.json",  "24_grid_ctl.json",   "25_grid_tall.json", "f0_form.json",
     "n1_cells_wrap.json", "n2_rows_align.json",
+    // XML 线格式语料（docs/CARD_XML.md §7）：追加在末尾保证既有下标稳定。.xml 文件由
+    // CorpusCards() 包成 {"xml":"…"} args 走 xml 通道；x0-x4 是 XML 提示词的五个示例原文
+    // （红线：过管线零 hints），x5-x7 是伤疒话术卡（仪表盘/HTML 容错/列表点选）。
+    "x0_ctl.xml",         "x1_table.xml",       "x2_menu.xml",       "x3_fold.xml",
+    "x4_confirm.xml",     "x5_dashboard.xml",   "x6_html.xml",       "x7_alarms.xml",
 };
 constexpr int kNumCorpusFiles = static_cast<int>(sizeof(kCorpusFiles) / sizeof(kCorpusFiles[0]));
 
@@ -130,12 +135,30 @@ constexpr const char* kCorpusNegFiles[] = {
 };
 constexpr int kNumCorpusNegFiles = static_cast<int>(sizeof(kCorpusNegFiles) / sizeof(kCorpusNegFiles[0]));
 
-// 惰性加载 + 缓存全部 26 张正例文本（F9 demo 每次按需读一次即可，量很小，不必每帧重读）。
+// .xml 语料 → ui_render args：整个文件内容进 {"xml":"…"}（cJSON 负责转义），与真机上
+// LLM 走 xml 通道的 args 形状一字不差。
+std::string WrapXmlArgs(const std::string& xml) {
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "xml", xml.c_str());
+    char* s = cJSON_PrintUnformatted(o);
+    std::string out = s ? s : "{}";
+    free(s);
+    cJSON_Delete(o);
+    return out;
+}
+
+// 惰性加载 + 缓存全部正例文本（F9 demo 每次按需读一次即可，量很小，不必每帧重读）。
 std::vector<std::string>& CorpusCards() {
     static std::vector<std::string> cards;
     if (cards.empty()) {
         cards.reserve(kNumCorpusFiles);
-        for (int i = 0; i < kNumCorpusFiles; i++) cards.push_back(ReadCorpusFile(kCorpusFiles[i]));
+        for (int i = 0; i < kNumCorpusFiles; i++) {
+            std::string body = ReadCorpusFile(kCorpusFiles[i]);
+            const std::string name(kCorpusFiles[i]);
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".xml") == 0 && !body.empty())
+                body = WrapXmlArgs(body);
+            cards.push_back(std::move(body));
+        }
     }
     return cards;
 }
@@ -1865,8 +1888,10 @@ int main() {
     if (const char* dp = std::getenv("PI_SIM_DUMP_PROMPT")) {
         FILE* f = std::fopen(dp, "w");
         if (f) {
+            // schema 走 pi_card_render_schema()：随 ui/cardfmt（或 PI_SIM_CARDFMT）二选一，
+            // 与真机 TOOLS[] 实际注入的一致（编译期宏只覆盖 json 版）。
             std::fprintf(f, "===SYSTEM_PROMPT===\n%s\n===RENDER_DESC===\n%s\n===RENDER_SCHEMA===\n%s\n",
-                         pi_card_system_prompt(), pi_card_render_desc(), PI_CARD_RENDER_SCHEMA);
+                         pi_card_system_prompt(), pi_card_render_desc(), pi_card_render_schema());
             std::fclose(f);
             std::fprintf(stderr, "[sim] dumped prompt+schema to %s\n", dp);
         }

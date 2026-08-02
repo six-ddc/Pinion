@@ -11,6 +11,7 @@
 #include "pi_card_preview_sig.h"
 #include "pi_card_render.h"
 #include "pi_card_solver.h"
+#include "pi_card_xml.h"  // XML 通道：逐帧把部分 xml 串编译成同构信封，走同一套签名机器
 
 #define TAG "pi_card_preview"
 
@@ -77,6 +78,24 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
         return;
     }
 
+    // XML 通道（docs/CARD_XML.md §3 P3a）：流式吐的是 {"xml":"<card>…"}，partial parser 把
+    // 未闭合的字符串值补全成节点，这里逐帧把当前 xml 前缀过 XmlCompile（宽容截断：尾部残缺
+    // token 丢弃、未闭合自动闭合）。编译确定性保证已冻结前序 grid 的 JSON 逐帧一致（
+    // card_xml_test「前缀单调性」锁定），signature 不抖；产物与 JSON 通道同构，后面的
+    // display 门控/media 拦截/grid 签名整块重渲机器原样复用，零分叉。snap/compiled 生命期
+    // 同帧：下面所有 early-return 都要两个一起删。
+    cJSON* compiled = nullptr;
+    const cJSON* xmlj = cJSON_GetObjectItem(snap, "xml");
+    if (cJSON_IsString(xmlj) && xmlj->valuestring[0] != '\0') {
+        std::string xerr;
+        if (!XmlCompile(xmlj->valuestring, std::strlen(xmlj->valuestring), &compiled, nullptr,
+                        xerr)) {
+            cJSON_Delete(snap);
+            return;  // 还没吐出任何元素：安静等下一帧（与 JSON 通道 root 未现身同口径）
+        }
+    }
+    const cJSON* env = compiled ? compiled : snap;  // 后续统一读 env（信封）
+
     // display：值确定不是 "chat" 时永久放弃（仅 chat 模式预览；overlay/standby 走各自的渲染
     // 通路，跟聊天流内联生长无关）。没出现这个键就按默认口径（chat）继续。注意 partial parser
     // 会把未闭合的字符串**值**补全成完整节点——快照切在 "display":"ch 中间时树里就是 "ch"，
@@ -84,17 +103,19 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     // 仍是 "chat" 的前缀（含空串）就继续等；只有 "o"/"overlay"/"standby" 这类前缀已分叉的才
     // 放弃。已完整的 "chat" 不会再变长（万一真变出 "chatty" 也过不了 execute 期校验，预览
     // 兜底撤除，不留孤儿）。
-    const cJSON* dispj = cJSON_GetObjectItem(snap, "display");
+    const cJSON* dispj = cJSON_GetObjectItem(env, "display");
     if (cJSON_IsString(dispj) && dispj->valuestring &&
         std::strncmp("chat", dispj->valuestring, std::strlen(dispj->valuestring)) != 0) {
         s_preview.disqualified = true;
         if (s_preview.active) PreviewTeardownInternal();
+        cJSON_Delete(compiled);
         cJSON_Delete(snap);
         return;
     }
 
-    const cJSON* root_spec = cJSON_GetObjectItem(snap, "root");
+    const cJSON* root_spec = cJSON_GetObjectItem(env, "root");
     if (!cJSON_IsArray(root_spec)) {
+        cJSON_Delete(compiled);
         cJSON_Delete(snap);
         return;  // v2：root 是 grid 块数组，还没吐出来（或压根不是数组）时安静等下一帧
     }
@@ -106,6 +127,7 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     if (pi_card_media::SpecUsesMedia(root_spec)) {
         s_preview.disqualified = true;
         if (s_preview.active) PreviewTeardownInternal();
+        cJSON_Delete(compiled);
         cJSON_Delete(snap);
         return;
     }
@@ -113,6 +135,7 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     if (!s_preview.active) {
         lv_obj_t* row = FeedBeginRow();
         if (!row) {
+            cJSON_Delete(compiled);
             cJSON_Delete(snap);
             return;  // feed 未就绪：这次工具调用就没有预览，不是错误
         }
@@ -127,7 +150,7 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
 
     // data：v2 §4.2 的签名把 data 折了进去（GridSignature），data 迟到/变化会让引用它的 grid
     // 签名跟着变、自然触发整块重渲——不需要 v1 那种全树回刷通道。
-    const cJSON* data = cJSON_GetObjectItem(snap, "data");
+    const cJSON* data = cJSON_GetObjectItem(env, "data");
     PreviewSetData(data);
 
     const int ngrid_raw = cJSON_GetArraySize(root_spec);
@@ -156,6 +179,7 @@ void PreviewOnArgs(const char* partial_json, uint32_t gen) {
     }
 
     PreviewSetData(nullptr);
+    cJSON_Delete(compiled);
     cJSON_Delete(snap);
 }
 

@@ -1,0 +1,1 @@
+<card display='overlay' ttl='30s'><grid><label role='title'>睡眠定时</label><choice id='dur' options='15分|30分|60分'/></grid><grid><button variant='ghost' tap='close'>取消</button><button variant='primary' side='end' tap='report:开始睡眠定时,close'>开始</button></grid></card>

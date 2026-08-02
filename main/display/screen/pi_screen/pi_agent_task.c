@@ -874,6 +874,10 @@ void pi_agent_task_start(void) {
     for (size_t i = 0; i < sizeof(TOOLS) / sizeof(TOOLS[0]); i++) {
         if (strcmp(TOOLS[i].def.name, "ui_render") == 0) {
             TOOLS[i].def.description = pi_card_render_desc();
+            /* 参数 schema 同样运行时二选一（NVS ui/cardfmt：json 版含 required:["root"]，
+             * xml 版是零约束的裸 {"xml":string}）——pi-c 强制内联约束，XML 模式若沿用 json
+             * schema 会在 pi-c 层干拒 xml-only args。返回编译期常量指针，常驻契约满足。 */
+            TOOLS[i].def.parameters_schema_json = pi_card_render_schema();
         }
     }
     /* 8KB 预算守卫（编排者裁决补充）：DESC+system prompt 之和常驻占用上下文，两者都随

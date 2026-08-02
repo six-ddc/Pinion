@@ -42,6 +42,14 @@ const char *pi_card_render_desc(void);
  * 指针是安全的。实现见 pi_card_host.cc。 */
 const char *pi_card_system_prompt(void);
 
+/* ui_render 参数 schema：随 NVS ui/cardfmt（0=json 1=xml，默认 json）二选一——JSON 模式用
+ * PI_CARD_RENDER_SCHEMA（含 required:["root"]），XML 模式用 PI_CARD_RENDER_SCHEMA_XML。
+ * 必须运行时选：pi-c 解析 $ref 且强制一切内联约束（CARD_XML.md §10.1），若 XML 模式沿用
+ * JSON schema，xml-only args 会被 required:["root"] 在 pi-c 层干拒（截断 echo→弱模型原样
+ * 重试）。pi_agent_task_start 里与 description 同一循环改填 TOOLS[].def.parameters_schema_json
+ * （返回编译期常量字符串指针，常驻契约天然满足）。 */
+const char *pi_card_render_schema(void);
+
 /* ---- 喂给 LLM 的工具描述与 JSON-Schema（编译期常量）---- */
 
 /* PI_CARD_DESC_HEAD + <运行时路径清单> + PI_CARD_DESC_TAIL = ui_render 完整描述（CARD_V2）。
@@ -151,6 +159,66 @@ const char *pi_card_system_prompt(void);
     "},\"display\":{\"type\":\"string\",\"enum\":[\"chat\",\"overlay\",\"standby\"]" \
     "},\"ttl_ms\":{\"type\":\"number\",\"minimum\":0},\"card\":{\"type\":\"string\"},\"data\":{\"typ" \
     "e\":\"object\"}},\"required\":[\"root\"]}"
+
+/* XML 模式的 ui_render 参数 schema：只声明裸 {"xml":string}，零内联约束零 required——
+ * 弱模型若惯性回落 JSON 形态（直接给 root），host 侧 pi_card_tool_render 双通道都接得住，
+ * 绝不让 pi-c 层硬拒（CARD_XML.md §10.1 避坑）。 */
+#define PI_CARD_RENDER_SCHEMA_XML \
+    "{\"type\":\"object\",\"properties\":{\"xml\":{\"type\":\"string\"},\"root\":{\"type\":\"array\"" \
+    "},\"display\":{\"type\":\"string\"},\"ttl_ms\":{\"type\":\"number\"},\"card\":{\"type\":\"strin" \
+    "g\"},\"data\":{\"type\":\"object\"}}}"
+
+/* XML 版 ui_render 描述（cardfmt=1 时注入）：HEAD + <活体路径清单> + TAIL，骨架与 JSON 版
+ * 同构（拆两段的理由同上）。词表/属性/动作微语法一次讲全——示例在 system prompt。 */
+#define PI_CARD_DESC_HEAD_XML                                                                         \
+    "Render an interactive UI card. Args: {\"xml\":\"<card>…</card>\"} — one HTML-like XML string; "  \
+    "the device compiles and lays out everything (you never write x/y/w/h/columns/CSS). Returns "     \
+    "{\"card\":\"<id>\",\"state\":{<path>:<value>},\"hints\":[…]}: state = every hardware path this " \
+    "card binds (this IS your device read); hints = advice for FUTURE cards — the card IS on "        \
+    "screen, never re-render because of a hint. Invalid input returns a fixable error; overlays "     \
+    "auto-close (ttl) and are capped. "                                                               \
+    "<card display='chat|overlay|standby' ttl='30s' id?> stacks BLOCK elements top-to-bottom: "       \
+    "<grid fill?>leaves</grid> (a flow wrapped by size — headers, control rows like icon+slider+"     \
+    "value, button groups; divider/chart/choice/qrcode take their own line); "                        \
+    "<table cols='项,值:num'><tr><td>…</td>…</tr>…</table> (aligned TABLE sharing column tracks; "    \
+    "':num' = number column, right-aligned mono; cols optional — auto-inferred; a <td> holds text "   \
+    "or ONE leaf; one <td> per row = vertical menu); "                                                \
+    "<list bind='key' max? empty?>row-template leaves</list> (repeats the template once per "         \
+    "element of data 'key'; {i}=idx0,{n}=idx1,{item.FIELD} in strings; row tap = tap on a template "  \
+    "leaf, report/set/close only); "                                                                  \
+    "<divider/>; "                                                                                    \
+    "<data> card data: scalar <temp>24</temp>; list rows by repeating <tracks title='七里香'/>. "     \
+    "LEAVES (12, exactly these, self-closing unless text content): "                                  \
+    "<label text? role? bind? fmt? mono? bind_data?/> or <label>text</label>; "                       \
+    "<button text? icon? variant? tap?>text</button>; <slider min? max? value? bind? id? change? "    \
+    "release?/>; <arc like slider/>(round dial); <switch checked? bind? id? change?/>; "              \
+    "<bar min? max? value? bind?/>; <choice options='a|b|c'(2-6) value? id? bind? change?/>"          \
+    "(picker; reports idx+label); <icon name='wifi'/>(decor; tappable=<button icon>); "               \
+    "<qrcode text?/>; <chart bind='path' points?/>(LINE chart, fixed height); "                       \
+    "<stock_chart symbol name? mode?/>(live CN/HK/US chart, self-refreshing, timeframe buttons, "     \
+    "hold-to-inspect; symbol from stock tool; mode min|5d|day|week). "                                \
+    "role ramp: eyebrow|kicker|section|title|heading|label|value|caption (header=eyebrow+title; "     \
+    "big number=value). variant: primary(ONE amber CTA)|ghost|plain|default. Common attrs: id, "      \
+    "bind, tone, hidden, side='end' (push cell to the row's right edge); mono/hidden/checked are "    \
+    "bare booleans. Grid fill=bg box. tone/fill: semantic token (auto light/dark): accent|"           \
+    "accent_dim|ok|err|tx|dim|faint|card|card2|line|line2|bg — never hex. "
+
+#define PI_CARD_DESC_TAIL_XML                                                                         \
+    "Bound label fmt: ONE placeholder matching the type — number->%d/'%d%%', string->%s (%s on a "    \
+    "number path crashes); mono for numbers. bind_data label shows card data[key] ({value} in its "   \
+    "text inlines it). "                                                                              \
+    "EVENTS: tap(click)/change/release attrs = comma-separated steps 'verb:payload', zero "           \
+    "round-trip — close | set:path=value ('{i}' in a row template) | toggle:id / show:id / hide:id "  \
+    "(a hidden leaf) | invoke:cmd (safe cmds run at once, else confirm). report:text only when you "  \
+    "must generate text or a NEW decision (quote a payload holding a comma: report:'a, b'; every "    \
+    "id'd control's value auto-attaches, choice as idx(label)). "                                     \
+    "Escape & as &amp; in attribute values (URLs). "                                                  \
+    "DATA: ui_update (JSON args, unchanged) mutates card data (set/append/remove/replace); bound "    \
+    "list/bind_data re-render. Icons: Lucide names (wifi|battery|play|check|x…); unknown → dot. "     \
+    "Limits: 64 leaves, >8 blocks->first 8 render, so prefer 3-5 blocks/card & split big "            \
+    "dashboards. Layout auto: grid wraps by size; table aligns to shared tracks. Off-vocabulary "     \
+    "tags/attrs are tolerated but noted — stick to the vocabulary. See system prompt for CHOOSE "     \
+    "tree+examples."
 
 #define PI_CARD_UPDATE_DESC                                                                          \
     "Patch a node inside a rendered card, or mutate card data. Args {card?:'' (latest), id?:"        \

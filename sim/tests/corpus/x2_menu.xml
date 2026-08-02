@@ -1,0 +1,1 @@
+<card><grid><label role='eyebrow'>点歌</label></grid><list bind='tracks' max='8' empty='暂无'><button variant='ghost' tap="report:'选了{item.title}'">{item.title}</button></list><data><tracks title='七里香'/><tracks title='花海'/></data></card>

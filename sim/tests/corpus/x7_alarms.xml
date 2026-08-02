@@ -1,0 +1,5 @@
+<card><grid><label role="eyebrow">闹钟</label><label role="title">选择要关闭的闹钟</label></grid>
+<list bind="alarms" max="6" empty="没有闹钟">
+<button variant="ghost" icon="bell" tap="report:'关闭闹钟 {item.time}'">{item.time} {item.label}</button>
+</list>
+<data><alarms time="07:30" label="工作日"/><alarms time="09:00" label="周末"/></data></card>

@@ -109,6 +109,7 @@ add_executable(pi_sim
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_actions.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_render.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_solver.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_xml.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_host.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview.cc
     ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_preview_sig.cc
@@ -277,4 +278,19 @@ target_include_directories(preview_prefix_test PRIVATE
 target_compile_options(preview_prefix_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(preview_prefix_test PRIVATE -fsanitize=address,undefined)
 target_link_libraries(preview_prefix_test PRIVATE pi)
+
+# ---- card_xml_test: XML 线格式编译器（docs/CARD_XML.md）纯函数单测 ----
+# 与 solver 同款：零 LVGL / 零 ESP 依赖，复用 pi-c 的 cJSON 源码，ASan/UBSan 全程开。
+add_executable(card_xml_test
+    tests/card_xml_test.cc
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card/pi_card_xml.cc
+    ${PI_C_DIR}/third_party/cJSON/cJSON.c
+)
+target_include_directories(card_xml_test PRIVATE
+    tests
+    ${CLAW_ROOT}/main/display/screen/pi_screen/pi_card
+    ${PI_C_DIR}/third_party/cJSON
+)
+target_compile_options(card_xml_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+target_link_options(card_xml_test PRIVATE -fsanitize=address,undefined)
 

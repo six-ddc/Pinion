@@ -19,6 +19,7 @@
 #include "pi_card_render.h"
 #include "pi_card_stock.h"
 #include "pi_card_tools.h"
+#include "pi_card_xml.h"
 #include "pi_fonts.h"
 #include "pi_theme.h"
 #include "pi_ui_bridge.h"
@@ -846,6 +847,23 @@ std::string BindStateJson(const cJSON* root) {
     return out;
 }
 
+// ---- 线格式开关（docs/CARD_XML.md D2）：NVS ui/cardfmt 0=json 1=xml，默认 json ----
+// 单次启动只注入一套提示词/schema（construct-once 缓存与 desc/prompt 同生命周期），改开关
+// 需重启生效。xml 参数键本身**不受开关控制**——host 双通道常开（有 xml 键就走 XmlCompile），
+// 开关只决定教给模型哪套线格式。sim 里 PI_SIM_CARDFMT=1 免写 ini 直接切（A/B 工装）。
+int CardFmt() {
+    static int fmt = -1;
+    if (fmt >= 0) return fmt;
+#ifndef ESP_PLATFORM
+    if (const char* e = std::getenv("PI_SIM_CARDFMT")) {
+        fmt = std::atoi(e) != 0 ? 1 : 0;
+        return fmt;
+    }
+#endif
+    fmt = Settings("ui", false).GetInt("cardfmt", 0) != 0 ? 1 : 0;
+    return fmt;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -863,33 +881,55 @@ extern "C" char* pi_card_tool_render(const cJSON* args, bool* is_error) {
         *is_error = true;
         return Dup(e);
     };
-    // v2：Repair() 就地修复 args 里的 "root"（单 grid 对象包数组/剥旧属性/旧 list→bind_rows
-    // 等语法糖，见 docs/CARD_V2.md §6.2），修复不了的（如顶层 preset/slots 残留——preset/slots
-    // 已整删，§3 决策 A）当场拒绝、不再往下跑 Validate。args 是本次调用独占的解析树，就地
-    // 改写安全。
-    std::string rerr;
+    // XML 通道（docs/CARD_XML.md §3）：args 有 "xml" 串就先 XmlCompile 成同构信封，之后
+    // 与 JSON 通道汇入**同一漏斗**（Repair/Validate/Lint/入队全复用，下面的 spec 指针二选一，
+    // 逻辑零分叉）。通道常开，不受 cardfmt 开关控制（开关只决定教模型哪套格式）。编译 note
+    // 与 Repair note 同口径——都是「你给的和实际渲染的不一样」，随 hints 回给 LLM。
     std::vector<std::string> repair_notes;  // 修复动作（如 >8 grids 截断）随 hints 回给 LLM
-    if (!Repair(const_cast<cJSON*>(args), rerr, &repair_notes)) {
+    struct CJsonDel {
+        void operator()(cJSON* j) const { cJSON_Delete(j); }
+    };
+    std::unique_ptr<cJSON, CJsonDel> compiled;
+    const cJSON* spec = args;
+    const cJSON* xmlj = cJSON_GetObjectItem(args, "xml");
+    if (cJSON_IsString(xmlj) && xmlj->valuestring[0] != '\0') {
+        cJSON* out = nullptr;
+        std::string xerr;
+        if (!XmlCompile(xmlj->valuestring, std::strlen(xmlj->valuestring), &out, &repair_notes,
+                        xerr)) {
+            return reject("xml", xerr);
+        }
+        compiled.reset(out);
+        spec = out;
+        if (cJSON_GetObjectItem(args, "root") != nullptr)
+            repair_notes.push_back("both xml and root given — xml won, root ignored");
+    }
+    // v2：Repair() 就地修复 spec 里的 "root"（单 grid 对象包数组/剥旧属性/旧 list→bind_rows
+    // 等语法糖，见 docs/CARD_V2.md §6.2），修复不了的（如顶层 preset/slots 残留——preset/slots
+    // 已整删，§3 决策 A）当场拒绝、不再往下跑 Validate。spec 是本次调用独占的解析树（args
+    // 本体或 XmlCompile 新产物），就地改写安全。
+    std::string rerr;
+    if (!Repair(const_cast<cJSON*>(spec), rerr, &repair_notes)) {
         return reject("repair", rerr);
     }
-    const cJSON* root = cJSON_GetObjectItem(args, "root");
+    const cJSON* root = cJSON_GetObjectItem(spec, "root");
     if (!root || !(cJSON_IsObject(root) || cJSON_IsArray(root))) {
-        return reject("no-root", "spec missing 'root' array of grid blocks");
+        return reject("no-root", "spec missing 'root' array of grid blocks (or an 'xml' card string)");
     }
-    const cJSON* data = cJSON_GetObjectItem(args, "data");  // object|null，卡级 data 模型
+    const cJSON* data = cJSON_GetObjectItem(spec, "data");  // object|null，卡级 data 模型
     std::string err;
     if (!Validate(root, data, err)) {
         return reject("validate", err);
     }
-    const cJSON* disp = cJSON_GetObjectItem(args, "display");
+    const cJSON* disp = cJSON_GetObjectItem(spec, "display");
     int mode = 0;
     if (cJSON_IsString(disp)) {
         if (std::strcmp(disp->valuestring, "overlay") == 0) mode = 1;
         else if (std::strcmp(disp->valuestring, "standby") == 0) mode = 2;
     }
-    const cJSON* ttl = cJSON_GetObjectItem(args, "ttl_ms");
+    const cJSON* ttl = cJSON_GetObjectItem(spec, "ttl_ms");
     int ttl_ms = cJSON_IsNumber(ttl) ? ttl->valueint : 0;
-    const cJSON* cardj = cJSON_GetObjectItem(args, "card");
+    const cJSON* cardj = cJSON_GetObjectItem(spec, "card");
     // standby：单槽常驻卡固定 id "pin"，忽略 LLM 传入的 card（与 OnRenderEvent 的强制口径
     // 一致，见 pi_card_host.h 头注）——否则这里回给 LLM 的 id 会和 drain 侧真正注册的
     // "pin" 对不上，后续 ui_update/ui_close card:'pin' 就找不到卡。
@@ -1054,10 +1094,14 @@ std::string BuildPathsClause(bool full) {
 // 动态 ui_render 工具描述：静态 HEAD/TAIL 骨架之间插 BuildPathsClause(true)。construct-once，
 // 缓存进 function-static std::string：pi_agent_task_start 只在启动时借一次这个指针塞进
 // TOOLS[].def.description，该指针必须常驻——static 局部变量的存储期覆盖整个固件运行期。
+// HEAD/TAIL 随 cardfmt 二选一（XML 版见 pi_card_tools.h 的 *_XML 宏），路径/命令清单与
+// STANDBY 段两套共用。
 extern "C" const char* pi_card_render_desc(void) {
     static std::string s;
     if (!s.empty()) return s.c_str();
-    s = std::string(PI_CARD_DESC_HEAD) + BuildPathsClause(true) + " " + PI_CARD_DESC_TAIL +
+    const bool xml = CardFmt() == 1;
+    s = std::string(xml ? PI_CARD_DESC_HEAD_XML : PI_CARD_DESC_HEAD) + BuildPathsClause(true) + " " +
+        (xml ? PI_CARD_DESC_TAIL_XML : PI_CARD_DESC_TAIL) +
         " COMMANDS (invoke cmd): " + BuildCommandsClause(true) +
         ". STANDBY: display:'standby' pins ONE widget to the home/clock screen (replaces any prior "
         "pin, id is always 'pin' -- ui_update/ui_close use card:'pin'; an on-screen ✕ also removes "
@@ -1065,19 +1109,122 @@ extern "C" const char* pi_card_render_desc(void) {
     return s.c_str();
 }
 
+// ui_render 参数 schema（编译期常量二选一，见 pi_card_tools.h 的选择理由注释）。
+extern "C" const char* pi_card_render_schema(void) {
+    return CardFmt() == 1 ? PI_CARD_RENDER_SCHEMA_XML : PI_CARD_RENDER_SCHEMA;
+}
+
+namespace {
+
+// 两套线格式提示词的共享段——单一来源（CARD_XML.md §6：动态清单两套共用，不出现第三份
+// 硬编码）：人格开场 + WRITABLE/HOME WIDGET/DEVICE COMMANDS 尾段。invoke_syntax 是两套唯一
+// 的措辞分叉点（JSON 教 {do:'invoke',cmd}，XML 教 invoke:cmd 微语法步）。
+constexpr const char* kPromptIntro =
+    "You are pi, the on-device assistant in a palm-size 720×720 touch screen; the user also "
+    "talks by voice. Reply short, warm, in the user's language (usually Chinese). Text is read "
+    "aloud by TTS -- avoid markdown symbols, links, long bullet lists.\n\n";
+
+std::string SharedPromptTail(const char* invoke_syntax) {
+    return std::string("WRITABLE device paths you can set: ") + BuildPathsClause(false) +
+           ".\n\n"
+           "HOME WIDGET -- display:'standby' pins one card to the home/clock screen (survives new "
+           "chats/reboot). Prefer local actions/invoke in it -- a report runs you in the "
+           "BACKGROUND, keep rare. Remove via ui_close card:'pin'.\n"
+           "DEVICE COMMANDS -- " +
+           invoke_syntax +
+           " for real actions a data path can't do (reconnect, "
+           "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
+           BuildCommandsClause(false) + ".\n\n";
+}
+
+// XML 版 system prompt（cardfmt=1，docs/CARD_XML.md §6）：CARDS 教学换线格式词表 + 五示例
+// 逐一翻译成 XML（示例红线：原文过管线零 hints——card_xml_test/伤疤语料锁定）。NEVER 清单
+// 按 XML 语境改写（一维 rows/裸叶子等错型已被语法本身消化，保留 media 卡/emoji 两条）。
+std::string BuildXmlSystemPrompt() {
+    return std::string(kPromptIntro) +
+        "CARDS -- draw real interactive UI with ui_render (+ ui_update/ui_close) instead of "
+        "describing controls/status/choices. There is NO read tool -- rendering a card that binds a "
+        "device path IS how you read the device (return value gives live values as state). "
+        "ui_render args: {\"xml\":\"<card>…</card>\"} -- one HTML-like XML string, tiny "
+        "vocabulary; the device lays everything out. You never write x/y, width, gaps, columns or "
+        "CSS. Just say WHAT controls exist.\n\n"
+        "BLOCKS inside <card display='chat|overlay|standby' ttl='30s'> (stacked top-to-bottom):\n"
+        "- <grid fill?>leaves</grid> -- a flow wrapped by size. Use for headers/control rows "
+        "(icon+slider+value)/button groups; divider/chart/choice/qrcode get their own line.\n"
+        "- <table cols='项,值:num'><tr><td>…</td>…</tr>…</table> -- an aligned TABLE sharing "
+        "columns; ':num' right-aligns+mono that column; a <td> holds text or ONE leaf; one "
+        "<td>/row = a vertical menu. Use for status/forms/dashboards.\n"
+        "- <list bind='key' max? empty?>row-template leaves</list> -- one row per element of "
+        "<data> 'key'; {i}/{n}/{item.FIELD} in strings. Row taps: report/set/close only.\n"
+        "- <divider/>; <data> = card data: scalar <temp>24</temp>, list rows by repeating "
+        "<tracks title='七里香'/>.\n\n"
+        "LEAVES: <label text|role|bind|fmt|mono/> - <button text|icon|variant|tap> - "
+        "<slider|arc|bar bind|min|max|value|change/> - <switch bind|checked/> - <choice "
+        "options='a|b|c' id/> - <icon name/>(decor; tappable=<button icon>) - <divider/> - "
+        "<qrcode text/> - <chart bind/> - <stock_chart symbol/>. role ramp: eyebrow|kicker|"
+        "section|title|heading|label|value|caption. Header = <label role='eyebrow'/> + <label "
+        "role='title'/> in one grid. Big number = role 'value' (mono, right-aligned in tables). "
+        "Controls carry their own state -- don't restate it in words.\n\n"
+        "EVENTS: tap/change/release = comma-separated steps, zero round-trip, invisible in chat "
+        "-- close | set:path=value | toggle:id / show:id / hide:id (a hidden leaf) | invoke:cmd. "
+        "report:text ONLY to generate new content or a NEW decision (full round-trip, shows as a "
+        "user message; quote a comma payload: report:'a, b'); every id'd control's value "
+        "auto-attaches (choice as idx(label)) -- id a control instead of writing its value into "
+        "text. Escape & as &amp; in attributes.\n\n"
+        "STYLE: lean on pi's look. tone/fill = semantic tokens (accent/ok/err/tx/dim/faint/card2/"
+        "line...), never hex/CSS. ONE primary(amber) button/card, rest ghost/plain/default. "
+        "side='end' pushes a cell to the row's right edge. <grid fill='card2'> gives a background "
+        "box. Labels 1-3 words; num columns don't truncate, text columns do. Max 8 blocks/64 "
+        "leaves per card; split big dashboards.\n\n"
+        "CHOOSE: SET something -> a control grid that binds the path (writes hardware directly). "
+        "STATUS -> a table binding the paths. CHOICE/CONFIRM/FORM/MENU -> render it, the tap "
+        "rides back on report. Chit-chat -> just text. Playback UI is built-in — never render "
+        "player/media cards. Prefer display 'chat'; 'overlay' only for a modal moment "
+        "(auto-closes).\n\n"
+        "UPDATE vs RE-RENDER: change text/value/visibility/data via ui_update (JSON args "
+        "id+props/patches/data, unchanged), not a fresh ui_render; re-render only if structurally "
+        "different.\n\n" +
+        SharedPromptTail("invoke:cmd (a tap step)") +
+        "Example 1, control card: <card><grid><icon name='volume'/><slider bind='audio.volume'/>"
+        "<label role='value' bind='audio.volume' fmt='%d%%'/></grid><grid><icon name='sun'/>"
+        "<label>浅色</label><switch bind='ui.theme' side='end'/></grid></card>\n"
+        "Example 2, status TABLE (':num' = number column): <card><grid><label role='eyebrow'>状态"
+        "</label></grid><table cols=',:num'><tr><td>电量</td><td><label role='value' "
+        "bind='battery.level' fmt='%d%%' mono/></td></tr><tr><td>信号</td><td><label "
+        "role='value' bind='net.rssi' fmt='%d' mono/></td></tr></table></card>\n"
+        "Example 3, tap-a-row menu (list + data): <card><grid><label role='eyebrow'>点歌"
+        "</label></grid><list bind='tracks' max='8' empty='暂无'><button variant='ghost' "
+        "tap=\"report:'选了{item.title}'\">{item.title}</button></list>"
+        "<data><tracks title='七里香'/><tracks title='花海'/></data></card>\n"
+        "Example 4, expandable detail -- local toggle, ZERO round-trip: <card><grid>"
+        "<label role='eyebrow'>电量</label><label role='title' bind='battery.level' fmt='%d%%'/>"
+        "<button icon='chevron-down' variant='ghost' side='end' tap='toggle:hist'/></grid>"
+        "<grid fill='card2'><chart bind='battery.level' id='hist' hidden/></grid></card>\n"
+        "Example 5, overlay confirm -- id'd control value auto-attaches to report: <card "
+        "display='overlay' ttl='30s'><grid><label role='title'>睡眠定时</label><choice id='dur' "
+        "options='15分|30分|60分'/></grid><grid><button variant='ghost' tap='close'>取消</button>"
+        "<button variant='primary' side='end' tap='report:开始睡眠定时,close'>开始</button>"
+        "</grid></card>\n"
+        "NEVER: JSON card args (always the xml string); style/class/CSS attrs; nested containers "
+        "(depth is card>block>leaf); media.* player cards; emoji in text (no glyphs on device).";
+}
+
+}  // namespace
+
 // system prompt：同款 function-static 缓存 + 常驻指针契约（D7）。pi-c 在 create_agent 里
 // 深拷贝一份（pi_agent.c:58-60 pi_strdup），故 new_session 重建 agent 时再次借用同一指针
 // 是安全的。路径清单与 DESC 共用 BuildPathsClause，杜绝第三份硬编码路径。
 extern "C" const char* pi_card_system_prompt(void) {
     static std::string s;
     if (!s.empty()) return s.c_str();
+    if (CardFmt() == 1) {
+        s = BuildXmlSystemPrompt();
+        return s.c_str();
+    }
     // 预算超标后精简（P4/media 累计撑爆 9216B 预算）：措辞收紧 + 去与 TAIL 重复的 PRESETS
     // 形状/示例（TAIL 现只写"see system prompt"）；规则/关键字/preset 形状/路径清单一个不少，
     // 只留 1 个示例（confirm/list 的用法已在 PRESETS 小节与 HEAD 的 list{} 条目里讲过）。
-    s =
-        "You are pi, the on-device assistant in a palm-size 720×720 touch screen; the user also "
-        "talks by voice. Reply short, warm, in the user's language (usually Chinese). Text is read "
-        "aloud by TTS -- avoid markdown symbols, links, long bullet lists.\n\n"
+    s = std::string(kPromptIntro) +
         // v2（CARD_V2.md §10）：v1 的 DESIGN/COMPACT/LAYOUT 三段布局教学（row/grow/justify）已
         // 随 grid-only 重构整段替换——布局改由固件的 solver 纯函数决定，模型只声明"有哪些控件、
         // 语义是什么"。CHOOSE 段替代了 v1"WHEN A CARD, NOT CHAT"里提到的 LIST（v1 类型，已删，
@@ -1122,17 +1269,8 @@ extern "C" const char* pi_card_system_prompt(void) {
         "control's value (choice as idx(label)) -- id a control instead of writing its value into "
         "text.\n\n"
         "UPDATE vs RE-RENDER: change text/value/visibility/data via ui_update, not a fresh "
-        "ui_render; re-render only if structurally different.\n\n"
-        "WRITABLE device paths you can set: " +
-        BuildPathsClause(false) +
-        ".\n\n"
-        "HOME WIDGET -- display:'standby' pins one card to the home/clock screen (survives new "
-        "chats/reboot). Prefer local actions/invoke in it -- a report runs you in the BACKGROUND, "
-        "keep rare. Remove via ui_close card:'pin'.\n"
-        "DEVICE COMMANDS -- {do:'invoke',cmd} for real actions a data path can't do (reconnect, "
-        "switch network, new chat); confirm-level pops a firmware confirm. Available: " +
-        BuildCommandsClause(false) +
-        ".\n\n"
+        "ui_render; re-render only if structurally different.\n\n" +
+        SharedPromptTail("{do:'invoke',cmd}") +
         // 示例必须无瑕疵——弱模型照抄它们（真机实录：没在示例里见过的形态它永远写不对，
         // 一维 rows 连拒两次后才补的 Ex2/Ex3）。Ex1=cells 控制卡（switch 绑真实可写 bool
         // 路径，纯 bind 即生效无需 handler）；Ex2=rows 表格，肉眼可见二维嵌套 + num 列；

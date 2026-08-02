@@ -1,0 +1,1 @@
+<card><grid><label role='eyebrow'>电量</label><label role='title' bind='battery.level' fmt='%d%%'/><button icon='chevron-down' variant='ghost' side='end' tap='toggle:hist'/></grid><grid fill='card2'><chart bind='battery.level' id='hist' hidden/></grid></card>

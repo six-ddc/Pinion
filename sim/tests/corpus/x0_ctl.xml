@@ -1,0 +1,1 @@
+<card><grid><icon name='volume'/><slider bind='audio.volume'/><label role='value' bind='audio.volume' fmt='%d%%'/></grid><grid><icon name='sun'/><label>浅色</label><switch bind='ui.theme' side='end'/></grid></card>
